@@ -1,0 +1,1046 @@
+"""Tests for the OpenRouter adapter, persistent chat, and default TUI."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+from rich.syntax import Syntax
+from rich.text import Text
+from textual.widgets import Button, Input, RichLog, Select, Static
+
+from mechagnome import (
+    Harness,
+    Kernel,
+    ModelStreamEvent,
+    ModelTurn,
+    RunCancelled,
+    ToolCall,
+)
+from mechagnome import __main__ as cli
+from mechagnome import openrouter as openrouter_module
+from mechagnome.isolation import IsolatedToolRunner
+from mechagnome.openrouter import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    OpenRouterError,
+    OpenRouterModel,
+)
+from mechagnome.tui import DeleteToolScreen, ToolboxApp, ToolManagerScreen
+
+
+class FinalModel:
+    """Deterministic multi-prompt model for conversation and TUI tests."""
+
+    def __init__(self) -> None:
+        self.message_snapshots: list[list[dict[str, Any]]] = []
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.message_snapshots.append([dict(message) for message in messages])
+        return ModelTurn(text=f"answer {len(self.message_snapshots)}")
+
+
+def sse_response(
+    *payloads: dict[str, Any],
+    finish_reason: str = "stop",
+    post_terminal: tuple[dict[str, Any], ...] = (),
+    done: bool = True,
+) -> httpx.Response:
+    """Build a deterministic OpenRouter-style event stream."""
+    content = "".join(f"data: {json.dumps(payload)}\n\n" for payload in payloads)
+    content += (
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {"delta": {}, "finish_reason": finish_reason},
+                ]
+            }
+        )
+        + "\n\n"
+    )
+    content += "".join(f"data: {json.dumps(payload)}\n\n" for payload in post_terminal)
+    if done:
+        content += "data: [DONE]\n\n"
+    return httpx.Response(
+        200,
+        headers={"Content-Type": "text/event-stream"},
+        content=content,
+    )
+
+
+def test_conversation_keeps_model_context_and_one_durable_session(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = FinalModel()
+    conversation = Harness(kernel).start(model)
+
+    first = conversation.send("first")
+    second = conversation.send("second")
+
+    assert first.session_id == second.session_id == conversation.session_id
+    assert model.message_snapshots[0] == [{"role": "user", "content": "first"}]
+    assert model.message_snapshots[1] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer 1", "tool_calls": []},
+        {"role": "user", "content": "second"},
+    ]
+    kinds = [
+        event["kind"]
+        for event in kernel.read_session(conversation.session_id, limit=100)["events"]
+    ]
+    assert kinds == ["user", "model", "final", "user", "model", "final"]
+
+
+def test_conversation_rehydrates_an_existing_saved_session(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    first_model = FinalModel()
+    first = Harness(kernel).start(first_model)
+    first.send("first")
+
+    second_model = FinalModel()
+    resumed = Harness(kernel).start(second_model, session_id=first.session_id)
+    resumed.send("second")
+
+    assert second_model.message_snapshots[0] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer 1", "tool_calls": []},
+        {"role": "user", "content": "second"},
+    ]
+
+
+def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers["Authorization"]
+        captured["title"] = request.headers["X-OpenRouter-Title"]
+        captured["body"] = json.loads(request.content)
+        return sse_response(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "tool-1",
+                                    "function": {
+                                        "name": "help",
+                                        "arguments": '{"topic":',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": '"quickstart"}'},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            finish_reason="tool_calls",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    turn = model.respond(
+        [{"role": "user", "content": "How do I begin?"}],
+        kernel.tool_definitions(),
+    )
+
+    assert model.model == DEFAULT_MODEL
+    assert captured["url"] == f"{DEFAULT_BASE_URL}/chat/completions"
+    assert captured["authorization"] == "Bearer test-key"
+    assert captured["title"] == "mechagnome"
+    assert captured["body"]["model"] == "z-ai/glm-5.2"
+    assert captured["body"]["parallel_tool_calls"] is False
+    assert captured["body"]["stream"] is True
+    assert captured["body"]["messages"][0]["role"] == "system"
+    assert [tool["function"]["name"] for tool in captured["body"]["tools"]] == [
+        "help",
+        "search_tools",
+        "read_tool_source",
+        "write_tool",
+        "call_tool",
+    ]
+    assert turn.calls[0].name == "help"
+    assert turn.calls[0].args == {"topic": "quickstart"}
+
+
+def test_openrouter_adapter_serializes_prior_tool_results(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assistant = body["messages"][-2]
+        observation = body["messages"][-1]
+        assert assistant["tool_calls"][0]["function"] == {
+            "name": "help",
+            "arguments": '{"topic": "quickstart"}',
+        }
+        assert observation == {
+            "role": "tool",
+            "tool_call_id": "tool-1",
+            "name": "help",
+            "content": '{"topic": "quickstart"}',
+        }
+        return sse_response(
+            {"choices": [{"delta": {"content": "Rea"}}]},
+            {"choices": [{"delta": {"content": "dy."}}]},
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    messages = [
+        {"role": "user", "content": "begin"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "tool-1", "name": "help", "args": {"topic": "quickstart"}}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "tool-1",
+            "name": "help",
+            "content": {"topic": "quickstart"},
+        },
+    ]
+
+    assert model.respond(messages, kernel.tool_definitions()).text == "Ready."
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"choices": [{"delta": []}]},
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [{"index": 0, "function": "not-an-object"}],
+                    }
+                }
+            ]
+        },
+    ],
+)
+def test_openrouter_adapter_normalizes_wrong_json_shapes(
+    tmp_path: Path, payload: dict[str, Any]
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: sse_response(payload))
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+def test_openrouter_adapter_normalizes_non_object_http_error(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, json=["bad request"])
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError, match="HTTP 400"):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+def test_openrouter_adapter_rejects_truncated_stream(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "partial"}}]},
+                done=False,
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError, match="before \\[DONE\\]"):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+def test_openrouter_adapter_rejects_non_success_finish_reason(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "partial"}}]},
+                finish_reason="length",
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError, match="length"):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+def test_openrouter_adapter_allows_usage_metadata_after_finish(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "Ready."}}]},
+                post_terminal=(
+                    {
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 2,
+                            "total_tokens": 12,
+                        },
+                    },
+                ),
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    turn = model.respond(
+        [{"role": "user", "content": "hello"}], kernel.tool_definitions()
+    )
+
+    assert turn.text == "Ready."
+
+
+def test_openrouter_adapter_rejects_model_data_after_finish(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "Ready."}}]},
+                post_terminal=(
+                    {
+                        "choices": [
+                            {"delta": {"content": "late"}, "finish_reason": None}
+                        ]
+                    },
+                ),
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError, match="model data after"):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+@pytest.mark.parametrize("repeated_reason", [None, "stop"])
+def test_openrouter_adapter_allows_empty_terminal_metadata(
+    tmp_path: Path, repeated_reason: str | None
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "Ready."}}]},
+                post_terminal=(
+                    {"choices": [{"delta": {}, "finish_reason": repeated_reason}]},
+                ),
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    assert (
+        model.respond(
+            [{"role": "user", "content": "hello"}], kernel.tool_definitions()
+        ).text
+        == "Ready."
+    )
+
+
+@pytest.mark.parametrize(
+    ("late_delta", "message"),
+    [
+        (
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "late",
+                        "function": {"name": "help", "arguments": "{}"},
+                    }
+                ]
+            },
+            "model data after",
+        ),
+        ({"tool_calls": {}}, "invalid tool-call deltas"),
+    ],
+)
+def test_openrouter_adapter_rejects_late_tool_call_shapes(
+    tmp_path: Path, late_delta: dict[str, Any], message: str
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "Ready."}}]},
+                post_terminal=(
+                    {"choices": [{"delta": late_delta, "finish_reason": None}]},
+                ),
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError, match=message):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+def test_openrouter_adapter_rejects_changed_terminal_reason(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "Ready."}}]},
+                post_terminal=(
+                    {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                ),
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError, match="changed the terminal"):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+def test_openrouter_adapter_bounds_stream_size(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    monkeypatch.setattr(openrouter_module, "MAX_STREAM_BYTES", 10)
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: sse_response(
+                {"choices": [{"delta": {"content": "too large"}}]},
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    with pytest.raises(OpenRouterError, match="size limit"):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+class PausingSSEStream(httpx.SyncByteStream):
+    """Hold a provider response open until another thread closes it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = False
+
+    def __iter__(self) -> Any:
+        yield b'data: {"choices":[{"delta":{"content":"Partial"}}]}\n\n'
+        self.started.set()
+        self.release.wait(timeout=3)
+        if not self.closed:
+            yield (
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                b"data: [DONE]\n\n"
+            )
+
+    def close(self) -> None:
+        self.closed = True
+        self.release.set()
+
+
+def test_openrouter_latches_cancellation_until_stream_registration(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    requests = 0
+
+    def response(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return sse_response({"choices": [{"delta": {"content": "too late"}}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(response))
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    model.cancel_current()
+
+    with pytest.raises(OpenRouterError):
+        model.respond(
+            [{"role": "user", "content": "do not start"}],
+            kernel.tool_definitions(),
+        )
+    assert requests == 0
+
+
+def test_conversation_cancellation_closes_active_openrouter_stream(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    stream = PausingSSEStream()
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=stream,
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+    conversation = Harness(kernel).start(model)
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            conversation.send("stream forever")
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert stream.started.wait(timeout=1)
+    assert conversation.cancel() is True
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert stream.closed is True
+    assert len(failures) == 1
+    assert isinstance(failures[0], RunCancelled)
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "cancelled"]
+
+
+class PausingResetModel(FinalModel):
+    """Expose rollout teardown so cancellation can race it deterministically."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reset_started = threading.Event()
+        self.release_reset = threading.Event()
+        self.cancel_calls = 0
+
+    def reset_cancellation(self) -> None:
+        self.reset_started.set()
+        self.release_reset.wait(timeout=2)
+
+    def cancel_current(self) -> None:
+        self.cancel_calls += 1
+
+
+def test_conversation_cleanup_cannot_latch_cancellation_for_next_send(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingResetModel()
+    conversation = Harness(kernel).start(model)
+    failures: list[BaseException] = []
+    cancel_results: list[bool] = []
+    cancel_started = threading.Event()
+
+    def send() -> None:
+        try:
+            conversation.send("first")
+        except BaseException as error:
+            failures.append(error)
+
+    send_thread = threading.Thread(target=send)
+    send_thread.start()
+    assert model.reset_started.wait(timeout=1)
+
+    def cancel() -> None:
+        cancel_started.set()
+        cancel_results.append(conversation.cancel())
+
+    cancel_thread = threading.Thread(target=cancel)
+    cancel_thread.start()
+    assert cancel_started.wait(timeout=1)
+    cancel_thread.join(timeout=0.05)
+    assert cancel_thread.is_alive() is True
+    model.release_reset.set()
+    send_thread.join(timeout=2)
+    cancel_thread.join(timeout=2)
+
+    assert failures == []
+    assert cancel_results == [False]
+    assert model.cancel_calls == 0
+    assert conversation.send("second").answer == "answer 2"
+
+
+def test_authored_tools_do_not_inherit_provider_credentials(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.call(
+        "write_tool",
+        {
+            "name": "read_environment",
+            "description": "Report whether provider credentials are inherited.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import os\n\n"
+                "def main(input, ctx):\n"
+                "    return {'key': os.environ.get('OPENROUTER_API_KEY')}\n"
+            ),
+        },
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sentinel-provider-key")
+    runner = IsolatedToolRunner(kernel)
+    session_id = kernel.create_session()
+
+    result = runner.call(
+        "call_tool",
+        {"name": "read_environment", "args": {}},
+        session_id=session_id,
+    )
+
+    assert result == {"key": None}
+
+
+def test_bare_command_launches_tui_with_openrouter_defaults(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    database = tmp_path / "toolbox.db"
+    launched: dict[str, Any] = {}
+
+    def fake_run_tui(
+        kernel: Kernel, model: OpenRouterModel, *, model_name: str
+    ) -> None:
+        launched.update(kernel=kernel, model=model, model_name=model_name)
+
+    monkeypatch.setenv("MECHAGNOME_DB", str(database))
+    monkeypatch.setattr(sys, "argv", ["mechagnome"])
+    monkeypatch.setattr(cli, "run_tui", fake_run_tui)
+
+    assert cli.main() == 0
+    assert launched["kernel"].db_path == database
+    assert launched["model"].base_url == DEFAULT_BASE_URL
+    assert launched["model_name"] == DEFAULT_MODEL
+
+
+def test_tui_sends_a_prompt_without_blocking_and_saves_the_session(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = FinalModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "hello from the tui"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert prompt.disabled is False
+            assert model.message_snapshots[0][-1] == {
+                "role": "user",
+                "content": "hello from the tui",
+            }
+
+    asyncio.run(exercise())
+    events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "model", "final"]
+
+
+class PausingStreamingModel:
+    """Pause after one delta so the live TUI state can be inspected."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> Any:
+        yield ModelStreamEvent(text_delta="Partial")
+        self.started.set()
+        self.release.wait(timeout=3)
+        yield ModelStreamEvent(text_delta=" response")
+        yield ModelStreamEvent(turn=ModelTurn(text="Partial response"))
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        raise AssertionError("streaming interface should be preferred")
+
+    def cancel_current(self) -> None:
+        self.release.set()
+
+
+def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingStreamingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "stream please"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set() and app.streamed_text:
+                    break
+            assert app.streamed_text == "Partial"
+            assert app.query_one("#stream", Static).display is True
+            model.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.streamed_text == ""
+            assert app.query_one("#stream", Static).display is False
+            chat = "\n".join(
+                line.text for line in app.query_one("#chat", RichLog).lines
+            )
+            assert "Partial response" in chat
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+    kinds = [
+        event["kind"]
+        for event in kernel.read_session(app.conversation.session_id, limit=100)[
+            "events"
+        ]
+    ]
+    assert kinds == ["user", "model", "final"]
+
+
+def test_escape_stops_streaming_rollout_and_records_cancellation(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingStreamingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "stop this stream"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set() and app.streamed_text:
+                    break
+            assert app.streamed_text == "Partial"
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.busy is False
+            assert prompt.disabled is False
+            chat = "\n".join(
+                line.text for line in app.query_one("#chat", RichLog).lines
+            )
+            assert "stopped" in chat
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+    events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "cancelled"]
+    assert app.conversation.messages == []
+    resumed = Harness(kernel).start(
+        FinalModel(), session_id=app.conversation.session_id
+    )
+    assert resumed.messages == []
+
+
+class ToolThenFinalModel:
+    """Call a deliberately slow tool unless the rollout is stopped."""
+
+    def __init__(self) -> None:
+        self.turn = 0
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.turn += 1
+        if self.turn == 1:
+            return ModelTurn(
+                calls=(ToolCall("call_tool", {"name": "slow", "args": {}}, "slow-1"),)
+            )
+        return ModelTurn(text="Tool completed.")
+
+
+def test_escape_terminates_active_tool_subprocess(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    pid_path = tmp_path / "slow-tool-pids"
+    child_ready_path = tmp_path / "slow-tool-child-ready"
+    child_code = (
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"Path({str(child_ready_path)!r}).write_text('ready')\n"
+        "time.sleep(30)\n"
+    )
+    kernel.call(
+        "write_tool",
+        {
+            "name": "slow",
+            "description": "Sleep long enough to exercise cancellation.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import os\n"
+                "from pathlib import Path\n"
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n\n"
+                "def main(input, ctx):\n"
+                f"    child_code = {child_code!r}\n"
+                "    child = subprocess.Popen(\n"
+                "        [sys.executable, '-c', child_code]\n"
+                "    )\n"
+                f"    while not Path({str(child_ready_path)!r}).exists():\n"
+                "        time.sleep(0.01)\n"
+                f"    Path({str(pid_path)!r}).write_text(\n"
+                "        f'{os.getpid()} {child.pid}', encoding='utf-8'\n"
+                "    )\n"
+                "    time.sleep(30)\n"
+                "    return {'finished': True}\n"
+            ),
+        },
+    )
+    model = ToolThenFinalModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "run the slow tool"
+            await pilot.press("enter")
+            for _ in range(200):
+                await pilot.pause()
+                events = kernel.read_session(app.conversation.session_id, limit=100)[
+                    "events"
+                ]
+                if (
+                    any(
+                        event["kind"] == "call_started" and event["tool_name"] == "slow"
+                        for event in events
+                    )
+                    and pid_path.exists()
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("slow tool never started")
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.busy is False
+            assert prompt.disabled is False
+
+    worker_pid = child_pid = None
+    try:
+        asyncio.run(exercise())
+        worker_pid, child_pid = map(int, pid_path.read_text().split())
+        for _ in range(100):
+            if not _process_exists(worker_pid) and not _process_exists(child_pid):
+                break
+            time.sleep(0.01)
+        assert _process_exists(worker_pid) is False
+        assert _process_exists(child_pid) is False
+    finally:
+        for pid in (worker_pid, child_pid):
+            if pid is not None and _process_exists(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
+    assert events[-1]["kind"] == "cancelled"
+    assert model.turn == 1
+    assert app.conversation.messages == []
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+class ToolWritingModel:
+    """Write and call one user tool for headless TUI activity coverage."""
+
+    def __init__(self) -> None:
+        self.turn = 0
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.turn += 1
+        if self.turn == 1:
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "write_tool",
+                        {
+                            "name": "hello",
+                            "description": "Return a greeting.",
+                            "input_schema": {"type": "object"},
+                            "source": (
+                                "def main(input, ctx):\n    return {'hello': 'world'}\n"
+                            ),
+                        },
+                        "write-hello",
+                    ),
+                )
+            )
+        if self.turn == 2:
+            return ModelTurn(
+                calls=(ToolCall("call_tool", {"name": "hello", "args": {}}, "use"),)
+            )
+        return ModelTurn(text="Built and used hello.")
+
+
+def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    app = ToolboxApp(kernel, ToolWritingModel(), model_name="test/model")
+
+    async def submit(pilot: Any, value: str) -> None:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = value
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(pilot, "build a hello tool")
+            chat = "\n".join(
+                line.text for line in app.query_one("#chat", RichLog).lines
+            )
+            tools = "\n".join(
+                line.text for line in app.query_one("#tools", RichLog).lines
+            )
+            assert "write_tool" in chat
+            assert "call_tool" in chat
+            assert "hello" in chat
+            assert "hello  v1" in tools
+            assert "1 user" in str(app.query_one("#model-info", Static).render())
+
+            await submit(pilot, "/tools")
+            assert isinstance(app.screen, ToolManagerScreen)
+            assert app.screen.selected_name == "hello"
+            await pilot.press("escape")
+            await pilot.pause()
+            await submit(pilot, "/sessions")
+            old_session = app.conversation.session_id
+            inspection = "\n".join(
+                line.text for line in app.query_one("#chat", RichLog).lines
+            )
+            assert "saved sessions" in inspection
+            assert old_session[:12] in inspection
+            await submit(pilot, "/new")
+            assert app.conversation.session_id != old_session
+            assert len(kernel.list_sessions(limit=10)["sessions"]) == 2
+
+    asyncio.run(exercise())
+
+
+def test_tool_manager_navigates_source_diff_stats_and_deletes(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    creator = kernel.create_session()
+    kernel.write_tool(
+        name="number",
+        description="Return the first number without parsing [bold]markup[/bold].",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 1",
+        session_id=creator,
+    )
+    kernel.write_tool(
+        name="number",
+        description="A literal closing tag: [/bold]",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 2",
+        base_version=1,
+        session_id=creator,
+    )
+    kernel.call("number", {}, session_id=creator)
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            manager = app.screen
+            assert manager.selected_name == "number"
+            assert manager.selected_version == 2
+            source = manager.query_one("#tool-source", Static).content
+            assert isinstance(source, Syntax)
+            assert "return 2" in source.code
+            diff = manager.query_one("#tool-diff", Static).content
+            assert isinstance(diff, Syntax)
+            assert "number@v1" in diff.code
+            assert "+    return 2" in diff.code
+            assert "-    return 1\n+    return 2" in diff.code
+            assert manager.history["call_count"] == 1
+            assert manager.history["versions"][0]["created_session_id"] == creator
+            summary = manager.query_one("#tool-summary", Static).content
+            assert isinstance(summary, Text)
+            assert "[/bold]" in summary.plain
+
+            manager.query_one("#version-picker", Select).value = 1
+            await pilot.pause()
+            assert manager.selected_version == 1
+            source = manager.query_one("#tool-source", Static).content
+            assert isinstance(source, Syntax)
+            assert "return 1" in source.code
+
+            await pilot.click("#delete-tool")
+            await pilot.pause()
+            assert isinstance(app.screen, DeleteToolScreen)
+            await pilot.click("#confirm-delete")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            manager = app.screen
+            assert manager.history["active_version"] is None
+            assert manager.query_one("#delete-tool", Button).disabled is True
+            assert "number" not in {binding["name"] for binding in kernel.bindings()}
+            assert kernel.tool_history("number")["versions"][0]["version"] == 2
+
+    asyncio.run(exercise())
