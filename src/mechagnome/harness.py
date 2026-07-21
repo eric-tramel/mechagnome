@@ -27,6 +27,8 @@ class ModelTurn:
 
     text: str | None = None
     calls: tuple[ToolCall, ...] = field(default_factory=tuple)
+    reasoning: str | None = None
+    reasoning_details: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -201,27 +203,25 @@ class Conversation:
                 )
                 raise
             token.check()
-            self._append(
-                on_event,
-                "model",
-                {
-                    "text": turn.text,
-                    "calls": [
-                        {"id": call.id, "name": call.name, "args": call.args}
-                        for call in turn.calls
-                    ],
-                },
-            )
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": turn.text,
-                    "tool_calls": [
-                        {"id": call.id, "name": call.name, "args": call.args}
-                        for call in turn.calls
-                    ],
-                }
-            )
+            calls = [
+                {"id": call.id, "name": call.name, "args": call.args}
+                for call in turn.calls
+            ]
+            model_payload: dict[str, Any] = {"text": turn.text, "calls": calls}
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": turn.text,
+                "tool_calls": calls,
+            }
+            if turn.reasoning:
+                model_payload["reasoning"] = turn.reasoning
+                assistant_message["reasoning"] = turn.reasoning
+            if turn.reasoning_details:
+                details = list(turn.reasoning_details)
+                model_payload["reasoning_details"] = details
+                assistant_message["reasoning_details"] = details
+            self._append(on_event, "model", model_payload)
+            self.messages.append(assistant_message)
             if not turn.calls:
                 answer = turn.text or ""
                 self._append(on_event, "final", {"content": answer})
@@ -401,13 +401,18 @@ class Harness:
                     calls = payload.get("calls") or []
                     for call in calls:
                         call_names[call["id"]] = call["name"]
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": payload.get("text"),
-                            "tool_calls": calls,
-                        }
-                    )
+                    assistant_message: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": payload.get("text"),
+                        "tool_calls": calls,
+                    }
+                    if payload.get("reasoning"):
+                        assistant_message["reasoning"] = payload["reasoning"]
+                    if payload.get("reasoning_details"):
+                        assistant_message["reasoning_details"] = payload[
+                            "reasoning_details"
+                        ]
+                    messages.append(assistant_message)
                 elif event["kind"] == "tool_observation":
                     call_id = payload["model_call_id"]
                     messages.append(

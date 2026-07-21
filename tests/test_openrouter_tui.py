@@ -37,7 +37,9 @@ from mechagnome.openrouter import (
 )
 from mechagnome.tui import (
     DeleteToolScreen,
+    ModelSelectionScreen,
     NamespaceNameScreen,
+    ReasoningEffortScreen,
     ToolboxApp,
     ToolManagerScreen,
 )
@@ -209,6 +211,101 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert turn.calls[0].args == {"topic": "quickstart"}
 
 
+def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.params["supported_parameters"] == "tools"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "example/reasoner",
+                        "name": "Example Reasoner",
+                        "supported_parameters": ["tools", "reasoning"],
+                        "reasoning": {
+                            "supported_efforts": ["high", "low", "none"],
+                            "mandatory": False,
+                        },
+                    },
+                    {
+                        "id": "example/standard",
+                        "name": "Example Standard",
+                        "supported_parameters": ["tools"],
+                    },
+                    {
+                        "id": "example/mandatory-reasoner",
+                        "name": "Mandatory Reasoner",
+                        "supported_parameters": ["tools", "reasoning"],
+                        "reasoning": {
+                            "supported_efforts": None,
+                            "mandatory": True,
+                        },
+                    },
+                    {
+                        "id": "example/no-tools",
+                        "name": "No Tools",
+                        "supported_parameters": ["reasoning"],
+                    },
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    options = model.available_models()
+
+    assert [
+        (
+            option.id,
+            option.name,
+            option.reasoning_efforts,
+            option.reasoning_mandatory,
+        )
+        for option in options
+    ] == [
+        (
+            "example/reasoner",
+            "Example Reasoner",
+            ("high", "low", "none"),
+            False,
+        ),
+        ("example/standard", "Example Standard", (), False),
+        (
+            "example/mandatory-reasoner",
+            "Mandatory Reasoner",
+            ("minimal", "low", "medium", "high", "xhigh", "max"),
+            True,
+        ),
+    ]
+
+
+def test_openrouter_adapter_sends_configured_reasoning_effort(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return sse_response({"choices": [{"delta": {"content": "Ready."}}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=client,
+    )
+    model.reasoning_effort = "high"
+
+    model.respond(
+        [{"role": "user", "content": "hello"}],
+        Kernel(tmp_path / "toolbox.db").tool_definitions(),
+    )
+
+    assert captured["body"]["reasoning"] == {"effort": "high"}
+
+
 def test_openrouter_adapter_serializes_prior_tool_results(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
 
@@ -253,6 +350,69 @@ def test_openrouter_adapter_serializes_prior_tool_results(tmp_path: Path) -> Non
     ]
 
     assert model.respond(messages, kernel.tool_definitions()).text == "Ready."
+
+
+def test_openrouter_preserves_reasoning_across_tool_continuation(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    detail = {
+        "type": "reasoning.encrypted",
+        "data": "opaque-provider-payload",
+        "id": "reasoning-1",
+        "format": "anthropic-claude-v1",
+        "index": 0,
+    }
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return sse_response(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning": "I should inspect the help topic.",
+                                "reasoning_details": [detail],
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "reason-call",
+                                        "function": {
+                                            "name": "help",
+                                            "arguments": '{"topic":"quickstart"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                finish_reason="tool_calls",
+            )
+        assistant = body["messages"][-2]
+        assert assistant["reasoning"] == "I should inspect the help topic."
+        assert assistant["reasoning_details"] == [detail]
+        assert body["reasoning"] == {"effort": "high"}
+        return sse_response({"choices": [{"delta": {"content": "Ready with help."}}]})
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    model.reasoning_effort = "high"
+
+    result = Harness(kernel).start(model).send("How do I begin?")
+
+    assert result.answer == "Ready with help."
+    first_model_event = next(
+        event
+        for event in kernel.read_session(result.session_id, limit=100)["events"]
+        if event["kind"] == "model"
+    )
+    assert first_model_event["payload"]["reasoning_details"] == [detail]
 
 
 def test_openrouter_adapter_round_trips_objects_and_keeps_parallel_calls(
@@ -879,6 +1039,107 @@ def test_bare_command_launches_tui_with_openrouter_defaults(
     assert launched["kernel"].db_path == database
     assert launched["model"].base_url == DEFAULT_BASE_URL
     assert launched["model_name"] == DEFAULT_MODEL
+
+
+def test_tui_clicks_to_change_model_and_reasoning_effort(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "example/standard",
+                        "name": "Example Standard",
+                        "supported_parameters": ["tools"],
+                    },
+                    {
+                        "id": "example/reasoner",
+                        "name": "Example Reasoner",
+                        "supported_parameters": ["tools", "reasoning"],
+                        "reasoning": {
+                            "supported_efforts": ["high", "low"],
+                            "mandatory": False,
+                        },
+                    },
+                ]
+            },
+        )
+
+    model = OpenRouterModel(
+        model="example/standard",
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    app = ToolboxApp(
+        kernel=Kernel(tmp_path / "toolbox.db"), model=model, model_name=model.model
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            reasoning = app.query_one("#reasoning-selector", Button)
+            assert reasoning.display is False
+
+            await pilot.click("#model-selector")
+            await pilot.pause()
+            assert isinstance(app.screen, ModelSelectionScreen)
+            app.screen.query_one("#model-picker", Select).value = "example/reasoner"
+            await pilot.pause()
+            await pilot.click("#confirm-model")
+            await pilot.pause()
+
+            assert model.model == "example/reasoner"
+            assert reasoning.display is True
+            assert "example/reasoner" in str(
+                app.query_one("#model-selector", Button).label
+            )
+
+            await pilot.click("#reasoning-selector")
+            await pilot.pause()
+            assert isinstance(app.screen, ReasoningEffortScreen)
+            app.screen.query_one("#reasoning-picker", Select).value = "high"
+            await pilot.click("#confirm-reasoning")
+            await pilot.pause()
+
+            assert model.reasoning_effort == "high"
+            assert "high" in str(reasoning.label)
+
+            await pilot.click("#model-selector")
+            await pilot.pause()
+            assert isinstance(app.screen, ModelSelectionScreen)
+            app.screen.query_one("#model-name", Input).value = "custom/unknown"
+            await pilot.click("#confirm-model")
+            await pilot.pause()
+
+            assert model.model == "custom/unknown"
+            assert model.reasoning_effort is None
+            assert reasoning.display is False
+
+    asyncio.run(exercise())
+
+
+def test_tui_hides_reasoning_when_model_catalog_fails(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"message": "unavailable"}})
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    app = ToolboxApp(Kernel(tmp_path / "toolbox.db"), model, model_name=model.model)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.workers.wait_for_complete()
+            assert app.query_one("#reasoning-selector", Button).display is False
+            await pilot.click("#model-selector")
+            await pilot.pause()
+            assert isinstance(app.screen, ModelSelectionScreen)
+            assert app.screen.query_one("#model-name", Input).value == DEFAULT_MODEL
+
+    asyncio.run(exercise())
 
 
 def test_tui_sends_a_prompt_without_blocking_and_saves_the_session(

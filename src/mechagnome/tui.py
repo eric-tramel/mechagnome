@@ -33,7 +33,11 @@ from textual.widgets import (
 
 from mechagnome.harness import AgentEvent, Harness, Model, RunCancelled
 from mechagnome.kernel import Kernel
-from mechagnome.openrouter import OpenRouterModel
+from mechagnome.openrouter import (
+    OpenRouterError,
+    OpenRouterModel,
+    OpenRouterModelOption,
+)
 
 
 class DeleteToolScreen(ModalScreen[bool]):
@@ -172,6 +176,219 @@ class NamespaceNameScreen(ModalScreen[str | None]):
         name = self.query_one("#namespace-name", Input).value.strip()
         if name:
             self.dismiss(name)
+
+
+class ModelSelectionScreen(ModalScreen[str | None]):
+    """Select a catalog model or enter an OpenRouter model slug directly."""
+
+    CSS = """
+    ModelSelectionScreen {
+        align: center middle;
+        background: #0008;
+    }
+
+    #model-dialog {
+        width: 76;
+        height: auto;
+        max-height: 24;
+        border: round #38bdf8;
+        background: #111923;
+        padding: 1 2;
+    }
+
+    #model-title {
+        text-style: bold;
+        color: #7dd3fc;
+        margin-bottom: 1;
+    }
+
+    #model-name, #model-picker, #model-capability {
+        margin-bottom: 1;
+    }
+
+    #model-capability {
+        height: auto;
+        color: #8fa5ba;
+    }
+
+    #model-actions {
+        height: 3;
+        align-horizontal: right;
+    }
+
+    #model-actions Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        current_model: str,
+        options: list[OpenRouterModelOption],
+    ) -> None:
+        super().__init__()
+        self.current_model = current_model
+        self.options = options
+        self.options_by_id = {option.id: option for option in options}
+
+    def compose(self) -> ComposeResult:
+        picker_options = [
+            (f"{option.name}  ·  {option.id}", option.id) for option in self.options
+        ]
+        current = (
+            self.current_model
+            if self.current_model in self.options_by_id
+            else Select.NULL
+        )
+        with Vertical(id="model-dialog"):
+            yield Static("Change model", id="model-title")
+            yield Input(
+                value=self.current_model,
+                placeholder="provider/model-slug",
+                id="model-name",
+            )
+            yield Select(
+                picker_options,
+                value=current,
+                allow_blank=True,
+                prompt="Choose a tool-capable OpenRouter model",
+                id="model-picker",
+            )
+            yield Static(id="model-capability")
+            with Horizontal(id="model-actions"):
+                yield Button("Cancel", id="cancel-model")
+                yield Button("Use model", id="confirm-model", variant="primary")
+
+    def on_mount(self) -> None:
+        self._show_capability(self.current_model)
+        model_name = self.query_one("#model-name", Input)
+        model_name.focus()
+        model_name.action_end()
+
+    @on(Select.Changed, "#model-picker")
+    def select_model(self, event: Select.Changed) -> None:
+        if event.value is Select.NULL:
+            return
+        model_id = str(event.value)
+        self.query_one("#model-name", Input).value = model_id
+        self._show_capability(model_id)
+
+    @on(Input.Changed, "#model-name")
+    def edit_model(self, event: Input.Changed) -> None:
+        self._show_capability(event.value.strip())
+
+    @on(Input.Submitted, "#model-name")
+    def submit_model(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#cancel-model")
+    def cancel_model(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#confirm-model")
+    def confirm_model(self) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        model_id = self.query_one("#model-name", Input).value.strip()
+        if not model_id:
+            return
+        self.dismiss(model_id)
+
+    def _show_capability(self, model_id: str) -> None:
+        option = self.options_by_id.get(model_id)
+        if option is None:
+            message = "Custom slug; reasoning support is unknown."
+        elif option.reasoning_efforts:
+            message = "Reasoning efforts: " + ", ".join(option.reasoning_efforts) + "."
+        else:
+            message = "Does not expose configurable reasoning effort."
+        self.query_one("#model-capability", Static).update(message)
+
+
+class ReasoningEffortScreen(ModalScreen[str | None]):
+    """Choose the reasoning effort sent with subsequent model requests."""
+
+    CSS = """
+    ReasoningEffortScreen {
+        align: center middle;
+        background: #0008;
+    }
+
+    #reasoning-dialog {
+        width: 58;
+        height: auto;
+        border: round #a855f7;
+        background: #111923;
+        padding: 1 2;
+    }
+
+    #reasoning-title, #reasoning-picker, #reasoning-help {
+        margin-bottom: 1;
+    }
+
+    #reasoning-title {
+        text-style: bold;
+        color: #c084fc;
+    }
+
+    #reasoning-help {
+        height: auto;
+        color: #8fa5ba;
+    }
+
+    #reasoning-actions {
+        height: 3;
+        align-horizontal: right;
+    }
+
+    #reasoning-actions Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        current_effort: str | None,
+        efforts: tuple[str, ...],
+    ) -> None:
+        super().__init__()
+        self.current_effort = current_effort
+        self.efforts = efforts
+
+    def compose(self) -> ComposeResult:
+        options = [("Automatic (provider default)", "automatic")]
+        options.extend((effort, effort) for effort in self.efforts)
+        with Vertical(id="reasoning-dialog"):
+            yield Static("Reasoning effort", id="reasoning-title")
+            yield Select(
+                options,
+                value=self.current_effort or "automatic",
+                allow_blank=False,
+                id="reasoning-picker",
+            )
+            yield Static(
+                "The selected effort applies to the next model request. "
+                "Automatic uses the provider default; models that allow reasoning "
+                "to be disabled also offer none.",
+                id="reasoning-help",
+            )
+            with Horizontal(id="reasoning-actions"):
+                yield Button("Cancel", id="cancel-reasoning")
+                yield Button("Set effort", id="confirm-reasoning", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#reasoning-picker", Select).focus()
+
+    @on(Button.Pressed, "#cancel-reasoning")
+    def cancel_reasoning(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#confirm-reasoning")
+    def confirm_reasoning(self) -> None:
+        value = self.query_one("#reasoning-picker", Select).value
+        if value is not Select.NULL:
+            self.dismiss(str(value))
 
 
 class ToolManagerScreen(Screen[None]):
@@ -729,6 +946,37 @@ class ToolboxApp(App[None]):
         color: #8fa5ba;
     }
 
+    #status-message, #status-session, .status-separator {
+        width: auto;
+        height: 1;
+    }
+
+    .status-separator {
+        margin: 0 1;
+    }
+
+    .status-control {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        min-height: 1;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: #7dd3fc;
+        text-style: bold;
+    }
+
+    .status-control:hover, .status-control:focus {
+        background: #243447;
+        color: #bae6fd;
+        text-style: bold underline;
+    }
+
+    #reasoning-selector {
+        color: #c084fc;
+    }
+
     #stream {
         display: none;
         height: auto;
@@ -768,6 +1016,7 @@ class ToolboxApp(App[None]):
         self.harness = Harness(kernel, max_turns=max_turns)
         self.conversation = self.harness.start(model)
         self.busy = False
+        self.model_options: list[OpenRouterModelOption] = []
         self.streamed_text = ""
         self.pending_stream_text: list[str] = []
         self.stream_timer: Timer | None = None
@@ -782,7 +1031,22 @@ class ToolboxApp(App[None]):
                 yield Static("TOOLBOX", classes="sidebar-title")
                 yield RichLog(id="tools", wrap=True, markup=False, min_width=1)
         yield Static(id="stream")
-        yield Static(id="status")
+        with Horizontal(id="status"):
+            yield Static(id="status-message")
+            yield Static("·", classes="status-separator")
+            yield Button(
+                self._active_model_name,
+                id="model-selector",
+                classes="status-control",
+            )
+            yield Static("·", id="reasoning-separator", classes="status-separator")
+            yield Button(
+                "reasoning: automatic",
+                id="reasoning-selector",
+                classes="status-control",
+            )
+            yield Static("·", classes="status-separator")
+            yield Static(id="status-session")
         yield Input(
             placeholder="Ask the agent to build or use whatever it needs…",
             id="prompt",
@@ -793,12 +1057,89 @@ class ToolboxApp(App[None]):
         """Populate the initial panes and focus the prompt."""
         self._show_welcome()
         self._refresh_sidebar()
+        self._refresh_model_controls()
         self._set_busy(False)
         self.query_one("#prompt", Input).focus()
+        self.load_model_options()
 
     def on_unmount(self, event: Unmount) -> None:
         """Release a synchronous rollout before asyncio joins worker threads."""
         self.conversation.close()
+
+    @work(thread=True, exclusive=True, group="model-catalog", exit_on_error=False)
+    def load_model_options(self) -> None:
+        """Load OpenRouter model capabilities without blocking the TUI."""
+        if not isinstance(self.model, OpenRouterModel):
+            return
+        try:
+            options = self.model.available_models()
+        except OpenRouterError:
+            return
+        self.call_from_thread(self._set_model_options, options)
+
+    def _set_model_options(self, options: list[OpenRouterModelOption]) -> None:
+        self.model_options = options
+        current = self._current_model_option()
+        effort = self.model.reasoning_effort
+        if current is None or (
+            effort is not None and effort not in current.reasoning_efforts
+        ):
+            self.model.reasoning_effort = None
+        self._refresh_model_controls()
+
+    @on(Button.Pressed, "#model-selector")
+    def choose_model(self) -> None:
+        """Open the model picker when no rollout is active."""
+        if self.busy:
+            self._set_status("stop the active rollout before changing models")
+            return
+        if not isinstance(self.model, OpenRouterModel):
+            self._set_status("this model adapter cannot be changed at runtime")
+            return
+        self.push_screen(
+            ModelSelectionScreen(self._active_model_name, self.model_options),
+            self._finish_model_selection,
+        )
+
+    def _finish_model_selection(self, selection: str | None) -> None:
+        if selection is None:
+            return
+        self.model.model = selection
+        current = self._current_model_option()
+        effort = self.model.reasoning_effort
+        if current is None or (
+            effort is not None and effort not in current.reasoning_efforts
+        ):
+            self.model.reasoning_effort = None
+        self._refresh_sidebar()
+        self._refresh_model_controls()
+        self._set_status(f"model → {selection}")
+
+    @on(Button.Pressed, "#reasoning-selector")
+    def choose_reasoning_effort(self) -> None:
+        """Open the reasoning-effort picker when the model supports it."""
+        if self.busy:
+            self._set_status("stop the active rollout before changing reasoning")
+            return
+        if not isinstance(self.model, OpenRouterModel):
+            return
+        current = self._current_model_option()
+        if current is None or not current.reasoning_efforts:
+            return
+        self.push_screen(
+            ReasoningEffortScreen(
+                self.model.reasoning_effort,
+                current.reasoning_efforts,
+            ),
+            self._finish_reasoning_effort,
+        )
+
+    def _finish_reasoning_effort(self, selection: str | None) -> None:
+        if selection is None or not isinstance(self.model, OpenRouterModel):
+            return
+        self.model.reasoning_effort = None if selection == "automatic" else selection
+        self._refresh_model_controls()
+        self._set_status(f"reasoning → {selection}")
 
     @on(Input.Submitted, "#prompt")
     def submit_prompt(self, event: Input.Submitted) -> None:
@@ -860,7 +1201,7 @@ class ToolboxApp(App[None]):
                 self.query_one("#chat", RichLog).write(
                     Panel(
                         Markdown(content),
-                        title=self.model_name,
+                        title=self._active_model_name,
                         title_align="left",
                         border_style="bright_magenta",
                     )
@@ -919,7 +1260,7 @@ class ToolboxApp(App[None]):
             self.query_one("#chat", RichLog).write(
                 Panel(
                     Markdown(content),
-                    title=f"{self.model_name} · stopped",
+                    title=f"{self._active_model_name} · stopped",
                     title_align="left",
                     border_style="yellow",
                 )
@@ -1130,7 +1471,7 @@ class ToolboxApp(App[None]):
         self.query_one("#chat", RichLog).write(
             Panel(
                 Markdown(
-                    f"**{self.model_name}** · {readiness}\n\n"
+                    f"**{self._active_model_name}** · {readiness}\n\n"
                     "Ask for a task. The agent begins with only five core operations "
                     "and grows the toolbox as needed. Use `/help` for TUI commands."
                 ),
@@ -1170,7 +1511,7 @@ class ToolboxApp(App[None]):
         user_count = len(bindings) - core_count
         selection = " + ".join(item["name"] for item in selected)
         self.query_one("#model-info", Static).update(
-            f"{self.model_name}\n"
+            f"{self._active_model_name}\n"
             f"session {self.conversation.session_id[:10]}\n"
             f"{selection}\n"
             f"{core_count} core · {user_count} user"
@@ -1199,6 +1540,34 @@ class ToolboxApp(App[None]):
             if index < len(bindings) - 1:
                 toolbox.write("")
 
+    def _refresh_model_controls(self) -> None:
+        selector = self.query_one("#model-selector", Button)
+        reasoning = self.query_one("#reasoning-selector", Button)
+        separator = self.query_one("#reasoning-separator", Static)
+        configurable = isinstance(self.model, OpenRouterModel)
+        selector.disabled = not configurable
+        selector.label = self._active_model_name
+        current = self._current_model_option()
+        show_reasoning = current is not None and bool(current.reasoning_efforts)
+        reasoning.display = show_reasoning
+        separator.display = show_reasoning
+        if configurable:
+            effort = self.model.reasoning_effort or "automatic"
+            reasoning.label = f"reasoning: {effort}"
+
+    @property
+    def _active_model_name(self) -> str:
+        if isinstance(self.model, OpenRouterModel):
+            return self.model.model
+        return self.model_name
+
+    def _current_model_option(self) -> OpenRouterModelOption | None:
+        model_name = self._active_model_name
+        return next(
+            (option for option in self.model_options if option.id == model_name),
+            None,
+        )
+
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         prompt = self.query_one("#prompt", Input)
@@ -1210,8 +1579,9 @@ class ToolboxApp(App[None]):
             prompt.focus()
 
     def _set_status(self, message: str) -> None:
-        self.query_one("#status", Static).update(
-            f"{message}  ·  {self.model_name}  ·  {self.conversation.session_id[:10]}"
+        self.query_one("#status-message", Static).update(message)
+        self.query_one("#status-session", Static).update(
+            self.conversation.session_id[:10]
         )
 
     @staticmethod

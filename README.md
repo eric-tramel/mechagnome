@@ -49,6 +49,10 @@ tools, and sessions. A fresh working directory receives its own default
 namespace; an existing session retains its saved ordered selection when resumed.
 Databases upgraded from the original global-toolbox schema retain a `legacy`
 fallback for unmapped directories until an explicit cwd default is configured.
+Click the model name in the status bar to switch among tool-capable OpenRouter
+models or enter a model slug directly. Models whose catalog metadata advertises
+supported reasoning efforts also expose a neighboring control containing only
+those effort levels.
 
 TUI commands:
 

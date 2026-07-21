@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
@@ -20,6 +21,7 @@ DEFAULT_MODEL = "z-ai/glm-5.2"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_KEY_ENV = "OPENROUTER_API_KEY"
 MAX_STREAM_BYTES = 4_000_000
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 # Open-ended nested objects are not represented consistently by every model or
 # provider behind an OpenAI-compatible tool-calling endpoint. Keep the kernel's
@@ -62,6 +64,16 @@ class OpenRouterError(ToolboxError):
     """A structured provider or response-shape failure."""
 
 
+@dataclass(frozen=True)
+class OpenRouterModelOption:
+    """One tool-capable model exposed by OpenRouter's model catalog."""
+
+    id: str
+    name: str
+    reasoning_efforts: tuple[str, ...] = ()
+    reasoning_mandatory: bool = False
+
+
 class OpenRouterModel:
     """Streaming OpenRouter Chat Completions model adapter."""
 
@@ -75,6 +87,7 @@ class OpenRouterModel:
         client: httpx.Client | None = None,
     ) -> None:
         self.model = model
+        self.reasoning_effort: str | None = None
         self.base_url = DEFAULT_BASE_URL
         self.api_key_env = DEFAULT_KEY_ENV
         self.api_key = api_key or os.environ.get(DEFAULT_KEY_ENV)
@@ -108,6 +121,79 @@ class OpenRouterModel:
         """Discard a cancellation latch when its conversation rollout has ended."""
         with self._active_lock:
             self._cancel_requested = False
+
+    def available_models(self) -> list[OpenRouterModelOption]:
+        """Return text models that can use Mechagnome's tool-calling surface."""
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            if self.client is None:
+                with httpx.Client(timeout=self.timeout) as client:
+                    response = client.get(
+                        f"{self.base_url}/models",
+                        headers=headers,
+                        params={"supported_parameters": "tools"},
+                    )
+            else:
+                response = self.client.get(
+                    f"{self.base_url}/models",
+                    headers=headers,
+                    params={"supported_parameters": "tools"},
+                )
+        except httpx.HTTPError as error:
+            raise OpenRouterError(
+                "openrouter_transport", f"OpenRouter model catalog failed: {error}"
+            ) from error
+        if response.status_code >= 400:
+            raise self._http_error(response)
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise OpenRouterError(
+                "openrouter_models", "OpenRouter returned an invalid model catalog"
+            ) from error
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        if not isinstance(data, list):
+            raise OpenRouterError(
+                "openrouter_models", "OpenRouter returned an invalid model catalog"
+            )
+        options: list[OpenRouterModelOption] = []
+        for item in data:
+            if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
+                continue
+            parameters = item.get("supported_parameters")
+            supported = parameters if isinstance(parameters, list) else []
+            if "tools" not in supported:
+                continue
+            reasoning = item.get("reasoning")
+            efforts: tuple[str, ...] = ()
+            mandatory = False
+            if isinstance(reasoning, Mapping):
+                mandatory = reasoning.get("mandatory") is True
+                if "supported_efforts" in reasoning:
+                    raw_efforts = reasoning["supported_efforts"]
+                    if raw_efforts is None:
+                        efforts = REASONING_EFFORTS
+                    elif isinstance(raw_efforts, list):
+                        efforts = tuple(
+                            effort for effort in raw_efforts if isinstance(effort, str)
+                        )
+                if mandatory:
+                    efforts = tuple(effort for effort in efforts if effort != "none")
+            options.append(
+                OpenRouterModelOption(
+                    id=item["id"],
+                    name=(
+                        item["name"]
+                        if isinstance(item.get("name"), str)
+                        else item["id"]
+                    ),
+                    reasoning_efforts=efforts,
+                    reasoning_mandatory=mandatory,
+                )
+            )
+        return options
 
     def respond(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -143,6 +229,8 @@ class OpenRouterModel:
             "parallel_tool_calls": True,
             "stream": True,
         }
+        if self.reasoning_effort is not None:
+            body["reasoning"] = {"effort": self.reasoning_effort}
         try:
             if self.client is None:
                 with (
@@ -162,6 +250,8 @@ class OpenRouterModel:
         self, client: httpx.Client, body: dict[str, Any]
     ) -> Iterator[ModelStreamEvent]:
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        reasoning_details: list[dict[str, Any]] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
         saw_done = False
@@ -245,6 +335,30 @@ class OpenRouterModel:
                             "OpenRouter returned an invalid stream event",
                         ) from error
                     text = self._text_content(delta.get("content"))
+                    raw_reasoning = delta.get("reasoning")
+                    if raw_reasoning is None:
+                        reasoning = ""
+                    elif isinstance(raw_reasoning, str):
+                        reasoning = raw_reasoning
+                    else:
+                        raise OpenRouterError(
+                            "openrouter_response",
+                            "model returned invalid reasoning text",
+                        )
+                    raw_reasoning_details = delta.get("reasoning_details")
+                    if raw_reasoning_details is None:
+                        detail_deltas: list[dict[str, Any]] = []
+                    elif isinstance(raw_reasoning_details, list) and all(
+                        isinstance(detail, Mapping) for detail in raw_reasoning_details
+                    ):
+                        detail_deltas = [
+                            dict(detail) for detail in raw_reasoning_details
+                        ]
+                    else:
+                        raise OpenRouterError(
+                            "openrouter_response",
+                            "model returned invalid reasoning details",
+                        )
                     raw_tool_deltas = delta.get("tool_calls")
                     if raw_tool_deltas is None:
                         tool_deltas = []
@@ -256,7 +370,7 @@ class OpenRouterModel:
                             "model returned invalid tool-call deltas",
                         )
                     if finish_reason is not None:
-                        if text or tool_deltas:
+                        if text or reasoning or detail_deltas or tool_deltas:
                             raise OpenRouterError(
                                 "openrouter_response",
                                 "OpenRouter sent model data after stream completion",
@@ -270,6 +384,9 @@ class OpenRouterModel:
                     if text:
                         text_parts.append(text)
                         yield ModelStreamEvent(text_delta=text)
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+                    reasoning_details.extend(detail_deltas)
                     self._merge_tool_deltas(tool_calls, tool_deltas)
                     if reason is not None:
                         finish_reason = reason
@@ -303,7 +420,12 @@ class OpenRouterModel:
             for _, item in sorted(tool_calls.items())
         )
         yield ModelStreamEvent(
-            turn=ModelTurn(text="".join(text_parts) or None, calls=calls)
+            turn=ModelTurn(
+                text="".join(text_parts) or None,
+                calls=calls,
+                reasoning="".join(reasoning_parts) or None,
+                reasoning_details=tuple(reasoning_details),
+            )
         )
 
     @contextmanager
@@ -452,6 +574,12 @@ class OpenRouterModel:
                         }
                         for call in calls
                     ]
+                reasoning = message.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    item["reasoning"] = reasoning
+                reasoning_details = message.get("reasoning_details")
+                if reasoning_details:
+                    item["reasoning_details"] = reasoning_details
                 wired.append(item)
             elif role == "tool":
                 content = message.get("content")
