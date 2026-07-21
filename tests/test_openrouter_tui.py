@@ -1270,6 +1270,24 @@ def test_tool_manager_opens_during_streaming_rollout(tmp_path: Path) -> None:
         model.release.set()
 
 
+def test_ctrl_t_toggles_tool_manager(tmp_path: Path) -> None:
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"), FinalModel(), model_name="test/model"
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert not isinstance(app.screen, ToolManagerScreen)
+
+    asyncio.run(exercise())
+
+
 def test_escape_stops_streaming_rollout_and_records_cancellation(
     tmp_path: Path,
 ) -> None:

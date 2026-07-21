@@ -1422,7 +1422,10 @@ class ToolboxApp(App[None]):
         )
 
     def action_manage_tools(self) -> None:
-        """Open the source, history, usage, and deletion manager."""
+        """Toggle the source, history, usage, and deletion manager."""
+        if isinstance(self.screen, ToolManagerScreen):
+            self.pop_screen()
+            return
         self.push_screen(
             ToolManagerScreen(
                 self.kernel,
@@ -1439,7 +1442,7 @@ class ToolboxApp(App[None]):
                     "**Commands**\n\n"
                     "- `Esc` — stop the active rollout\n"
                     "- `/new` — start a new saved conversation\n"
-                    "- `/tools` or `Ctrl+T` — open tool management\n"
+                    "- `/tools` or `Ctrl+T` — toggle tool management\n"
                     "- `/toolbox list` — list namespaces and active order\n"
                     "- `/toolbox create NAME [CWD]` — create a namespace\n"
                     "- `/toolbox use|add|remove NAME...` — change this session\n"
