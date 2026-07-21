@@ -493,6 +493,77 @@ def test_tools_compose_and_read_the_live_session(tmp_path: Path) -> None:
     assert add_starts[0]["parent_call_id"] is not None
 
 
+def test_model_provider_propagates_through_nested_tool_calls(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "ask",
+        "def main(input, ctx):\n"
+        "    return ctx.model_provider.complete(input['messages'])\n",
+    )
+    write(
+        kernel,
+        "ask_many",
+        "def main(input, ctx):\n"
+        "    return [\n"
+        "        ctx.call_tool('ask', {'messages': input['messages']})\n"
+        "        for _ in range(input['count'])\n"
+        "    ]\n",
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, messages: Any) -> str:
+            self.calls += 1
+            return f"answer {self.calls}: {messages[-1]['content']}"
+
+    provider = Provider()
+    envelope = {
+        "name": "ask_many",
+        "args": {
+            "messages": [{"role": "user", "content": "hello"}],
+            "count": 8,
+        },
+    }
+    assert kernel.call("call_tool", envelope, model_provider=provider) == [
+        f"answer {index}: hello" for index in range(1, 9)
+    ]
+
+    envelope["args"]["count"] = 9
+    with pytest.raises(ToolboxError) as exhausted:
+        kernel.call("call_tool", envelope, model_provider=provider)
+    assert exhausted.value.code == "model_provider_limit"
+    assert provider.calls == 16
+
+    single = {
+        "name": "ask",
+        "args": {"messages": [{"role": "user", "content": "fresh"}]},
+    }
+    assert kernel.call("call_tool", single, model_provider=provider).endswith("fresh")
+    assert provider.calls == 17
+
+
+def test_model_provider_is_predictably_unavailable_for_direct_calls(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "ask",
+        "def main(input, ctx):\n"
+        "    return ctx.model_provider.complete([\n"
+        "        {'role': 'user', 'content': 'hello'},\n"
+        "    ])\n",
+    )
+
+    with pytest.raises(ToolboxError) as error:
+        call_tool(kernel, "ask", {})
+
+    assert error.value.code == "model_provider_unavailable"
+
+
 def test_all_core_source_is_readable_and_schema_is_pinned(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
 
@@ -1051,6 +1122,34 @@ class ReprogrammingModel:
         return ModelTurn(text="Search changed.")
 
 
+class ProviderUsingModel:
+    """Exercise one authored tool and provide its nested completion."""
+
+    def __init__(self) -> None:
+        self.turn = 0
+        self.provider_messages: list[Any] = []
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.turn += 1
+        if self.turn == 1:
+            return ModelTurn(
+                calls=(ToolCall("call_tool", {"name": "ask", "args": {}}, "ask"),)
+            )
+        return ModelTurn(text=str(messages[-1]["content"]))
+
+    def complete(self, messages: Any) -> str:
+        self.provider_messages.append(messages)
+        return "nested completion"
+
+    def cancel_current(self) -> None:
+        pass
+
+    def reset_cancellation(self) -> None:
+        pass
+
+
 class OversizedBatchModel:
     """Request a batch wider than the harness permits, then repair it."""
 
@@ -1081,6 +1180,74 @@ def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
         "Search active tools by name, description, schema, and source.",
         "Live rewritten search.",
     ]
+
+
+def test_harness_explicitly_binds_and_can_disable_model_provider(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "ask",
+        "def main(input, ctx):\n"
+        "    return ctx.model_provider.complete([\n"
+        "        {'role': 'user', 'content': 'nested'},\n"
+        "    ])\n",
+    )
+    model = ProviderUsingModel()
+
+    result = Harness(kernel).run(
+        model,
+        "ask through the provider",
+        model_provider=model,
+    )
+
+    assert result.answer == "nested completion"
+    assert model.provider_messages == [[{"role": "user", "content": "nested"}]]
+
+    disabled = Harness(kernel).run(
+        ProviderUsingModel(),
+        "ask without a provider",
+    )
+    assert "model_provider_unavailable" in disabled.answer
+
+
+def test_harness_preserves_providerless_legacy_tool_runner_signature(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+
+    class LegacyRunner:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def call(
+            self,
+            name: str,
+            args: dict[str, Any],
+            *,
+            session_id: str,
+            on_event: Any = None,
+            cancelled: Any = None,
+        ) -> Any:
+            self.calls.append(name)
+            return {"legacy": True}
+
+    runner = LegacyRunner()
+    result = Harness(kernel, tool_runner=runner).run(
+        ProviderUsingModel(),
+        "use legacy runner",
+    )
+
+    assert result.answer == "{'legacy': True}"
+    assert runner.calls == ["call_tool"]
+
+    with pytest.raises(ToolboxError) as error:
+        Harness(kernel, tool_runner=runner).start(
+            ProviderUsingModel(),
+            model_provider=ProviderUsingModel(),
+        )
+    assert error.value.code == "model_provider_unavailable"
 
 
 def test_harness_exposes_only_five_operations_and_saves_everything(

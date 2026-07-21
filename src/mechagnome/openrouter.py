@@ -6,7 +6,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from threading import Lock
@@ -21,6 +21,7 @@ DEFAULT_MODEL = "z-ai/glm-5.2"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_KEY_ENV = "OPENROUTER_API_KEY"
 MAX_STREAM_BYTES = 4_000_000
+MAX_COMPLETION_TOKENS = 2048
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 # Open-ended nested objects are not represented consistently by every model or
@@ -96,6 +97,7 @@ class OpenRouterModel:
         self.client = client
         self._active_lock = Lock()
         self._active_client: httpx.Client | None = None
+        self._active_client_closeable = False
         self._active_response: httpx.Response | None = None
         self._cancel_requested = False
 
@@ -109,7 +111,7 @@ class OpenRouterModel:
         with self._active_lock:
             self._cancel_requested = True
             response = self._active_response
-            client = self._active_client
+            client = self._active_client if self._active_client_closeable else None
         if response is not None:
             with suppress(Exception):
                 response.close()
@@ -209,6 +211,34 @@ class OpenRouterModel:
             )
         return completed
 
+    def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
+        """Return a text-only completion without the outer agent prompt or tools."""
+        if not self.api_key:
+            raise OpenRouterError(
+                "missing_api_key",
+                f"set {self.api_key_env} before sending a message",
+                env=self.api_key_env,
+            )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [dict(message) for message in messages],
+            "max_tokens": MAX_COMPLETION_TOKENS,
+            "stream": False,
+        }
+        try:
+            if self.client is None:
+                with (
+                    httpx.Client(timeout=self.timeout) as client,
+                    self._active(client=client, close_client_on_cancel=True),
+                ):
+                    return self._completion_response(client, body)
+            with self._active(client=self.client):
+                return self._completion_response(self.client, body)
+        except (httpx.HTTPError, httpx.StreamError) as error:
+            raise OpenRouterError(
+                "openrouter_transport", f"OpenRouter request failed: {error}"
+            ) from error
+
     def stream(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> Iterator[ModelStreamEvent]:
@@ -235,7 +265,7 @@ class OpenRouterModel:
             if self.client is None:
                 with (
                     httpx.Client(timeout=self.timeout) as client,
-                    self._active(client=client),
+                    self._active(client=client, close_client_on_cancel=True),
                 ):
                     yield from self._stream_response(client, body)
             else:
@@ -263,10 +293,8 @@ class OpenRouterModel:
                 "POST",
                 f"{self.base_url}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
+                    **self._headers(),
                     "Accept": "text/event-stream",
-                    "Content-Type": "application/json",
-                    "X-OpenRouter-Title": "mechagnome",
                 },
                 json=body,
             ) as response,
@@ -428,16 +456,80 @@ class OpenRouterModel:
             )
         )
 
+    def _completion_response(self, client: httpx.Client, body: dict[str, Any]) -> str:
+        deadline = time.monotonic() + self.timeout
+        response_bytes = bytearray()
+        with (
+            client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers={**self._headers(), "Accept": "application/json"},
+                json=body,
+            ) as response,
+            self._active(response=response),
+        ):
+            if response.is_error:
+                response.read()
+                raise self._http_error(response)
+            for chunk in response.iter_bytes():
+                if time.monotonic() > deadline:
+                    raise OpenRouterError(
+                        "openrouter_timeout",
+                        f"OpenRouter request exceeded {self.timeout:g} seconds",
+                    )
+                response_bytes.extend(chunk)
+                if len(response_bytes) > MAX_STREAM_BYTES:
+                    raise OpenRouterError(
+                        "openrouter_response_too_large",
+                        "OpenRouter response exceeded the response size limit",
+                        limit=MAX_STREAM_BYTES,
+                    )
+        try:
+            payload = json.loads(response_bytes)
+            if not isinstance(payload, Mapping):
+                raise TypeError("response is not an object")
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or len(choices) != 1:
+                raise TypeError("response choices are invalid")
+            choice = choices[0]
+            if not isinstance(choice, Mapping):
+                raise TypeError("response choice is not an object")
+            if choice.get("finish_reason") not in {None, "stop"}:
+                raise TypeError("completion did not stop normally")
+            message = choice.get("message")
+            if not isinstance(message, Mapping):
+                raise TypeError("response message is not an object")
+            if message.get("tool_calls"):
+                raise TypeError("completion returned tool calls")
+            content = message.get("content")
+            if not isinstance(content, str):
+                raise TypeError("completion content is not text")
+        except (TypeError, ValueError) as error:
+            raise OpenRouterError(
+                "openrouter_response",
+                "OpenRouter returned an invalid completion",
+            ) from error
+        return content
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "X-OpenRouter-Title": "mechagnome",
+        }
+
     @contextmanager
     def _active(
         self,
         *,
         client: httpx.Client | None = None,
         response: httpx.Response | None = None,
+        close_client_on_cancel: bool = False,
     ) -> Iterator[None]:
         with self._active_lock:
             if client is not None:
                 self._active_client = client
+                self._active_client_closeable = close_client_on_cancel
             if response is not None:
                 self._active_response = response
             cancel_requested = self._cancel_requested
@@ -448,7 +540,7 @@ class OpenRouterModel:
                 if response is not None:
                     with suppress(Exception):
                         response.close()
-                if client is not None:
+                if client is not None and close_client_on_cancel:
                     with suppress(Exception):
                         client.close()
                 raise OpenRouterError(
@@ -459,6 +551,7 @@ class OpenRouterModel:
             with self._active_lock:
                 if client is not None and self._active_client is client:
                     self._active_client = None
+                    self._active_client_closeable = False
                 if response is not None and self._active_response is response:
                     self._active_response = None
 

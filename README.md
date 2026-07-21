@@ -209,6 +209,23 @@ the current session sees its own in-progress call. Events use a stable
 per-session sequence and include nested parent call IDs and resolved versions.
 New events also carry stable toolbox and tool-version identities.
 
+Tools can request text from a host-configured model without receiving its
+credentials:
+
+```python
+def main(input, ctx):
+    text = ctx.model_provider.complete([
+        {"role": "system", "content": "Answer in one short sentence."},
+        {"role": "user", "content": input["question"]},
+    ])
+    return {"answer": text}
+```
+
+`complete()` accepts 1–64 text messages whose roles are `system`, `user`, or
+`assistant`, and returns text. One top-level tool call tree may make at most
+eight attempts; requests and responses are size-bounded. If a harness has no
+provider, the call raises `model_provider_unavailable`.
+
 ## Model adapter boundary
 
 The TUI uses the bundled streaming `OpenRouterModel`, while `Harness` itself
@@ -235,6 +252,13 @@ result = Harness(Kernel(".toolbox/toolbox.db")).run(
 
 For persistent interactive use, `Harness.start(model)` returns a `Conversation`;
 each `send()` reuses its message history and durable session ID.
+
+`Harness.start()` and `Harness.run()` accept an explicit `model_provider=`.
+Passing the outer model is the usual choice when it also implements
+`complete()`, `cancel_current()`, and `reset_cancellation()`. The default is
+`None`, so embedding code must opt in before authored tools receive model-spend
+authority. The bundled TUI opts its OpenRouter model in. Provider objects are
+runtime-only and are never restored from session history.
 
 Adapters may additionally implement `stream(messages, tools)` and yield
 `ModelStreamEvent(text_delta=...)` values followed by exactly one
@@ -282,11 +306,15 @@ user, an empty or explicitly mounted working directory, outbound network limits,
 and credentials scoped to the experiment. Destroy the environment after use.
 
 Authored tools are arbitrary Python. Each model-requested call tree runs in a
-fresh worker process with a small environment allowlist. This prevents direct
-inheritance through the worker's `os.environ`; it is **not credential
-separation**. The provider client and generated code run as the same OS user,
-so on permissive systems a tool may inspect the parent process or its memory and
-recover the OpenRouter key. Treat the experiment key as expendable and assume
+fresh worker process with a small environment allowlist. Provider requests use
+a host-side broker, so the isolated worker does not receive the concrete client
+or key in its environment or launch request. This is convenient credential
+opacity, **not credential separation**. The provider client and generated code
+run as the same OS user, so on permissive systems a tool may inspect the parent
+process or its memory and recover the OpenRouter key. The proxy also
+intentionally lets authored tools spend the configured provider account. Direct
+`Kernel.call(..., model_provider=...)` execution is in-process and makes no
+provider-isolation claim. Treat the experiment key as expendable and assume
 agent-authored code can spend or exfiltrate it.
 
 Nested tool calls remain together in the worker, and the host terminates the

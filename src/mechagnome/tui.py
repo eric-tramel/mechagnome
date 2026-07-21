@@ -34,6 +34,7 @@ from textual.widgets import (
 
 from mechagnome.harness import AgentEvent, Harness, Model, RunCancelled
 from mechagnome.kernel import Kernel
+from mechagnome.model_provider import ModelProvider
 from mechagnome.openrouter import (
     OpenRouterError,
     OpenRouterModel,
@@ -1102,13 +1103,18 @@ class ToolboxApp(App[None]):
         *,
         model_name: str,
         max_turns: int = 50,
+        model_provider: ModelProvider | None = None,
     ) -> None:
         super().__init__()
         self.kernel = kernel
         self.model = model
+        self.model_provider = model_provider
         self.model_name = model_name
         self.harness = Harness(kernel, max_turns=max_turns)
-        self.conversation = self.harness.start(model)
+        self.conversation = self.harness.start(
+            model,
+            model_provider=model_provider,
+        )
         self.busy = False
         self.model_options: list[OpenRouterModelOption] = []
         self.streamed_text = ""
@@ -1483,7 +1489,10 @@ class ToolboxApp(App[None]):
         """Begin a fresh model conversation without deleting toolbox state."""
         if self.busy:
             return
-        self.conversation = self.harness.start(self.model)
+        self.conversation = self.harness.start(
+            self.model,
+            model_provider=self.model_provider,
+        )
         self.query_one("#chat", ChatFeed).clear()
         self.forwarded_targets.clear()
         self.forwarded_events.clear()
@@ -1739,4 +1748,9 @@ class ToolboxApp(App[None]):
 
 def run_tui(kernel: Kernel, model: Model, *, model_name: str) -> None:
     """Launch the interactive terminal application."""
-    ToolboxApp(kernel, model, model_name=model_name).run()
+    ToolboxApp(
+        kernel,
+        model,
+        model_name=model_name,
+        model_provider=model if isinstance(model, OpenRouterModel) else None,
+    ).run()

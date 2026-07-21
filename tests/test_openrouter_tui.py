@@ -26,6 +26,7 @@ from mechagnome import (
     ModelStreamEvent,
     ModelTurn,
     RunCancelled,
+    ToolboxError,
     ToolCall,
 )
 from mechagnome import __main__ as cli
@@ -79,6 +80,24 @@ class FinalModel:
     ) -> ModelTurn:
         self.message_snapshots.append([dict(message) for message in messages])
         return ModelTurn(text=f"answer {len(self.message_snapshots)}")
+
+
+class StaticProvider:
+    """Simple cooperative provider for isolated-runner tests."""
+
+    def __init__(self, result: str = "provided") -> None:
+        self.result = result
+        self.calls = 0
+
+    def complete(self, messages: Any) -> str:
+        self.calls += 1
+        return self.result
+
+    def cancel_current(self) -> None:
+        pass
+
+    def reset_cancellation(self) -> None:
+        pass
 
 
 def sse_response(
@@ -232,6 +251,105 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert "JSON-encoded object" in call_schema["description"]
     assert turn.calls[0].name == "help"
     assert turn.calls[0].args == {"topic": "quickstart"}
+
+
+def test_openrouter_completion_is_text_only_and_omits_agent_surface() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers["Authorization"]
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Nested."},
+                    }
+                ]
+            },
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    messages = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Answer."},
+    ]
+
+    assert model.complete(messages) == "Nested."
+    assert captured["authorization"] == "Bearer test-key"
+    assert captured["body"] == {
+        "model": DEFAULT_MODEL,
+        "messages": messages,
+        "max_tokens": 2048,
+        "stream": False,
+    }
+
+
+def test_openrouter_completion_rejects_tool_calls_and_invalid_content() -> None:
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {"content": None, "tool_calls": [{}]},
+                        }
+                    ]
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "choices": [{"finish_reason": "stop", "message": {"content": []}}]
+                },
+            ),
+        ]
+    )
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: next(responses))
+        ),
+    )
+
+    for _ in range(2):
+        with pytest.raises(OpenRouterError, match="invalid completion"):
+            model.complete([{"role": "user", "content": "hello"}])
+
+
+def test_openrouter_completion_reuses_borrowed_client_after_cancellation() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": "reused"},
+                        }
+                    ]
+                },
+            )
+        )
+    )
+    model = OpenRouterModel(api_key="test-key", client=client)
+
+    model.cancel_current()
+    with pytest.raises(OpenRouterError) as cancelled:
+        model.complete([{"role": "user", "content": "first"}])
+    assert cancelled.value.code == "openrouter_cancelled"
+
+    model.reset_cancellation()
+    assert model.complete([{"role": "user", "content": "second"}]) == "reused"
+    assert client.is_closed is False
 
 
 def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
@@ -948,6 +1066,305 @@ def test_authored_tools_do_not_inherit_provider_credentials(
     assert result == {"key": None}
 
 
+def test_isolated_model_provider_is_predictably_unavailable(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.call(
+        "write_tool",
+        {
+            "name": "ask",
+            "description": "Request a completion.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "def main(input, ctx):\n"
+                "    return ctx.model_provider.complete([\n"
+                "        {'role': 'user', 'content': 'hello'},\n"
+                "    ])\n"
+            ),
+        },
+    )
+
+    with pytest.raises(ToolboxError) as error:
+        IsolatedToolRunner(kernel).call(
+            "call_tool",
+            {"name": "ask", "args": {}},
+            session_id=kernel.create_session(),
+        )
+
+    assert error.value.code == "model_provider_unavailable"
+
+
+def test_isolated_tool_uses_host_authenticated_model_provider(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    secret = "sentinel-provider-key"
+    host_pid = os.getpid()
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["pid"] = os.getpid()
+        captured["authorization"] = request.headers["Authorization"]
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "brokered"},
+                    }
+                ]
+            },
+        )
+
+    model = OpenRouterModel(
+        api_key=secret,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.call(
+        "write_tool",
+        {
+            "name": "brokered_completion",
+            "description": "Use the host model provider.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n\n"
+                "def main(input, ctx):\n"
+                "    request_text = Path(sys.argv[1]).read_text()\n"
+                "    return {\n"
+                "        'text': ctx.model_provider.complete([\n"
+                "            {'role': 'user', 'content': 'nested'},\n"
+                "        ]),\n"
+                "        'worker_pid': os.getpid(),\n"
+                "        'environment_key': os.environ.get('OPENROUTER_API_KEY'),\n"
+                "        'worker_request': request_text,\n"
+                "    }\n"
+            ),
+        },
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", secret)
+    session_id = kernel.create_session()
+
+    result = IsolatedToolRunner(kernel).call_with_model_provider(
+        "call_tool",
+        {"name": "brokered_completion", "args": {}},
+        session_id=session_id,
+        model_provider=model,
+    )
+
+    assert result["text"] == "brokered"
+    assert result["worker_pid"] != host_pid
+    assert result["environment_key"] is None
+    request = json.loads(result["worker_request"])
+    assert set(request) == {
+        "db_path",
+        "max_depth",
+        "max_calls",
+        "name",
+        "args",
+        "session_id",
+        "toolbox_ids",
+        "cwd",
+        "model_provider_fd",
+    }
+    assert isinstance(request["model_provider_fd"], int)
+    assert secret not in result["worker_request"]
+    assert captured["pid"] == host_pid
+    assert captured["authorization"] == f"Bearer {secret}"
+    assert captured["body"] == {
+        "model": DEFAULT_MODEL,
+        "messages": [{"role": "user", "content": "nested"}],
+        "max_tokens": 2048,
+        "stream": False,
+    }
+    events = kernel.read_session(session_id, limit=100)["events"]
+    assert secret not in json.dumps(events)
+    for database_file in tmp_path.glob("toolbox.db*"):
+        assert secret.encode() not in database_file.read_bytes()
+
+
+def test_isolated_provider_budget_counts_invalid_attempts(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.call(
+        "write_tool",
+        {
+            "name": "budget",
+            "description": "Exercise the model provider budget.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "def main(input, ctx):\n"
+                "    codes = []\n"
+                "    try:\n"
+                "        ctx.model_provider.complete([])\n"
+                "    except Exception as error:\n"
+                "        codes.append(error.code)\n"
+                "    for _ in range(7):\n"
+                "        ctx.model_provider.complete([\n"
+                "            {'role': 'user', 'content': 'valid'},\n"
+                "        ])\n"
+                "    try:\n"
+                "        ctx.model_provider.complete([\n"
+                "            {'role': 'user', 'content': 'exhausted'},\n"
+                "        ])\n"
+                "    except Exception as error:\n"
+                "        codes.append(error.code)\n"
+                "    return codes\n"
+            ),
+        },
+    )
+    provider = StaticProvider()
+
+    result = IsolatedToolRunner(kernel).call_with_model_provider(
+        "call_tool",
+        {"name": "budget", "args": {}},
+        session_id=kernel.create_session(),
+        model_provider=provider,
+    )
+
+    assert result == ["invalid_model_request", "model_provider_limit"]
+    assert provider.calls == 7
+
+
+def test_tool_timeout_cancels_and_resets_cooperative_model_provider(
+    tmp_path: Path,
+) -> None:
+    class BlockingProvider:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.exited = threading.Event()
+            self.cancel_calls = 0
+            self.reset_calls = 0
+
+        def complete(self, messages: Any) -> str:
+            self.started.set()
+            self.release.wait(timeout=2)
+            self.exited.set()
+            raise RuntimeError("cancelled upstream")
+
+        def cancel_current(self) -> None:
+            self.cancel_calls += 1
+            self.release.set()
+
+        def reset_cancellation(self) -> None:
+            self.reset_calls += 1
+
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.call(
+        "write_tool",
+        {
+            "name": "blocked_completion",
+            "description": "Wait for a model completion.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "def main(input, ctx):\n"
+                "    return ctx.model_provider.complete([\n"
+                "        {'role': 'user', 'content': 'wait'},\n"
+                "    ])\n"
+            ),
+        },
+    )
+    provider = BlockingProvider()
+    runner = IsolatedToolRunner(kernel, timeout=0.2)
+
+    with pytest.raises(ToolboxError) as error:
+        runner.call_with_model_provider(
+            "call_tool",
+            {"name": "blocked_completion", "args": {}},
+            session_id=kernel.create_session(),
+            model_provider=provider,
+        )
+
+    assert error.value.code == "tool_timeout"
+    assert provider.started.is_set()
+    assert provider.exited.wait(timeout=1)
+    assert provider.cancel_calls == 1
+    assert provider.reset_calls == 1
+
+
+def test_runner_cancels_broker_request_left_by_worker_daemon_thread(
+    tmp_path: Path,
+) -> None:
+    class BlockingProvider:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.cancel_calls = 0
+            self.reset_calls = 0
+
+        def complete(self, messages: Any) -> str:
+            self.started.set()
+            self.release.wait(timeout=2)
+            return "released"
+
+        def cancel_current(self) -> None:
+            self.cancel_calls += 1
+            self.release.set()
+
+        def reset_cancellation(self) -> None:
+            self.reset_calls += 1
+
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.call(
+        "write_tool",
+        {
+            "name": "background_completion",
+            "description": "Leave a provider request active while returning.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import threading\n"
+                "import time\n\n"
+                "def main(input, ctx):\n"
+                "    started = threading.Event()\n"
+                "    def request():\n"
+                "        started.set()\n"
+                "        ctx.model_provider.complete([\n"
+                "            {'role': 'user', 'content': 'background'},\n"
+                "        ])\n"
+                "    threading.Thread(target=request, daemon=True).start()\n"
+                "    started.wait(timeout=1)\n"
+                "    time.sleep(0.1)\n"
+                "    return 'worker returned'\n"
+            ),
+        },
+    )
+    provider = BlockingProvider()
+
+    result = IsolatedToolRunner(kernel).call_with_model_provider(
+        "call_tool",
+        {"name": "background_completion", "args": {}},
+        session_id=kernel.create_session(),
+        model_provider=provider,
+    )
+
+    assert result == "worker returned"
+    assert provider.started.is_set()
+    assert provider.cancel_calls == 1
+    assert provider.reset_calls == 1
+
+
+def test_isolated_runner_rejects_provider_without_cancellation(
+    tmp_path: Path,
+) -> None:
+    class NonCancellableProvider:
+        def complete(self, messages: Any) -> str:
+            return "unreachable"
+
+    kernel = Kernel(tmp_path / "toolbox.db")
+
+    with pytest.raises(ToolboxError) as error:
+        IsolatedToolRunner(kernel).call_with_model_provider(
+            "help",
+            {"topic": "quickstart"},
+            session_id=kernel.create_session(),
+            model_provider=NonCancellableProvider(),  # type: ignore[arg-type]
+        )
+
+    assert error.value.code == "invalid_model_provider"
+
+
 def test_isolated_worker_uses_persisted_session_cwd(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -968,8 +1385,11 @@ def test_isolated_worker_uses_persisted_session_cwd(tmp_path: Path) -> None:
     )
     session_id = kernel.create_session()
 
-    result = IsolatedToolRunner(kernel).call(
-        "call_tool", {"name": "where", "args": {}}, session_id=session_id
+    result = IsolatedToolRunner(kernel).call_with_model_provider(
+        "call_tool",
+        {"name": "where", "args": {}},
+        session_id=session_id,
+        model_provider=StaticProvider(),
     )
 
     assert result == str(workspace.resolve())
@@ -1019,13 +1439,14 @@ def test_inflight_worker_keeps_its_toolbox_selection_snapshot(tmp_path: Path) ->
 
     def run() -> None:
         outcomes.append(
-            IsolatedToolRunner(kernel).call(
+            IsolatedToolRunner(kernel).call_with_model_provider(
                 "call_tool",
                 {
                     "name": "wait_then_call",
                     "args": {"ready": str(ready), "release": str(release)},
                 },
                 session_id=session_id,
+                model_provider=StaticProvider(),
             )
         )
 
@@ -1188,6 +1609,29 @@ def test_tui_sends_a_prompt_without_blocking_and_saves_the_session(
     asyncio.run(exercise())
     events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
     assert [event["kind"] for event in events] == ["user", "model", "final"]
+
+
+def test_tui_preserves_model_provider_when_starting_a_new_session(
+    tmp_path: Path,
+) -> None:
+    provider = StaticProvider()
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"),
+        FinalModel(),
+        model_name="test/model",
+        model_provider=provider,
+    )
+    original_session = app.conversation.session_id
+    assert app.conversation.model_provider is provider
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            assert app.conversation.session_id != original_session
+            assert app.conversation.model_provider is provider
+
+    asyncio.run(exercise())
 
 
 class PausingStreamingModel:

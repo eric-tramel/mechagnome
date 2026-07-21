@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from mechagnome.bootstrap import CORE_NAMES
 from mechagnome.isolation import IsolatedToolRunner
 from mechagnome.kernel import JsonValue, Kernel, ToolboxError
+from mechagnome.model_provider import ModelProvider
 
 
 @dataclass(frozen=True)
@@ -112,14 +113,23 @@ class Conversation:
         max_turns: int,
         max_calls_per_turn: int,
         tool_runner: IsolatedToolRunner,
+        model_provider: ModelProvider | None = None,
         messages: list[dict[str, Any]] | None = None,
     ) -> None:
+        if model_provider is not None and not callable(
+            getattr(tool_runner, "call_with_model_provider", None)
+        ):
+            raise ToolboxError(
+                "model_provider_unavailable",
+                "the configured tool runner cannot broker model provider requests",
+            )
         self.kernel = kernel
         self.model = model
         self.session_id = session_id
         self.max_turns = max_turns
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner
+        self.model_provider = model_provider
         self.messages = messages or []
         self._run_lock = Lock()
         self._current_token: _CancellationToken | None = None
@@ -313,13 +323,24 @@ class Conversation:
                 }
             }
         try:
-            return self.tool_runner.call(
-                call.name,
-                call.args,
-                session_id=self.session_id,
-                on_event=lambda event: self._emit_record(sink, event),
-                cancelled=lambda: token.cancelled,
+            call_with_provider = getattr(
+                self.tool_runner,
+                "call_with_model_provider",
+                None,
             )
+            call_kwargs = {
+                "session_id": self.session_id,
+                "on_event": lambda event: self._emit_record(sink, event),
+                "cancelled": lambda: token.cancelled,
+            }
+            if callable(call_with_provider):
+                return call_with_provider(
+                    call.name,
+                    call.args,
+                    model_provider=self.model_provider,
+                    **call_kwargs,
+                )
+            return self.tool_runner.call(call.name, call.args, **call_kwargs)
         except ToolboxError as error:
             if token.cancelled or error.code == "cancelled":
                 raise RunCancelled from error
@@ -371,7 +392,13 @@ class Harness:
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner or IsolatedToolRunner(kernel)
 
-    def start(self, model: Model, *, session_id: str | None = None) -> Conversation:
+    def start(
+        self,
+        model: Model,
+        *,
+        session_id: str | None = None,
+        model_provider: ModelProvider | None = None,
+    ) -> Conversation:
         """Start a persistent conversation suitable for a chat interface."""
         identifier = self.kernel.create_session(session_id)
         return Conversation(
@@ -381,6 +408,7 @@ class Harness:
             max_turns=self.max_turns,
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
+            model_provider=model_provider,
             messages=self._session_messages(identifier),
         )
 
@@ -437,6 +465,11 @@ class Harness:
         prompt: str,
         *,
         session_id: str | None = None,
+        model_provider: ModelProvider | None = None,
     ) -> RunResult:
         """Run until the model returns a turn with no operation calls."""
-        return self.start(model, session_id=session_id).send(prompt)
+        return self.start(
+            model,
+            session_id=session_id,
+            model_provider=model_provider,
+        ).send(prompt)

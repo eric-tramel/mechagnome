@@ -10,6 +10,7 @@ from mechagnome.harness import (
     ToolCall,
 )
 from mechagnome.kernel import InvocationScope, Kernel, ToolboxError
+from mechagnome.model_provider import ModelProvider
 from mechagnome.openrouter import OpenRouterModel
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "InvocationScope",
     "Kernel",
     "ModelStreamEvent",
+    "ModelProvider",
     "ModelTurn",
     "OpenRouterModel",
     "RunCancelled",

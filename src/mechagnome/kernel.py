@@ -14,9 +14,12 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mechagnome.bootstrap import BOOTSTRAP_TOOLS, CORE_NAMES, CORE_SCHEMAS
+
+if TYPE_CHECKING:
+    from mechagnome.model_provider import _CompletionProvider
 
 JsonValue = Any
 
@@ -58,6 +61,7 @@ class _InvocationState:
     scope: InvocationScope
     max_depth: int
     max_calls: int
+    model_provider: _CompletionProvider
     calls: int = 0
 
     @property
@@ -133,6 +137,7 @@ class ToolContext:
         self._logical_slot = logical_slot
         self.caller_session_id = state.session_id
         self.sessions = SessionAccess(kernel, state.session_id)
+        self.model_provider = state.model_provider
 
     @property
     def kernel(self) -> _KernelCapability:
@@ -1434,8 +1439,11 @@ class Kernel:
         session_id: str | None = None,
         version: int | None = None,
         scope: InvocationScope | None = None,
+        model_provider: _CompletionProvider | None = None,
     ) -> JsonValue:
         """Start a top-level invocation in a durable session."""
+        from mechagnome.model_provider import _bind_model_provider
+
         if scope is None and session_id is None:
             identifier = self.create_session()
             active_scope = self.snapshot_scope(identifier)
@@ -1445,6 +1453,7 @@ class Kernel:
             scope=active_scope,
             max_depth=self.max_depth,
             max_calls=self.max_calls,
+            model_provider=_bind_model_provider(model_provider),
         )
         self.append_event(
             active_scope.session_id,
