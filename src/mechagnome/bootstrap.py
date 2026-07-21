@@ -9,7 +9,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class BootstrapTool:
-    """One initial implementation installed into a distinguished core slot."""
+    """One code-shipped default for a distinguished core slot."""
 
     name: str
     description: str

@@ -19,10 +19,12 @@ operations:
 It begins with no user-authored tools. During a session, an agent can write a
 Python tool, call it immediately, find it again later, compose it from other
 tools, and inspect current or historical sessions. The five core operations are
-also stored as readable, immutable source versions and can be replaced through
-`write_tool`. Tools live in named toolbox namespaces. Each session starts from
-the toolbox mapped to its working directory and can replace or compose its
-active namespaces without changing the provider-facing five-tool surface.
+also readable and replaceable through `write_tool`; their code-shipped version 1
+defaults track the installed library, while persisted version 2 and later
+implementations are immutable. Tools live in named toolbox namespaces. Each
+session starts from the toolbox mapped to its working directory and can replace
+or compose its active namespaces without changing the provider-facing five-tool
+surface.
 
 The fixed part is deliberately small: SQLite storage, version resolution,
 execution, event append, recursion limits, binding changes, and host rollback.
@@ -241,9 +243,10 @@ through the stable `call_tool(name, args, version=None)` envelope.
 ## Metacircular core
 
 The outer names and schemas of the five operations are pinned so a provider can
-keep one stable tool surface. Their descriptions, source, and behavior are
-versioned like any other tool. Privilege comes from the logical core slot being
-invoked:
+keep one stable tool surface. Their version 1 descriptions, source, and behavior
+are code-shipped defaults refreshed from the installed library at startup.
+Persisted version 2 and later implementations can override those defaults like
+any other tool version. Privilege comes from the logical core slot being invoked:
 
 | Slot | Low-level capability |
 | --- | --- |
@@ -258,10 +261,12 @@ the catalog capability. Activating the same source in the `search_tools` slot
 does. This is an API invariant, not an adversarial security boundary.
 
 Every successful write creates and activates an immutable integer version in
-one transaction, while `base_version` rejects stale binding updates. An
-invocation resolves its version before executing, so a core tool can replace
-itself: the running frame finishes on the old source and its next invocation
-sees the new binding.
+one transaction, while `base_version` rejects stale binding updates. Core
+version 1 is the exception: it tracks the current code-shipped default, so
+rolling back to version 1 restores the implementation bundled with the running
+library. An invocation resolves its version before executing, so a core tool can
+replace itself: the running frame finishes on the old source and its next
+invocation sees the new binding.
 
 ## Safety boundary
 

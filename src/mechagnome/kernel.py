@@ -299,6 +299,7 @@ class Kernel:
                             "unsupported_schema",
                             f"unsupported toolbox schema version: {version}",
                         )
+                self._refresh_core_defaults(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 connection.commit()
             except Exception:
@@ -549,6 +550,26 @@ class Kernel:
                 VALUES (?, ?, ?)
                 """,
                 (toolbox_id, tool.name, int(version.lastrowid)),
+            )
+
+    @staticmethod
+    def _refresh_core_defaults(connection: sqlite3.Connection) -> None:
+        """Synchronize every toolbox's core version 1 with shipped source."""
+        for tool in BOOTSTRAP_TOOLS:
+            connection.execute(
+                """
+                UPDATE tool_versions
+                SET description = ?, schema_json = ?, source = ?
+                WHERE version = 1 AND lineage_id IN (
+                    SELECT id FROM tool_lineages WHERE name = ?
+                )
+                """,
+                (
+                    tool.description,
+                    _json(tool.input_schema),
+                    tool.source,
+                    tool.name,
+                ),
             )
 
     def _create_toolbox_connection(

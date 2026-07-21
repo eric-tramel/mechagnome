@@ -6,6 +6,7 @@ import json
 import sqlite3
 import stat
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ import pytest
 
 from mechagnome import Harness, Kernel, ModelTurn, ToolboxError, ToolCall
 from mechagnome import __main__ as cli
-from mechagnome.bootstrap import CORE_NAMES, CORE_SCHEMAS
+from mechagnome.bootstrap import CORE_NAMES, CORE_SCHEMAS, HELP_SOURCE
 
 
 def kernel_at(tmp_path: Path, **kwargs: Any) -> Kernel:
@@ -70,6 +71,56 @@ def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
     reopened = kernel_at(tmp_path)
     assert reopened.bindings() == kernel.bindings()
     assert all(item["versions"] == [1] for item in reopened.bindings())
+
+
+def test_reopen_refreshes_code_shipped_core_version_one(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    kernel.create_toolbox("secondary")
+    stale_source = "def main(input, ctx):\n    return 'stale default'\n"
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute(
+            """
+            UPDATE tool_versions
+            SET description = 'stale', schema_json = '{}', source = ?
+            WHERE version = 1 AND lineage_id IN (
+                SELECT id FROM tool_lineages WHERE name = 'help'
+            )
+            """,
+            (stale_source,),
+        )
+
+    reopened = kernel_at(tmp_path)
+
+    assert reopened.call("help", {}).startswith("# Mechagnome help\n")
+    refreshed = reopened.read_tool_source("help", version=1)
+    assert refreshed["description"] == (
+        "Read progressive documentation for using and extending the toolbox."
+    )
+    assert refreshed["input_schema"] == CORE_SCHEMAS["help"]
+    assert refreshed["source"] == HELP_SOURCE
+    assert reopened.read_tool_source("help", version=1, toolbox="secondary")[
+        "source"
+    ] == HELP_SOURCE
+
+
+def test_reopen_preserves_active_core_version_two_override(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    replacement_source = "def main(input, ctx):\n    return 'custom help'\n"
+    write(
+        kernel,
+        "help",
+        replacement_source,
+        input_schema=CORE_SCHEMAS["help"],
+        base_version=1,
+    )
+
+    reopened = kernel_at(tmp_path)
+
+    assert reopened.call("help", {}) == "custom help"
+    assert reopened.call("help", {}, version=1).startswith("# Mechagnome help\n")
+    binding = next(item for item in reopened.bindings() if item["name"] == "help")
+    assert binding["active_version"] == 2
+    assert binding["versions"] == [1, 2]
 
 
 def test_bindings_can_order_by_recent_usage_without_changing_payload(
