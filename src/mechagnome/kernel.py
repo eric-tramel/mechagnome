@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 import os
@@ -19,7 +20,9 @@ from mechagnome.bootstrap import BOOTSTRAP_TOOLS, CORE_NAMES, CORE_SCHEMAS
 
 JsonValue = Any
 
+_SCHEMA_VERSION = 2
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+_TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 
 
 class ToolboxError(RuntimeError):
@@ -41,17 +44,32 @@ class ToolboxError(RuntimeError):
         }
 
 
+@dataclass(frozen=True)
+class InvocationScope:
+    """Immutable toolbox selection and working directory for one call tree."""
+
+    session_id: str
+    toolbox_ids: tuple[str, ...]
+    cwd: str
+
+
 @dataclass
 class _InvocationState:
-    session_id: str
+    scope: InvocationScope
     max_depth: int
     max_calls: int
     calls: int = 0
+
+    @property
+    def session_id(self) -> str:
+        return self.scope.session_id
 
 
 @dataclass(frozen=True)
 class _ResolvedTool:
     id: int
+    toolbox_id: str
+    toolbox_name: str
     name: str
     version: int
     description: str
@@ -129,7 +147,7 @@ class ToolContext:
     def call_tool(
         self, name: str, args: dict[str, Any], version: int | None = None
     ) -> JsonValue:
-        """Invoke a tool through the currently active editable call_tool binding."""
+        """Invoke a tool through the snapshotted editable dispatcher."""
         envelope: dict[str, Any] = {"name": name, "args": args}
         if version is not None:
             envelope["version"] = version
@@ -156,14 +174,18 @@ class _KernelCapability:
             )
 
     def catalog(self, include_core: bool = True) -> list[dict[str, Any]]:
-        """Return active tool metadata to the search_tools implementation."""
+        """Return effective metadata to the search implementation."""
         self._require("search_tools")
-        return self._context._kernel.catalog(include_core=include_core)
+        return self._context._kernel.catalog(
+            include_core=include_core, scope=self._context._state.scope
+        )
 
     def read_tool_source(self, name: str, version: int | None = None) -> dict[str, Any]:
-        """Read source through the read_tool_source capability."""
+        """Read source through the read capability."""
         self._require("read_tool_source")
-        return self._context._kernel.read_tool_source(name, version=version)
+        return self._context._kernel.read_tool_source(
+            name, version=version, scope=self._context._state.scope
+        )
 
     def write_tool(
         self,
@@ -174,7 +196,7 @@ class _KernelCapability:
         source: str,
         base_version: int | None = None,
     ) -> dict[str, Any]:
-        """Store source through the write_tool capability."""
+        """Store source through the write capability."""
         self._require("write_tool")
         return self._context._kernel.write_tool(
             name=name,
@@ -184,12 +206,13 @@ class _KernelCapability:
             base_version=base_version,
             session_id=self._context._state.session_id,
             parent_call_id=self._context._call_id,
+            scope=self._context._state.scope,
         )
 
     def execute(
         self, name: str, args: dict[str, Any], version: int | None = None
     ) -> JsonValue:
-        """Bottom out recursive dispatch through the call_tool capability."""
+        """Bottom out recursive dispatch through the call capability."""
         self._require("call_tool")
         return self._context._kernel._invoke(
             name,
@@ -205,9 +228,15 @@ class Kernel:
     """Persistent host substrate below the five editable core operations."""
 
     def __init__(
-        self, db_path: str | Path, *, max_depth: int = 12, max_calls: int = 100
+        self,
+        db_path: str | Path,
+        *,
+        max_depth: int = 12,
+        max_calls: int = 100,
+        cwd: str | Path | None = None,
     ) -> None:
-        self.db_path = Path(db_path)
+        self.cwd = self._canonical_cwd(cwd or Path.cwd())
+        self.db_path = Path(db_path).expanduser().resolve()
         parent_existed = self.db_path.parent.exists()
         self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not parent_existed:
@@ -226,93 +255,617 @@ class Kernel:
         self.max_calls = max_calls
         self._initialize()
 
+    @staticmethod
+    def _canonical_cwd(path: str | Path) -> str:
+        try:
+            resolved = Path(path).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise ToolboxError("invalid_cwd", f"invalid directory: {path}") from error
+        if not resolved.is_dir():
+            raise ToolboxError("invalid_cwd", f"not a directory: {resolved}")
+        return str(resolved)
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
-    def _initialize(self) -> None:
-        with closing(self._connect()) as connection, connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS tool_versions (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    description TEXT NOT NULL,
-                    schema_json TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(name, version)
-                );
-
-                CREATE TABLE IF NOT EXISTS bindings (
-                    name TEXT PRIMARY KEY,
-                    tool_id INTEGER NOT NULL REFERENCES tool_versions(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY,
-                    session_id TEXT NOT NULL REFERENCES sessions(id),
-                    seq INTEGER NOT NULL,
-                    kind TEXT NOT NULL,
-                    call_id TEXT,
-                    parent_call_id TEXT,
-                    tool_name TEXT,
-                    tool_version INTEGER,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(session_id, seq)
-                );
-                """
+    @staticmethod
+    def _tables(connection: sqlite3.Connection) -> set[str]:
+        return {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
-            for tool in BOOTSTRAP_TOOLS:
-                row = connection.execute(
-                    "SELECT id FROM tool_versions WHERE name = ? AND version = 1",
-                    (tool.name,),
-                ).fetchone()
-                if row is None:
-                    cursor = connection.execute(
-                        """
-                        INSERT INTO tool_versions (
-                            name, version, description, schema_json, source,
-                            created_at
-                        ) VALUES (?, 1, ?, ?, ?, ?)
-                        """,
-                        (
-                            tool.name,
-                            tool.description,
-                            _json(tool.input_schema),
-                            tool.source,
-                            _now(),
-                        ),
-                    )
-                    tool_id = int(cursor.lastrowid)
+        }
+
+    def _initialize(self) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                tables = self._tables(connection)
+                if "tool_versions" not in tables:
+                    self._create_schema(connection)
+                    self._ensure_cwd_default(connection, self.cwd)
+                elif "tool_lineages" not in tables:
+                    self._migrate_legacy(connection)
                 else:
-                    tool_id = int(row["id"])
+                    version = int(
+                        connection.execute("PRAGMA user_version").fetchone()[0]
+                    )
+                    if version != _SCHEMA_VERSION:
+                        raise ToolboxError(
+                            "unsupported_schema",
+                            f"unsupported toolbox schema version: {version}",
+                        )
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE toolboxes (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE cwd_defaults (
+                cwd TEXT PRIMARY KEY,
+                toolbox_id TEXT NOT NULL UNIQUE REFERENCES toolboxes(id)
+            )
+            """,
+            """
+            CREATE TABLE tool_lineages (
+                id INTEGER PRIMARY KEY,
+                toolbox_id TEXT NOT NULL REFERENCES toolboxes(id),
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(toolbox_id, name)
+            )
+            """,
+            """
+            CREATE TABLE tool_versions (
+                id INTEGER PRIMARY KEY,
+                lineage_id INTEGER NOT NULL REFERENCES tool_lineages(id),
+                version INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                schema_json TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(lineage_id, version)
+            )
+            """,
+            """
+            CREATE TABLE bindings (
+                toolbox_id TEXT NOT NULL REFERENCES toolboxes(id),
+                name TEXT NOT NULL,
+                tool_version_id INTEGER NOT NULL REFERENCES tool_versions(id),
+                PRIMARY KEY(toolbox_id, name)
+            )
+            """,
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                cwd TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE session_toolboxes (
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                position INTEGER NOT NULL,
+                toolbox_id TEXT NOT NULL REFERENCES toolboxes(id),
+                PRIMARY KEY(session_id, position),
+                UNIQUE(session_id, toolbox_id)
+            )
+            """,
+            """
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                seq INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                call_id TEXT,
+                parent_call_id TEXT,
+                toolbox_id TEXT REFERENCES toolboxes(id),
+                tool_name TEXT,
+                tool_version INTEGER,
+                tool_version_id INTEGER REFERENCES tool_versions(id),
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, seq)
+            )
+            """,
+            "CREATE INDEX events_tool_version_id ON events(tool_version_id)",
+            "CREATE INDEX events_session_seq ON events(session_id, seq)",
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    def _migrate_legacy(self, connection: sqlite3.Connection) -> None:
+        for table in ("tool_versions", "bindings", "sessions", "events"):
+            connection.execute(f"ALTER TABLE {table} RENAME TO legacy_{table}")
+        self._create_schema(connection)
+        toolbox_id = uuid.uuid4().hex
+        connection.execute(
+            "INSERT INTO toolboxes (id, name, created_at) VALUES (?, ?, ?)",
+            (toolbox_id, "legacy", _now()),
+        )
+        connection.execute(
+            "INSERT INTO metadata (key, value) VALUES ('legacy_fallback', ?)",
+            (toolbox_id,),
+        )
+        names = connection.execute(
+            "SELECT DISTINCT name FROM legacy_tool_versions ORDER BY name"
+        ).fetchall()
+        lineages: dict[str, int] = {}
+        for row in names:
+            cursor = connection.execute(
+                """
+                INSERT INTO tool_lineages (toolbox_id, name, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (toolbox_id, row["name"], _now()),
+            )
+            lineages[str(row["name"])] = int(cursor.lastrowid)
+        connection.execute(
+            """
+            INSERT INTO sessions (id, cwd, created_at)
+            SELECT id, NULL, created_at FROM legacy_sessions
+            """
+        )
+        for row in connection.execute(
+            "SELECT * FROM legacy_tool_versions ORDER BY id"
+        ).fetchall():
+            connection.execute(
+                """
+                INSERT INTO tool_versions (
+                    id, lineage_id, version, description, schema_json, source,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    lineages[str(row["name"])],
+                    row["version"],
+                    row["description"],
+                    row["schema_json"],
+                    row["source"],
+                    row["created_at"],
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO bindings (toolbox_id, name, tool_version_id)
+            SELECT ?, name, tool_id FROM legacy_bindings
+            """,
+            (toolbox_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO session_toolboxes (session_id, position, toolbox_id)
+            SELECT id, 0, ? FROM sessions
+            """,
+            (toolbox_id,),
+        )
+        legacy_events = connection.execute(
+            "SELECT * FROM legacy_events ORDER BY id"
+        ).fetchall()
+        for row in legacy_events:
+            version_id = None
+            if row["tool_name"] is not None and row["tool_version"] is not None:
+                version_row = connection.execute(
+                    """
+                    SELECT v.id
+                    FROM tool_versions AS v
+                    JOIN tool_lineages AS l ON l.id = v.lineage_id
+                    WHERE l.toolbox_id = ? AND l.name = ? AND v.version = ?
+                    """,
+                    (toolbox_id, row["tool_name"], row["tool_version"]),
+                ).fetchone()
+                version_id = int(version_row["id"]) if version_row else None
+            connection.execute(
+                """
+                INSERT INTO events (
+                    id, session_id, seq, kind, call_id, parent_call_id,
+                    toolbox_id, tool_name, tool_version, tool_version_id,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["session_id"],
+                    row["seq"],
+                    row["kind"],
+                    row["call_id"],
+                    row["parent_call_id"],
+                    toolbox_id if row["tool_name"] is not None else None,
+                    row["tool_name"],
+                    row["tool_version"],
+                    version_id,
+                    row["payload_json"],
+                    row["created_at"],
+                ),
+            )
+        for table in (
+            "legacy_bindings",
+            "legacy_tool_versions",
+            "legacy_events",
+            "legacy_sessions",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        self._seed_missing_core(connection, toolbox_id)
+
+    def _seed_missing_core(
+        self, connection: sqlite3.Connection, toolbox_id: str
+    ) -> None:
+        for tool in BOOTSTRAP_TOOLS:
+            exists = connection.execute(
+                """
+                SELECT 1 FROM tool_lineages
+                WHERE toolbox_id = ? AND name = ?
+                """,
+                (toolbox_id, tool.name),
+            ).fetchone()
+            if exists is not None:
+                continue
+            lineage = connection.execute(
+                """
+                INSERT INTO tool_lineages (toolbox_id, name, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (toolbox_id, tool.name, _now()),
+            )
+            version = connection.execute(
+                """
+                INSERT INTO tool_versions (
+                    lineage_id, version, description, schema_json, source, created_at
+                ) VALUES (?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    int(lineage.lastrowid),
+                    tool.description,
+                    _json(tool.input_schema),
+                    tool.source,
+                    _now(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO bindings (toolbox_id, name, tool_version_id)
+                VALUES (?, ?, ?)
+                """,
+                (toolbox_id, tool.name, int(version.lastrowid)),
+            )
+
+    def _create_toolbox_connection(
+        self,
+        connection: sqlite3.Connection,
+        name: str,
+    ) -> str:
+        if not isinstance(name, str) or _TOOLBOX_NAME.fullmatch(name) is None:
+            raise ToolboxError(
+                "invalid_toolbox_name", f"invalid toolbox name: {name!r}"
+            )
+        toolbox_id = uuid.uuid4().hex
+        try:
+            connection.execute(
+                "INSERT INTO toolboxes (id, name, created_at) VALUES (?, ?, ?)",
+                (toolbox_id, name, _now()),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ToolboxError(
+                "toolbox_exists", f"toolbox already exists: {name}"
+            ) from error
+        self._seed_missing_core(connection, toolbox_id)
+        return toolbox_id
+
+    def _ensure_cwd_default(self, connection: sqlite3.Connection, cwd: str) -> str:
+        row = connection.execute(
+            "SELECT toolbox_id FROM cwd_defaults WHERE cwd = ?", (cwd,)
+        ).fetchone()
+        if row is not None:
+            return str(row["toolbox_id"])
+        legacy = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'legacy_fallback'"
+        ).fetchone()
+        if legacy is not None:
+            return str(legacy["value"])
+        digest = hashlib.sha256(cwd.encode()).hexdigest()[:8]
+        base = re.sub(r"[^A-Za-z0-9_.-]", "-", Path(cwd).name) or "root"
+        name = f"cwd-{base[:40]}-{digest}"
+        toolbox_id = self._create_toolbox_connection(connection, name)
+        connection.execute(
+            "INSERT INTO cwd_defaults (cwd, toolbox_id) VALUES (?, ?)",
+            (cwd, toolbox_id),
+        )
+        return toolbox_id
+
+    def create_toolbox(
+        self,
+        name: str,
+        *,
+        cwd: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Create a named toolbox with independent bootstrap bindings."""
+        canonical = self._canonical_cwd(cwd) if cwd is not None else None
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                toolbox_id = self._create_toolbox_connection(connection, name)
+                if canonical is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO cwd_defaults (cwd, toolbox_id) VALUES (?, ?)
+                        ON CONFLICT(cwd) DO UPDATE SET toolbox_id = excluded.toolbox_id
+                        """,
+                        (canonical, toolbox_id),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {"id": toolbox_id, "name": name, "cwd": canonical}
+
+    def list_toolboxes(self) -> list[dict[str, Any]]:
+        """List registered toolboxes and cwd-default status."""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT t.id, t.name, d.cwd, t.created_at,
+                       d.cwd = ? AS is_default
+                FROM toolboxes AS t
+                LEFT JOIN cwd_defaults AS d ON d.toolbox_id = t.id
+                ORDER BY t.name
+                """,
+                (self.cwd,),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "cwd": row["cwd"],
+                "default": bool(row["is_default"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _toolbox_id(connection: sqlite3.Connection, name: str) -> str:
+        row = connection.execute(
+            "SELECT id FROM toolboxes WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            raise ToolboxError("unknown_toolbox", f"unknown toolbox: {name}")
+        return str(row["id"])
+
+    def set_cwd_default(
+        self, name: str, *, cwd: str | Path | None = None
+    ) -> dict[str, Any]:
+        """Associate one canonical cwd with a registered toolbox."""
+        canonical = self._canonical_cwd(cwd or self.cwd)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                toolbox_id = self._toolbox_id(connection, name)
+                connection.execute(
+                    "DELETE FROM cwd_defaults WHERE toolbox_id = ?", (toolbox_id,)
+                )
                 connection.execute(
                     """
-                    INSERT OR IGNORE INTO bindings (name, tool_id)
-                    VALUES (?, ?)
+                    INSERT INTO cwd_defaults (cwd, toolbox_id) VALUES (?, ?)
+                    ON CONFLICT(cwd) DO UPDATE SET toolbox_id = excluded.toolbox_id
                     """,
-                    (tool.name, tool_id),
+                    (canonical, toolbox_id),
                 )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {"cwd": canonical, "toolbox": name}
 
     def create_session(self, session_id: str | None = None) -> str:
-        """Create and return a durable session identifier."""
+        """Create a durable session with a materialized cwd-default selection."""
         identifier = session_id or uuid.uuid4().hex
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?, ?)",
-                (identifier, _now()),
-            )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                created = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (id, cwd, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (identifier, self.cwd, _now()),
+                ).rowcount
+                selected = connection.execute(
+                    "SELECT 1 FROM session_toolboxes WHERE session_id = ?",
+                    (identifier,),
+                ).fetchone()
+                if selected is None:
+                    default_id = self._ensure_cwd_default(connection, self.cwd)
+                    connection.execute(
+                        """
+                        INSERT INTO session_toolboxes (session_id, position, toolbox_id)
+                        VALUES (?, 0, ?)
+                        """,
+                        (identifier, default_id),
+                    )
+                if not created:
+                    exists = connection.execute(
+                        "SELECT 1 FROM sessions WHERE id = ?", (identifier,)
+                    ).fetchone()
+                    if exists is None:
+                        raise ToolboxError(
+                            "unknown_session", f"unknown session: {identifier}"
+                        )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return identifier
+
+    def active_toolboxes(self, session_id: str) -> list[dict[str, Any]]:
+        """Return one session's ordered toolbox selection."""
+        self.create_session(session_id)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT t.id, t.name, d.cwd, s.position
+                FROM session_toolboxes AS s
+                JOIN toolboxes AS t ON t.id = s.toolbox_id
+                LEFT JOIN cwd_defaults AS d ON d.toolbox_id = t.id
+                WHERE s.session_id = ?
+                ORDER BY s.position
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "cwd": row["cwd"],
+                "position": int(row["position"]),
+                "primary": int(row["position"]) == 0,
+            }
+            for row in rows
+        ]
+
+    def _selection_ids(
+        self, connection: sqlite3.Connection, session_id: str
+    ) -> list[str]:
+        rows = connection.execute(
+            """
+            SELECT toolbox_id FROM session_toolboxes
+            WHERE session_id = ? ORDER BY position
+            """,
+            (session_id,),
+        ).fetchall()
+        return [str(row["toolbox_id"]) for row in rows]
+
+    def select_toolboxes(
+        self,
+        session_id: str,
+        names: list[str],
+        *,
+        mode: str = "use",
+    ) -> list[dict[str, Any]]:
+        """Replace, append to, or remove from a session selection."""
+        if mode not in {"use", "add", "remove"}:
+            raise ToolboxError("invalid_selection_mode", f"invalid mode: {mode}")
+        self.create_session(session_id)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                before = self._selection_ids(connection, session_id)
+                requested = list(
+                    dict.fromkeys(self._toolbox_id(connection, name) for name in names)
+                )
+                if mode == "use":
+                    after = list(dict.fromkeys(requested))
+                    if not after:
+                        raise ToolboxError(
+                            "empty_selection", "use requires at least one toolbox"
+                        )
+                elif mode == "add":
+                    after = before + [item for item in requested if item not in before]
+                else:
+                    removed = set(requested)
+                    after = [item for item in before if item not in removed]
+                    if not after:
+                        after = [self._session_default_id(connection, session_id)]
+                self._replace_selection(connection, session_id, after)
+                self._append_event_connection(
+                    connection,
+                    session_id,
+                    "toolbox_selection_changed",
+                    {"mode": mode, "before": before, "after": after},
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return self.active_toolboxes(session_id)
+
+    @staticmethod
+    def _replace_selection(
+        connection: sqlite3.Connection, session_id: str, toolbox_ids: list[str]
+    ) -> None:
+        connection.execute(
+            "DELETE FROM session_toolboxes WHERE session_id = ?", (session_id,)
+        )
+        connection.executemany(
+            """
+            INSERT INTO session_toolboxes (session_id, position, toolbox_id)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (session_id, position, toolbox_id)
+                for position, toolbox_id in enumerate(toolbox_ids)
+            ],
+        )
+
+    def _session_default_id(
+        self, connection: sqlite3.Connection, session_id: str
+    ) -> str:
+        row = connection.execute(
+            "SELECT cwd FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            raise ToolboxError("unknown_session", f"unknown session: {session_id}")
+        cwd = str(row["cwd"] or self.cwd)
+        return self._ensure_cwd_default(connection, cwd)
+
+    def reset_toolboxes(self, session_id: str) -> list[dict[str, Any]]:
+        """Reset a session to the toolbox mapped to its launch cwd."""
+        self.create_session(session_id)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                before = self._selection_ids(connection, session_id)
+                after = [self._session_default_id(connection, session_id)]
+                self._replace_selection(connection, session_id, after)
+                self._append_event_connection(
+                    connection,
+                    session_id,
+                    "toolbox_selection_changed",
+                    {"mode": "default", "before": before, "after": after},
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return self.active_toolboxes(session_id)
+
+    def snapshot_scope(self, session_id: str) -> InvocationScope:
+        """Capture the immutable selection for one top-level call tree."""
+        self.create_session(session_id)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT cwd FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            assert row is not None
+            toolbox_ids = tuple(self._selection_ids(connection, session_id))
+        if not toolbox_ids:
+            raise ToolboxError("empty_selection", "session has no active toolbox")
+        return InvocationScope(
+            session_id=session_id,
+            toolbox_ids=toolbox_ids,
+            cwd=str(row["cwd"] or self.cwd),
+        )
 
     def append_event(
         self,
@@ -322,8 +875,10 @@ class Kernel:
         *,
         call_id: str | None = None,
         parent_call_id: str | None = None,
+        toolbox_id: str | None = None,
         tool_name: str | None = None,
         tool_version: int | None = None,
+        tool_version_id: int | None = None,
     ) -> int:
         """Append one committed event and return its session-local sequence."""
         with closing(self._connect()) as connection, connection:
@@ -334,8 +889,10 @@ class Kernel:
                 payload,
                 call_id=call_id,
                 parent_call_id=parent_call_id,
+                toolbox_id=toolbox_id,
                 tool_name=tool_name,
                 tool_version=tool_version,
+                tool_version_id=tool_version_id,
             )
 
     def _append_event_connection(
@@ -347,8 +904,10 @@ class Kernel:
         *,
         call_id: str | None = None,
         parent_call_id: str | None = None,
+        toolbox_id: str | None = None,
         tool_name: str | None = None,
         tool_version: int | None = None,
+        tool_version_id: int | None = None,
     ) -> int:
         row = connection.execute(
             """
@@ -362,9 +921,9 @@ class Kernel:
         connection.execute(
             """
             INSERT INTO events (
-                session_id, seq, kind, call_id, parent_call_id, tool_name,
-                tool_version, payload_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                session_id, seq, kind, call_id, parent_call_id, toolbox_id,
+                tool_name, tool_version, tool_version_id, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -372,8 +931,10 @@ class Kernel:
                 kind,
                 call_id,
                 parent_call_id,
+                toolbox_id,
                 tool_name,
                 tool_version,
+                tool_version_id,
                 _json(payload),
                 _now(),
             ),
@@ -387,7 +948,8 @@ class Kernel:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
-                SELECT sessions.id, sessions.created_at, COUNT(events.id) AS event_count
+                SELECT sessions.id, sessions.cwd, sessions.created_at,
+                       COUNT(events.id) AS event_count
                 FROM sessions
                 LEFT JOIN events ON events.session_id = sessions.id
                 GROUP BY sessions.id
@@ -397,9 +959,8 @@ class Kernel:
                 (limit + 1, cursor),
             ).fetchall()
         has_more = len(rows) > limit
-        items = [dict(row) for row in rows[:limit]]
         return {
-            "sessions": items,
+            "sessions": [dict(row) for row in rows[:limit]],
             "next_cursor": cursor + limit if has_more else None,
         }
 
@@ -417,8 +978,8 @@ class Kernel:
                 raise ToolboxError("unknown_session", f"unknown session: {session_id}")
             rows = connection.execute(
                 """
-                SELECT seq, kind, call_id, parent_call_id, tool_name,
-                       tool_version, payload_json, created_at
+                SELECT seq, kind, call_id, parent_call_id, toolbox_id, tool_name,
+                       tool_version, tool_version_id, payload_json, created_at
                 FROM events
                 WHERE session_id = ? AND seq > ?
                 ORDER BY seq
@@ -438,62 +999,200 @@ class Kernel:
             "next_after": events[-1]["seq"] if has_more and events else None,
         }
 
-    def tool_definitions(self) -> list[dict[str, Any]]:
-        """Return the five fixed model-facing operation definitions."""
-        definitions = []
-        for name in CORE_NAMES:
-            tool = self._resolve(name)
-            definitions.append(
-                {
-                    "name": name,
-                    "description": tool.description,
-                    "input_schema": CORE_SCHEMAS[name],
-                }
-            )
-        return definitions
-
-    def catalog(self, *, include_core: bool = True) -> list[dict[str, Any]]:
-        """Return active tool metadata for an editable search implementation."""
-        query = """
-            SELECT v.name, v.version, v.description, v.schema_json, v.source,
-                   v.created_at
-            FROM bindings AS b
-            JOIN tool_versions AS v ON v.id = b.tool_id
-            ORDER BY v.name
-        """
+    def _scope(
+        self,
+        *,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+    ) -> InvocationScope:
+        if scope is not None:
+            return scope
+        if session_id is not None:
+            identifier = self.create_session(session_id)
+            return self.snapshot_scope(identifier)
         with closing(self._connect()) as connection:
-            rows = connection.execute(query).fetchall()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                toolbox_id = self._ensure_cwd_default(connection, self.cwd)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return InvocationScope(
+            session_id="host",
+            toolbox_ids=(toolbox_id,),
+            cwd=self.cwd,
+        )
+
+    def _resolve(
+        self,
+        name: str,
+        *,
+        version: int | None = None,
+        scope: InvocationScope,
+        toolbox_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> _ResolvedTool:
+        owned = connection is None
+        db = connection or self._connect()
+        try:
+            toolbox_ids = (toolbox_id,) if toolbox_id is not None else scope.toolbox_ids
+            binding = None
+            for candidate in toolbox_ids:
+                binding = db.execute(
+                    """
+                    SELECT b.name, b.tool_version_id, l.id AS lineage_id,
+                           l.toolbox_id, t.name AS toolbox_name
+                    FROM bindings AS b
+                    JOIN tool_versions AS active ON active.id = b.tool_version_id
+                    JOIN tool_lineages AS l ON l.id = active.lineage_id
+                    JOIN toolboxes AS t ON t.id = b.toolbox_id
+                    WHERE b.toolbox_id = ? AND b.name = ?
+                    """,
+                    (candidate, name),
+                ).fetchone()
+                if binding is not None:
+                    break
+            if binding is None:
+                raise ToolboxError("unknown_tool", f"unknown tool {name!r}")
+            if version is None:
+                row = db.execute(
+                    "SELECT * FROM tool_versions WHERE id = ?",
+                    (binding["tool_version_id"],),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    """
+                    SELECT * FROM tool_versions
+                    WHERE lineage_id = ? AND version = ?
+                    """,
+                    (binding["lineage_id"], version),
+                ).fetchone()
+            if row is None:
+                raise ToolboxError(
+                    "unknown_tool",
+                    f"unknown tool {name!r} version {version}",
+                )
+            return _ResolvedTool(
+                id=int(row["id"]),
+                toolbox_id=str(binding["toolbox_id"]),
+                toolbox_name=str(binding["toolbox_name"]),
+                name=str(binding["name"]),
+                version=int(row["version"]),
+                description=str(row["description"]),
+                input_schema=json.loads(row["schema_json"]),
+                source=str(row["source"]),
+            )
+        finally:
+            if owned:
+                db.close()
+
+    def tool_definitions(
+        self, *, session_id: str | None = None, scope: InvocationScope | None = None
+    ) -> list[dict[str, Any]]:
+        """Return the five fixed model-facing operation definitions."""
+        active_scope = self._scope(session_id=session_id, scope=scope)
+        return [
+            {
+                "name": name,
+                "description": self._resolve(name, scope=active_scope).description,
+                "input_schema": CORE_SCHEMAS[name],
+            }
+            for name in CORE_NAMES
+        ]
+
+    def catalog(
+        self,
+        *,
+        include_core: bool = True,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return effective metadata for an editable search implementation."""
+        active_scope = self._scope(session_id=session_id, scope=scope)
+        with closing(self._connect()) as connection:
+            rows = self._effective_rows(connection, active_scope)
         tools = []
         for row in rows:
-            if not include_core and row["name"] in CORE_NAMES:
+            name = str(row["name"])
+            if not include_core and name in CORE_NAMES:
                 continue
             tools.append(
                 {
-                    "name": row["name"],
-                    "version": row["version"],
+                    "name": name,
+                    "version": int(row["version"]),
                     "description": row["description"],
                     "input_schema": json.loads(row["schema_json"]),
                     "source": row["source"],
-                    "kind": "core" if row["name"] in CORE_NAMES else "user",
+                    "kind": "core" if name in CORE_NAMES else "user",
                     "created_at": row["created_at"],
+                    "toolbox": row["toolbox_name"],
                 }
             )
         return tools
 
+    @staticmethod
+    def _effective_rows(
+        connection: sqlite3.Connection, scope: InvocationScope
+    ) -> list[sqlite3.Row]:
+        seen: set[str] = set()
+        rows: list[sqlite3.Row] = []
+        for toolbox_id in scope.toolbox_ids:
+            candidates = connection.execute(
+                """
+                SELECT b.name, v.id AS tool_version_id, v.lineage_id, v.version,
+                       v.description, v.schema_json, v.source, v.created_at,
+                       b.toolbox_id, t.name AS toolbox_name
+                FROM bindings AS b
+                JOIN tool_versions AS v ON v.id = b.tool_version_id
+                JOIN toolboxes AS t ON t.id = b.toolbox_id
+                WHERE b.toolbox_id = ?
+                ORDER BY b.name
+                """,
+                (toolbox_id,),
+            ).fetchall()
+            for row in candidates:
+                name = str(row["name"])
+                if name not in seen:
+                    seen.add(name)
+                    rows.append(row)
+        return sorted(rows, key=lambda row: str(row["name"]))
+
     def read_tool_source(
-        self, name: str, *, version: int | None = None
+        self,
+        name: str,
+        *,
+        version: int | None = None,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+        toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Host-level source read used by the corresponding core capability."""
-        tool = self._resolve(name, version=version)
-        active = self._active_version(name)
+        """Read source for an effective or explicitly scoped tool lineage."""
+        active_scope = self._scope(session_id=session_id, scope=scope)
+        with closing(self._connect()) as connection:
+            toolbox_id = self._toolbox_id(connection, toolbox) if toolbox else None
+            tool = self._resolve(
+                name,
+                version=version,
+                scope=active_scope,
+                toolbox_id=toolbox_id,
+                connection=connection,
+            )
+            active = self._resolve(
+                name,
+                scope=active_scope,
+                toolbox_id=tool.toolbox_id,
+                connection=connection,
+            )
         return {
             "name": tool.name,
             "version": tool.version,
-            "active": active == tool.version,
+            "active": active.version == tool.version,
             "description": tool.description,
             "input_schema": tool.input_schema,
             "source": tool.source,
             "kind": "core" if name in CORE_NAMES else "user",
+            "toolbox": tool.toolbox_name,
         }
 
     def write_tool(
@@ -506,25 +1205,58 @@ class Kernel:
         base_version: int | None = None,
         session_id: str | None = None,
         parent_call_id: str | None = None,
+        scope: InvocationScope | None = None,
+        toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Compile, store, and bind an immutable tool version."""
+        """Compile, store, and bind one namespace-owned immutable version."""
         self._validate_tool(name, description, input_schema, source)
         if name in CORE_SCHEMAS and input_schema != CORE_SCHEMAS[name]:
             raise ToolboxError(
                 "core_schema_pinned",
                 f"the outer schema for {name} cannot change in this prototype",
             )
+        active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                if toolbox is not None:
+                    target_id = self._toolbox_id(connection, toolbox)
+                else:
+                    try:
+                        target_id = self._resolve(
+                            name, scope=active_scope, connection=connection
+                        ).toolbox_id
+                    except ToolboxError as error:
+                        if error.code != "unknown_tool":
+                            raise
+                        target_id = active_scope.toolbox_ids[0]
+                lineage = connection.execute(
+                    """
+                    SELECT id FROM tool_lineages
+                    WHERE toolbox_id = ? AND name = ?
+                    """,
+                    (target_id, name),
+                ).fetchone()
+                if lineage is None:
+                    lineage_id = int(
+                        connection.execute(
+                            """
+                            INSERT INTO tool_lineages (toolbox_id, name, created_at)
+                            VALUES (?, ?, ?)
+                            """,
+                            (target_id, name, _now()),
+                        ).lastrowid
+                    )
+                else:
+                    lineage_id = int(lineage["id"])
                 active_row = connection.execute(
                     """
                     SELECT v.version
                     FROM bindings AS b
-                    JOIN tool_versions AS v ON v.id = b.tool_id
-                    WHERE b.name = ?
+                    JOIN tool_versions AS v ON v.id = b.tool_version_id
+                    WHERE b.toolbox_id = ? AND b.name = ?
                     """,
-                    (name,),
+                    (target_id, name),
                 ).fetchone()
                 active_version = (
                     int(active_row["version"]) if active_row is not None else None
@@ -542,21 +1274,21 @@ class Kernel:
                 row = connection.execute(
                     """
                     SELECT COALESCE(MAX(version), 0) + 1 AS next
-                    FROM tool_versions WHERE name = ?
+                    FROM tool_versions WHERE lineage_id = ?
                     """,
-                    (name,),
+                    (lineage_id,),
                 ).fetchone()
                 assert row is not None
                 version = int(row["next"])
                 cursor = connection.execute(
                     """
                     INSERT INTO tool_versions (
-                        name, version, description, schema_json, source,
+                        lineage_id, version, description, schema_json, source,
                         created_at
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        name,
+                        lineage_id,
                         version,
                         description,
                         _json(input_schema),
@@ -564,14 +1296,15 @@ class Kernel:
                         _now(),
                     ),
                 )
-                tool_id = int(cursor.lastrowid)
+                version_id = int(cursor.lastrowid)
                 connection.execute(
                     """
-                    INSERT INTO bindings (name, tool_id)
-                    VALUES (?, ?)
-                    ON CONFLICT(name) DO UPDATE SET tool_id = excluded.tool_id
+                    INSERT INTO bindings (toolbox_id, name, tool_version_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(toolbox_id, name)
+                    DO UPDATE SET tool_version_id = excluded.tool_version_id
                     """,
-                    (name, tool_id),
+                    (target_id, name, version_id),
                 )
                 if session_id is not None:
                     self._append_event_connection(
@@ -582,10 +1315,13 @@ class Kernel:
                             "name": name,
                             "from_version": active_version,
                             "to_version": version,
+                            "toolbox_id": target_id,
                         },
                         parent_call_id=parent_call_id,
+                        toolbox_id=target_id,
                         tool_name=name,
                         tool_version=version,
+                        tool_version_id=version_id,
                     )
                 connection.commit()
             except Exception:
@@ -651,13 +1387,23 @@ class Kernel:
         *,
         session_id: str | None = None,
         version: int | None = None,
+        scope: InvocationScope | None = None,
     ) -> JsonValue:
         """Start a top-level invocation in a durable session."""
-        identifier = self.create_session(session_id)
+        if scope is None and session_id is None:
+            identifier = self.create_session()
+            active_scope = self.snapshot_scope(identifier)
+        else:
+            active_scope = self._scope(session_id=session_id, scope=scope)
         state = _InvocationState(
-            session_id=identifier,
+            scope=active_scope,
             max_depth=self.max_depth,
             max_calls=self.max_calls,
+        )
+        self.append_event(
+            active_scope.session_id,
+            "invocation_scope",
+            {"toolbox_ids": active_scope.toolbox_ids, "cwd": active_scope.cwd},
         )
         return self._invoke(name, args, state=state, depth=0, version=version)
 
@@ -683,7 +1429,7 @@ class Kernel:
                 "max_calls", f"maximum call count {state.max_calls} exceeded"
             )
         state.calls += 1
-        tool = self._resolve(name, version=version)
+        tool = self._resolve(name, version=version, scope=state.scope)
         call_id = uuid.uuid4().hex
         self.append_event(
             state.session_id,
@@ -691,8 +1437,10 @@ class Kernel:
             {"args": args},
             call_id=call_id,
             parent_call_id=parent_call_id,
+            toolbox_id=tool.toolbox_id,
             tool_name=tool.name,
             tool_version=tool.version,
+            tool_version_id=tool.id,
         )
         logical_slot = tool.name if tool.name in CORE_NAMES else None
         context = ToolContext(self, state, call_id, depth, logical_slot)
@@ -730,8 +1478,10 @@ class Kernel:
                 details,
                 call_id=call_id,
                 parent_call_id=parent_call_id,
+                toolbox_id=tool.toolbox_id,
                 tool_name=tool.name,
                 tool_version=tool.version,
+                tool_version_id=tool.id,
             )
             raise
         self.append_event(
@@ -740,215 +1490,202 @@ class Kernel:
             {"result": result},
             call_id=call_id,
             parent_call_id=parent_call_id,
+            toolbox_id=tool.toolbox_id,
             tool_name=tool.name,
             tool_version=tool.version,
+            tool_version_id=tool.id,
         )
         return result
 
-    def _resolve(self, name: str, *, version: int | None = None) -> _ResolvedTool:
+    def bindings(
+        self,
+        *,
+        recent_first: bool = False,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+        include_origin: bool = False,
+        toolbox: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Inspect effective bindings without calling editable code."""
+        active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
-            if version is None:
-                row = connection.execute(
+            if toolbox is not None:
+                active_scope = InvocationScope(
+                    session_id=active_scope.session_id,
+                    toolbox_ids=(self._toolbox_id(connection, toolbox),),
+                    cwd=active_scope.cwd,
+                )
+            rows = self._effective_rows(connection, active_scope)
+            items = []
+            for row in rows:
+                versions = connection.execute(
                     """
-                    SELECT v.*
-                    FROM bindings AS b
-                    JOIN tool_versions AS v ON v.id = b.tool_id
-                    WHERE b.name = ?
+                    SELECT version FROM tool_versions
+                    WHERE lineage_id = ? ORDER BY version
                     """,
-                    (name,),
+                    (row["lineage_id"],),
+                ).fetchall()
+                used = connection.execute(
+                    """
+                    SELECT MAX(created_at) AS last_used
+                    FROM events WHERE kind = 'call_started'
+                    AND tool_version_id IN (
+                        SELECT id FROM tool_versions WHERE lineage_id = ?
+                    )
+                    """,
+                    (row["lineage_id"],),
                 ).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT * FROM tool_versions WHERE name = ? AND version = ?",
-                    (name, version),
-                ).fetchone()
-        if row is None:
-            qualifier = f" version {version}" if version is not None else ""
-            raise ToolboxError("unknown_tool", f"unknown tool {name!r}{qualifier}")
-        return _ResolvedTool(
-            id=int(row["id"]),
-            name=row["name"],
-            version=int(row["version"]),
-            description=row["description"],
-            input_schema=json.loads(row["schema_json"]),
-            source=row["source"],
-        )
+                item = {
+                    "name": row["name"],
+                    "active_version": int(row["version"]),
+                    "description": row["description"],
+                    "versions": [int(version["version"]) for version in versions],
+                    "kind": "core" if row["name"] in CORE_NAMES else "user",
+                }
+                if include_origin:
+                    item["toolbox"] = row["toolbox_name"]
+                    item["toolbox_id"] = row["toolbox_id"]
+                items.append((used["last_used"] if used else None, item))
+        if recent_first:
+            items.sort(
+                key=lambda pair: (pair[0] is None, pair[0] or "", pair[1]["name"])
+            )
+            used_items = [pair for pair in items if pair[0] is not None]
+            unused_items = [pair for pair in items if pair[0] is None]
+            used_items.reverse()
+            items = used_items + unused_items
+        else:
+            items.sort(key=lambda pair: pair[1]["name"])
+        return [item for _, item in items]
 
-    def _active_version(self, name: str) -> int | None:
-        with closing(self._connect()) as connection:
+    def _lineage_for_history(
+        self,
+        connection: sqlite3.Connection,
+        name: str,
+        scope: InvocationScope,
+        toolbox: str | None,
+    ) -> sqlite3.Row:
+        if toolbox is not None:
+            toolbox_ids = (self._toolbox_id(connection, toolbox),)
+        else:
+            toolbox_ids = scope.toolbox_ids
+            try:
+                resolved = self._resolve(name, scope=scope, connection=connection)
+            except ToolboxError as error:
+                if error.code != "unknown_tool":
+                    raise
+            else:
+                toolbox_ids = (resolved.toolbox_id,)
+        for toolbox_id in toolbox_ids:
             row = connection.execute(
                 """
-                SELECT v.version
-                FROM bindings AS b
-                JOIN tool_versions AS v ON v.id = b.tool_id
-                WHERE b.name = ?
+                SELECT l.id, l.toolbox_id, t.name AS toolbox_name
+                FROM tool_lineages AS l
+                JOIN toolboxes AS t ON t.id = l.toolbox_id
+                WHERE l.toolbox_id = ? AND l.name = ?
                 """,
-                (name,),
+                (toolbox_id, name),
             ).fetchone()
-        return int(row["version"]) if row is not None else None
+            if row is not None:
+                return row
+        raise ToolboxError("unknown_tool", f"unknown tool: {name}")
 
-    def bindings(self, *, recent_first: bool = False) -> list[dict[str, Any]]:
-        """Inspect active bindings without calling editable code."""
-        order_by = (
-            "usage.last_used_at IS NULL, usage.last_used_at DESC, v.name"
-            if recent_first
-            else "v.name"
-        )
+    def tool_inventory(
+        self, *, session_id: str | None = None, scope: InvocationScope | None = None
+    ) -> list[dict[str, Any]]:
+        """Return visible and historical tools in the selected namespaces."""
+        active_scope = self._scope(session_id=session_id, scope=scope)
+        names: set[str] = set()
         with closing(self._connect()) as connection:
-            active_rows = connection.execute(
-                f"""
-                SELECT v.name, v.version, v.description
-                FROM bindings AS b
-                JOIN tool_versions AS v ON v.id = b.tool_id
-                LEFT JOIN (
-                    SELECT tool_name, MAX(created_at) AS last_used_at
-                    FROM events
-                    WHERE kind = 'call_started' AND tool_name IS NOT NULL
-                    GROUP BY tool_name
-                ) AS usage ON usage.tool_name = v.name
-                ORDER BY {order_by}
-                """
-            ).fetchall()
-            version_rows = connection.execute(
-                "SELECT name, version FROM tool_versions ORDER BY name, version"
-            ).fetchall()
-        versions: dict[str, list[int]] = {}
-        for row in version_rows:
-            versions.setdefault(row["name"], []).append(int(row["version"]))
-        return [
-            {
-                "name": row["name"],
-                "active_version": int(row["version"]),
-                "description": row["description"],
-                "versions": versions[row["name"]],
-                "kind": "core" if row["name"] in CORE_NAMES else "user",
-            }
-            for row in active_rows
-        ]
-
-    def tool_inventory(self) -> list[dict[str, Any]]:
-        """Return every known tool with active state and aggregate usage."""
-        with closing(self._connect()) as connection:
-            version_rows = connection.execute(
-                """
-                SELECT name, version, description, created_at
-                FROM tool_versions
-                ORDER BY name, version DESC
-                """
-            ).fetchall()
-            active_rows = connection.execute(
-                """
-                SELECT v.name, v.version
-                FROM bindings AS b
-                JOIN tool_versions AS v ON v.id = b.tool_id
-                """
-            ).fetchall()
-            usage_rows = connection.execute(
-                """
-                SELECT tool_name, COUNT(*) AS call_count,
-                       COUNT(DISTINCT session_id) AS session_count
-                FROM events
-                WHERE kind = 'call_started' AND tool_name IS NOT NULL
-                GROUP BY tool_name
-                """
-            ).fetchall()
-        active = {row["name"]: int(row["version"]) for row in active_rows}
-        usage = {row["tool_name"]: row for row in usage_rows}
-        inventory: dict[str, dict[str, Any]] = {}
-        for row in version_rows:
-            name = str(row["name"])
-            item = inventory.setdefault(
-                name,
+            for toolbox_id in active_scope.toolbox_ids:
+                names.update(
+                    str(row["name"])
+                    for row in connection.execute(
+                        "SELECT name FROM tool_lineages WHERE toolbox_id = ?",
+                        (toolbox_id,),
+                    )
+                )
+        inventory = []
+        for name in sorted(names):
+            history = self.tool_history(name, scope=active_scope)
+            latest = history["versions"][0]
+            inventory.append(
                 {
                     "name": name,
-                    "active_version": active.get(name),
-                    "latest_version": int(row["version"]),
-                    "description": row["description"],
-                    "created_at": row["created_at"],
-                    "version_count": 0,
-                    "call_count": int(usage.get(name, {"call_count": 0})["call_count"]),
-                    "session_count": int(
-                        usage.get(name, {"session_count": 0})["session_count"]
-                    ),
-                    "kind": "core" if name in CORE_NAMES else "user",
-                },
+                    "active_version": history["active_version"],
+                    "latest_version": latest["version"],
+                    "description": latest["description"],
+                    "created_at": latest["created_at"],
+                    "version_count": len(history["versions"]),
+                    "call_count": history["call_count"],
+                    "session_count": len(history["sessions"]),
+                    "kind": history["kind"],
+                }
             )
-            item["version_count"] += 1
-        return list(inventory.values())
+        return inventory
 
-    def tool_history(self, name: str) -> dict[str, Any]:
-        """Return immutable versions, provenance, and per-session call stats."""
+    def tool_history(
+        self,
+        name: str,
+        *,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+        toolbox: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one namespace-owned lineage's versions and usage."""
+        active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
+            lineage = self._lineage_for_history(connection, name, active_scope, toolbox)
             version_rows = connection.execute(
                 """
-                SELECT version, description, schema_json, source, created_at
-                FROM tool_versions
-                WHERE name = ?
-                ORDER BY version DESC
+                SELECT id, version, description, schema_json, source, created_at
+                FROM tool_versions WHERE lineage_id = ? ORDER BY version DESC
                 """,
-                (name,),
+                (lineage["id"],),
             ).fetchall()
-            if not version_rows:
-                raise ToolboxError("unknown_tool", f"unknown tool: {name}")
             active_row = connection.execute(
                 """
-                SELECT v.version
-                FROM bindings AS b
-                JOIN tool_versions AS v ON v.id = b.tool_id
-                WHERE b.name = ?
+                SELECT v.version FROM bindings AS b
+                JOIN tool_versions AS v ON v.id = b.tool_version_id
+                WHERE b.toolbox_id = ? AND b.name = ?
                 """,
-                (name,),
+                (lineage["toolbox_id"], name),
             ).fetchone()
-            usage_rows = connection.execute(
-                """
-                SELECT tool_version,
-                       SUM(kind = 'call_started') AS call_count,
-                       SUM(kind = 'call_succeeded') AS success_count,
-                       SUM(kind = 'call_failed') AS failure_count,
-                       COUNT(DISTINCT CASE WHEN kind = 'call_started'
-                                          THEN session_id END) AS session_count,
-                       MAX(CASE WHEN kind = 'call_started'
-                                THEN created_at END) AS last_called_at
-                FROM events
-                WHERE tool_name = ? AND tool_version IS NOT NULL
-                GROUP BY tool_version
-                """,
-                (name,),
-            ).fetchall()
-            creator_rows = connection.execute(
-                """
-                SELECT tool_version, session_id
-                FROM events
-                WHERE kind = 'binding_changed' AND tool_name = ?
-                      AND tool_version IS NOT NULL
-                ORDER BY created_at, id
-                """,
-                (name,),
-            ).fetchall()
-            session_rows = connection.execute(
-                """
-                SELECT session_id, COUNT(*) AS call_count,
-                       MAX(created_at) AS last_called_at
-                FROM events
-                WHERE kind = 'call_started' AND tool_name = ?
-                GROUP BY session_id
-                ORDER BY last_called_at DESC, session_id
-                """,
-                (name,),
-            ).fetchall()
+            ids = [int(row["id"]) for row in version_rows]
+            placeholders = ",".join("?" for _ in ids)
+            event_rows = (
+                connection.execute(
+                    f"""
+                    SELECT tool_version_id, kind, session_id, created_at
+                    FROM events WHERE tool_version_id IN ({placeholders})
+                    """,
+                    ids,
+                ).fetchall()
+                if ids
+                else []
+            )
         active_version = int(active_row["version"]) if active_row is not None else None
-        usage = {
-            int(row["tool_version"]): row
-            for row in usage_rows
-            if row["tool_version"] is not None
-        }
-        creators: dict[int, str] = {}
-        for row in creator_rows:
-            creators.setdefault(int(row["tool_version"]), str(row["session_id"]))
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for event in event_rows:
+            grouped.setdefault(int(event["tool_version_id"]), []).append(event)
         versions = []
+        sessions: dict[str, list[str]] = {}
         for row in version_rows:
+            events = grouped.get(int(row["id"]), [])
+            calls = [event for event in events if event["kind"] == "call_started"]
+            for event in calls:
+                sessions.setdefault(str(event["session_id"]), []).append(
+                    str(event["created_at"])
+                )
+            creator = next(
+                (
+                    str(event["session_id"])
+                    for event in events
+                    if event["kind"] == "binding_changed"
+                ),
+                None,
+            )
             version = int(row["version"])
-            stats = usage.get(version)
             versions.append(
                 {
                     "version": version,
@@ -957,99 +1694,161 @@ class Kernel:
                     "input_schema": json.loads(row["schema_json"]),
                     "source": row["source"],
                     "created_at": row["created_at"],
-                    "created_session_id": creators.get(version),
-                    "call_count": int(stats["call_count"] or 0) if stats else 0,
-                    "success_count": int(stats["success_count"] or 0) if stats else 0,
-                    "failure_count": int(stats["failure_count"] or 0) if stats else 0,
-                    "session_count": int(stats["session_count"] or 0) if stats else 0,
-                    "last_called_at": stats["last_called_at"] if stats else None,
+                    "created_session_id": creator,
+                    "call_count": len(calls),
+                    "success_count": sum(
+                        event["kind"] == "call_succeeded" for event in events
+                    ),
+                    "failure_count": sum(
+                        event["kind"] == "call_failed" for event in events
+                    ),
+                    "session_count": len({event["session_id"] for event in calls}),
+                    "last_called_at": max(
+                        (str(event["created_at"]) for event in calls), default=None
+                    ),
                 }
             )
-        sessions = [
+        session_items = [
             {
-                "session_id": row["session_id"],
-                "call_count": int(row["call_count"]),
-                "last_called_at": row["last_called_at"],
+                "session_id": session_id,
+                "call_count": len(timestamps),
+                "last_called_at": max(timestamps),
             }
-            for row in session_rows
+            for session_id, timestamps in sessions.items()
         ]
+        session_items.sort(
+            key=lambda item: (item["last_called_at"], item["session_id"]), reverse=True
+        )
         return {
             "name": name,
             "kind": "core" if name in CORE_NAMES else "user",
             "active_version": active_version,
             "versions": versions,
-            "sessions": sessions,
+            "sessions": session_items,
             "call_count": sum(item["call_count"] for item in versions),
             "success_count": sum(item["success_count"] for item in versions),
             "failure_count": sum(item["failure_count"] for item in versions),
+            "toolbox": lineage["toolbox_name"],
         }
 
     def delete_tool(
-        self, name: str, *, session_id: str | None = None
+        self,
+        name: str,
+        *,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+        toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Remove a user tool from the active toolbox while retaining its history."""
+        """Remove one namespace binding while retaining its lineage history."""
         if name in CORE_NAMES:
             raise ToolboxError("core_tool_required", f"cannot delete core tool: {name}")
+        active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(
-                    """
-                    SELECT v.version
-                    FROM bindings AS b
-                    JOIN tool_versions AS v ON v.id = b.tool_id
-                    WHERE b.name = ?
-                    """,
-                    (name,),
-                ).fetchone()
-                if row is None:
-                    raise ToolboxError(
-                        "unknown_active_tool", f"unknown active tool: {name}"
-                    )
-                version = int(row["version"])
-                connection.execute("DELETE FROM bindings WHERE name = ?", (name,))
+                target = (
+                    self._toolbox_id(connection, toolbox)
+                    if toolbox
+                    else self._resolve(
+                        name, scope=active_scope, connection=connection
+                    ).toolbox_id
+                )
+                tool = self._resolve(
+                    name,
+                    scope=active_scope,
+                    toolbox_id=target,
+                    connection=connection,
+                )
+                connection.execute(
+                    "DELETE FROM bindings WHERE toolbox_id = ? AND name = ?",
+                    (target, name),
+                )
                 if session_id is not None:
                     self._append_event_connection(
                         connection,
                         session_id,
                         "binding_deleted",
-                        {"name": name, "from_version": version},
+                        {
+                            "name": name,
+                            "from_version": tool.version,
+                            "toolbox_id": target,
+                        },
+                        toolbox_id=target,
                         tool_name=name,
-                        tool_version=version,
+                        tool_version=tool.version,
+                        tool_version_id=tool.id,
                     )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
-        return {"name": name, "deleted_version": version, "active": False}
+        return {"name": name, "deleted_version": tool.version, "active": False}
 
-    def rollback(self, name: str, *, version: int) -> dict[str, Any]:
-        """Move a binding without relying on any editable tool implementation."""
-        current = self._active_version(name)
-        if current is None:
-            raise ToolboxError("unknown_tool", f"unknown active tool: {name}")
+    def rollback(
+        self,
+        name: str,
+        *,
+        version: int,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+        toolbox: str | None = None,
+    ) -> dict[str, Any]:
+        """Move one namespace binding without editable tool code."""
+        active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                if toolbox:
+                    target_id = self._toolbox_id(connection, toolbox)
+                    lineage = self._lineage_for_history(
+                        connection, name, active_scope, toolbox
+                    )
+                    try:
+                        current_tool = self._resolve(
+                            name,
+                            scope=active_scope,
+                            toolbox_id=target_id,
+                            connection=connection,
+                        )
+                    except ToolboxError as error:
+                        if error.code != "unknown_tool":
+                            raise
+                        current_tool = None
+                else:
+                    current_tool = self._resolve(
+                        name, scope=active_scope, connection=connection
+                    )
+                    target_id = current_tool.toolbox_id
+                    lineage = self._lineage_for_history(
+                        connection, name, active_scope, current_tool.toolbox_name
+                    )
                 row = connection.execute(
                     """
                     SELECT id, version FROM tool_versions
-                    WHERE name = ? AND version = ?
+                    WHERE lineage_id = ? AND version = ?
                     """,
-                    (name, version),
+                    (lineage["id"], version),
                 ).fetchone()
                 if row is None:
                     raise ToolboxError(
                         "no_rollback",
                         f"no requested rollback version exists for {name}",
                     )
-                target = int(row["version"])
                 connection.execute(
-                    "UPDATE bindings SET tool_id = ? WHERE name = ?",
-                    (int(row["id"]), name),
+                    """
+                    INSERT INTO bindings (toolbox_id, name, tool_version_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(toolbox_id, name)
+                    DO UPDATE SET tool_version_id = excluded.tool_version_id
+                    """,
+                    (target_id, name, int(row["id"])),
                 )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
-        return {"name": name, "from_version": current, "to_version": target}
+        return {
+            "name": name,
+            "from_version": current_tool.version if current_tool else None,
+            "to_version": int(row["version"]),
+        }

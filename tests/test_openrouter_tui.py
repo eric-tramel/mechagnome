@@ -760,6 +760,101 @@ def test_authored_tools_do_not_inherit_provider_credentials(
     assert result == {"key": None}
 
 
+def test_isolated_worker_uses_persisted_session_cwd(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    shadow = workspace / "mechagnome"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("")
+    shadow_marker = tmp_path / "shadow-worker-ran"
+    (shadow / "tool_worker.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(shadow_marker)!r}).write_text('shadowed')\n"
+    )
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=workspace)
+    kernel.write_tool(
+        name="where",
+        description="Return the process working directory.",
+        input_schema={"type": "object"},
+        source="import os\n\ndef main(input, ctx):\n    return os.getcwd()\n",
+    )
+    session_id = kernel.create_session()
+
+    result = IsolatedToolRunner(kernel).call(
+        "call_tool", {"name": "where", "args": {}}, session_id=session_id
+    )
+
+    assert result == str(workspace.resolve())
+    assert shadow_marker.exists() is False
+
+
+def test_inflight_worker_keeps_its_toolbox_selection_snapshot(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    kernel.create_toolbox("alpha")
+    kernel.create_toolbox("beta")
+    session_id = kernel.create_session()
+    kernel.select_toolboxes(session_id, ["alpha"], mode="use")
+    kernel.write_tool(
+        name="same",
+        description="Return alpha.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 'alpha'\n",
+        session_id=session_id,
+    )
+    kernel.write_tool(
+        name="wait_then_call",
+        description="Wait for the host, then resolve a nested call.",
+        input_schema={"type": "object"},
+        source=(
+            "import time\n"
+            "from pathlib import Path\n\n"
+            "def main(input, ctx):\n"
+            "    Path(input['ready']).write_text('ready')\n"
+            "    while not Path(input['release']).exists():\n"
+            "        time.sleep(0.01)\n"
+            "    return ctx.call_tool('same', {})\n"
+        ),
+        session_id=session_id,
+    )
+    kernel.select_toolboxes(session_id, ["beta"], mode="use")
+    kernel.write_tool(
+        name="same",
+        description="Return beta.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 'beta'\n",
+        session_id=session_id,
+    )
+    kernel.select_toolboxes(session_id, ["alpha", "beta"], mode="use")
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    outcomes: list[Any] = []
+
+    def run() -> None:
+        outcomes.append(
+            IsolatedToolRunner(kernel).call(
+                "call_tool",
+                {
+                    "name": "wait_then_call",
+                    "args": {"ready": str(ready), "release": str(release)},
+                },
+                session_id=session_id,
+            )
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+    kernel.select_toolboxes(session_id, ["beta", "alpha"], mode="use")
+    release.write_text("go")
+    thread.join(timeout=2)
+
+    assert outcomes == ["alpha"]
+    assert kernel.call("same", {}, session_id=session_id) == "beta"
+
+
 def test_bare_command_launches_tui_with_openrouter_defaults(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -1161,6 +1256,58 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
             await submit(pilot, "/new")
             assert app.conversation.session_id != old_session
             assert len(kernel.list_sessions(limit=10)["sessions"]) == 2
+
+    asyncio.run(exercise())
+
+
+def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    kernel.create_toolbox("alpha")
+    kernel.create_toolbox("beta")
+    setup = kernel.create_session()
+    kernel.select_toolboxes(setup, ["alpha"], mode="use")
+    kernel.write_tool(
+        name="identity",
+        description="Return alpha.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 'alpha'\n",
+        session_id=setup,
+    )
+    kernel.select_toolboxes(setup, ["beta"], mode="use")
+    kernel.write_tool(
+        name="identity",
+        description="Return beta.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 'beta'\n",
+        session_id=setup,
+    )
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+
+    async def submit(pilot: Any, value: str) -> None:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = value
+        await pilot.press("enter")
+        await pilot.pause()
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(pilot, "/toolbox use beta alpha")
+            selected = kernel.active_toolboxes(app.conversation.session_id)
+            assert [item["name"] for item in selected] == ["beta", "alpha"]
+            assert (
+                kernel.call("identity", {}, session_id=app.conversation.session_id)
+                == "beta"
+            )
+            sidebar = "\n".join(
+                line.text for line in app.query_one("#tools", RichLog).lines
+            )
+            assert "identity  v1  [beta]" in sidebar
+            assert "beta + alpha" in str(app.query_one("#model-info", Static).render())
+            await submit(pilot, "/toolbox list")
+            chat = "\n".join(
+                line.text for line in app.query_one("#chat", RichLog).lines
+            )
+            assert "toolbox namespaces" in chat
 
     asyncio.run(exercise())
 

@@ -9,13 +9,14 @@ from mechagnome.harness import (
     RunCancelled,
     ToolCall,
 )
-from mechagnome.kernel import Kernel, ToolboxError
+from mechagnome.kernel import InvocationScope, Kernel, ToolboxError
 from mechagnome.openrouter import OpenRouterModel
 
 __all__ = [
     "AgentEvent",
     "Conversation",
     "Harness",
+    "InvocationScope",
     "Kernel",
     "ModelStreamEvent",
     "ModelTurn",

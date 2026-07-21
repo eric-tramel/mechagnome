@@ -65,8 +65,10 @@ class AgentEvent:
     seq: int | None
     call_id: str | None = None
     parent_call_id: str | None = None
+    toolbox_id: str | None = None
     tool_name: str | None = None
     tool_version: int | None = None
+    tool_version_id: int | None = None
 
 
 EventSink = Callable[[AgentEvent], None]
@@ -186,7 +188,7 @@ class Conversation:
 
         for turn_number in range(1, self.max_turns + 1):
             token.check()
-            tools = self.kernel.tool_definitions()
+            tools = self.kernel.tool_definitions(session_id=self.session_id)
             try:
                 turn = self._respond(tools, on_event, token)
             except Exception as error:
@@ -345,8 +347,10 @@ class Conversation:
                     seq=event["seq"],
                     call_id=event["call_id"],
                     parent_call_id=event["parent_call_id"],
+                    toolbox_id=event["toolbox_id"],
                     tool_name=event["tool_name"],
                     tool_version=event["tool_version"],
+                    tool_version_id=event["tool_version_id"],
                 )
             )
 

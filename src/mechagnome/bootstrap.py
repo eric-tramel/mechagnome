@@ -84,6 +84,7 @@ HELP_SOURCE = dedent(
         "authoring": "tools/authoring.md",
         "composition": "tools/composition.md",
         "sessions": "runtime/sessions.md",
+        "namespaces": "runtime/namespaces.md",
         "versioning": "runtime/versioning.md",
         "core": "runtime/core.md",
     }

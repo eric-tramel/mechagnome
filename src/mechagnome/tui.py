@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import shlex
 from typing import Any
 
 from rich.markdown import Markdown
@@ -175,7 +176,9 @@ class ToolManagerScreen(Screen[None]):
         self.on_toolbox_changed = on_toolbox_changed
         self.inventory = self._inventory()
         self.selected_name = self.inventory[0]["name"]
-        self.history = self.kernel.tool_history(self.selected_name)
+        self.history = self.kernel.tool_history(
+            self.selected_name, session_id=self.session_id
+        )
         self.selected_version = self._initial_version()
 
     def compose(self) -> ComposeResult:
@@ -218,7 +221,9 @@ class ToolManagerScreen(Screen[None]):
         if event.value is Select.NULL:
             return
         self.selected_name = str(event.value)
-        self.history = self.kernel.tool_history(self.selected_name)
+        self.history = self.kernel.tool_history(
+            self.selected_name, session_id=self.session_id
+        )
         self.selected_version = self._initial_version()
         picker = self.query_one("#version-picker", Select)
         picker.set_options(self._version_options())
@@ -258,7 +263,9 @@ class ToolManagerScreen(Screen[None]):
             return
         self.on_toolbox_changed()
         self.inventory = self._inventory()
-        self.history = self.kernel.tool_history(self.selected_name)
+        self.history = self.kernel.tool_history(
+            self.selected_name, session_id=self.session_id
+        )
         self.selected_version = self._initial_version()
         tool_picker = self.query_one("#tool-picker", Select)
         tool_picker.set_options(self._tool_options())
@@ -271,7 +278,7 @@ class ToolManagerScreen(Screen[None]):
 
     def _inventory(self) -> list[dict[str, Any]]:
         return sorted(
-            self.kernel.tool_inventory(),
+            self.kernel.tool_inventory(session_id=self.session_id),
             key=lambda item: (item["kind"] == "core", item["name"]),
         )
 
@@ -315,7 +322,9 @@ class ToolManagerScreen(Screen[None]):
         creator = version["created_session_id"] or "host / unknown"
         summary = Text()
         summary.append(self.selected_name, style="bold cyan")
-        summary.append(f"  ·  {self.history['kind']}  ·  {state}\n")
+        summary.append(
+            f"  ·  {self.history['kind']}  ·  {self.history['toolbox']}  ·  {state}\n"
+        )
         summary.append(str(version["description"]))
         summary.append(
             f"\nv{version['version']} created {version['created_at'][:19]}  ·  "
@@ -715,13 +724,21 @@ class ToolboxApp(App[None]):
         stream.display = False
 
     def _command(self, prompt: str) -> bool:
-        command, _, argument = prompt.partition(" ")
+        try:
+            parts = shlex.split(prompt)
+        except ValueError as error:
+            self._write_error(str(error))
+            return True
+        command = parts[0]
+        arguments = parts[1:]
         if command in {"/quit", "/q"}:
             self.action_quit()
         elif command in {"/new", "/reset"}:
             self.action_new_session()
-        elif command in {"/tools", "/toolbox"}:
+        elif command == "/tools" or (command == "/toolbox" and not arguments):
             self.action_manage_tools()
+        elif command == "/toolbox":
+            self._toolbox_command(arguments)
         elif command == "/sessions":
             self._show_sessions()
         elif command in {"/help", "/?"}:
@@ -734,6 +751,63 @@ class ToolboxApp(App[None]):
         """Cancel synchronous work before asking Textual to exit."""
         self.conversation.close()
         self.exit()
+
+    def _toolbox_command(self, arguments: list[str]) -> None:
+        if self.busy:
+            self._set_status("stop the active rollout before changing toolboxes")
+            return
+        action, *values = arguments
+        try:
+            if action == "list":
+                self._show_toolboxes()
+                return
+            if action == "create":
+                if not 1 <= len(values) <= 2:
+                    raise ValueError("usage: /toolbox create NAME [CWD]")
+                cwd = values[1] if len(values) == 2 else self.kernel.cwd
+                self.kernel.create_toolbox(values[0], cwd=cwd)
+                self._set_status(f"created toolbox {values[0]}")
+            elif action in {"use", "add", "remove"}:
+                if not values:
+                    raise ValueError(f"usage: /toolbox {action} NAME [NAME ...]")
+                self.kernel.select_toolboxes(
+                    self.conversation.session_id, values, mode=action
+                )
+                self._set_status(f"toolbox selection {action}d")
+            elif action == "default":
+                if values:
+                    raise ValueError("usage: /toolbox default")
+                self.kernel.reset_toolboxes(self.conversation.session_id)
+                self._set_status("restored cwd-default toolbox")
+            elif action == "set-default":
+                if not 1 <= len(values) <= 2:
+                    raise ValueError("usage: /toolbox set-default NAME [CWD]")
+                self.kernel.set_cwd_default(
+                    values[0], cwd=values[1] if len(values) == 2 else None
+                )
+                self._set_status(f"cwd default → {values[0]}")
+            else:
+                raise ValueError(f"unknown toolbox command: {action}")
+        except Exception as error:
+            self._write_error(str(error))
+            return
+        self._refresh_sidebar()
+
+    def _show_toolboxes(self) -> None:
+        selected = {
+            item["id"]: item
+            for item in self.kernel.active_toolboxes(self.conversation.session_id)
+        }
+        table = Table("Toolbox", "Active", "Cwd", box=None, expand=True)
+        for toolbox in self.kernel.list_toolboxes():
+            active = selected.get(toolbox["id"])
+            marker = (
+                "primary" if active and active["primary"] else "yes" if active else ""
+            )
+            table.add_row(toolbox["name"], marker, str(toolbox["cwd"] or "—"))
+        self.query_one("#chat", RichLog).write(
+            Panel(table, title="toolbox namespaces", border_style="blue")
+        )
 
     def action_new_session(self) -> None:
         """Begin a fresh model conversation without deleting toolbox state."""
@@ -759,13 +833,16 @@ class ToolboxApp(App[None]):
     def action_show_tools(self) -> None:
         """Refresh the toolbox and report its active contents in chat."""
         self._refresh_sidebar()
-        bindings = self.kernel.bindings()
-        table = Table("Tool", "Version", "Kind", box=None, expand=True)
+        bindings = self.kernel.bindings(
+            session_id=self.conversation.session_id, include_origin=True
+        )
+        table = Table("Tool", "Version", "Kind", "Toolbox", box=None, expand=True)
         for binding in bindings:
             table.add_row(
                 binding["name"],
                 str(binding["active_version"]),
                 binding["kind"],
+                binding["toolbox"],
             )
         self.query_one("#chat", RichLog).write(
             Panel(table, title="active toolbox", border_style="blue")
@@ -793,6 +870,10 @@ class ToolboxApp(App[None]):
                     "- `Esc` — stop the active rollout\n"
                     "- `/new` — start a new saved conversation\n"
                     "- `/tools` or `Ctrl+T` — open tool management\n"
+                    "- `/toolbox list` — list namespaces and active order\n"
+                    "- `/toolbox create NAME [CWD]` — create a namespace\n"
+                    "- `/toolbox use|add|remove NAME...` — change this session\n"
+                    "- `/toolbox default` — restore the session cwd default\n"
                     "- `/sessions` — list saved sessions\n"
                     "- `/quit` — exit\n\n"
                     "The agent itself can call `help` for tool-authoring docs."
@@ -850,12 +931,19 @@ class ToolboxApp(App[None]):
         self._set_status("error")
 
     def _refresh_sidebar(self) -> None:
-        bindings = self.kernel.bindings(recent_first=True)
+        bindings = self.kernel.bindings(
+            recent_first=True,
+            session_id=self.conversation.session_id,
+            include_origin=True,
+        )
+        selected = self.kernel.active_toolboxes(self.conversation.session_id)
         core_count = sum(binding["kind"] == "core" for binding in bindings)
         user_count = len(bindings) - core_count
+        selection = " + ".join(item["name"] for item in selected)
         self.query_one("#model-info", Static).update(
             f"{self.model_name}\n"
             f"session {self.conversation.session_id[:10]}\n"
+            f"{selection}\n"
             f"{core_count} core · {user_count} user"
         )
         toolbox = self.query_one("#tools", RichLog)
@@ -864,7 +952,8 @@ class ToolboxApp(App[None]):
             style = "cyan" if binding["kind"] == "core" else "green"
             toolbox.write(
                 Text(
-                    f"{binding['name']}  v{binding['active_version']}",
+                    f"{binding['name']}  v{binding['active_version']}  "
+                    f"[{binding['toolbox']}]",
                     style=style,
                     overflow="fold",
                     no_wrap=False,

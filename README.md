@@ -20,7 +20,9 @@ It begins with no user-authored tools. During a session, an agent can write a
 Python tool, call it immediately, find it again later, compose it from other
 tools, and inspect current or historical sessions. The five core operations are
 also stored as readable, immutable source versions and can be replaced through
-`write_tool`.
+`write_tool`. Tools live in named toolbox namespaces. Each session starts from
+the toolbox mapped to its working directory and can replace or compose its
+active namespaces without changing the provider-facing five-tool surface.
 
 The fixed part is deliberately small: SQLite storage, version resolution,
 execution, event append, recursion limits, binding changes, and host rollback.
@@ -40,8 +42,11 @@ That opens the terminal UI with `z-ai/glm-5.2` as the default model. Responses
 appear incrementally as OpenRouter streams them; fragmented tool calls are
 assembled before execution. The main pane is the saved multi-turn conversation,
 and the sidebar updates as the agent creates or replaces tools. State defaults to
-`~/.local/share/mechagnome/toolbox.db`, so new TUI sessions share the same
-toolbox and can inspect earlier sessions.
+`~/.local/share/mechagnome/toolbox.db`, which holds the namespace registry,
+tools, and sessions. A fresh working directory receives its own default
+namespace; an existing session retains its saved ordered selection when resumed.
+Databases upgraded from the original global-toolbox schema retain a `legacy`
+fallback for unmapped directories until an explicit cwd default is configured.
 
 TUI commands:
 
@@ -52,6 +57,15 @@ TUI commands:
   creation provenance, per-version call outcomes, and calling sessions. User
   tools can be deleted from the active toolbox after confirmation; source,
   versions, usage, and session history remain available for audit.
+- `/toolbox list` shows registered namespaces and the current selection.
+- `/toolbox create NAME [CWD]` creates an independently versioned namespace and
+  maps the supplied (or current) cwd to it.
+- `/toolbox use NAME...` replaces this session's ordered selection.
+- `/toolbox add NAME...` appends namespaces to the selection; `/toolbox remove
+  NAME...` deselects them.
+- `/toolbox default` restores the namespace mapped to the session launch cwd;
+  `/toolbox set-default NAME [CWD]` changes a cwd mapping.
+- Bare `/toolbox` remains an alias for the tool manager.
 - `/sessions` lists saved sessions.
 - `/help` shows shortcuts; `/quit` exits.
 
@@ -104,6 +118,40 @@ uv run mechagnome --db .toolbox/demo.db rollback search_tools 1
 uv run mechagnome --db .toolbox/demo.db rollback call_tool 1
 ```
 
+Namespace registry operations are also available without launching the TUI:
+
+```bash
+uv run mechagnome toolboxes list
+uv run mechagnome toolboxes create research --cwd "$PWD"
+uv run mechagnome bindings --toolbox research
+uv run mechagnome rollback search_tools 1 --toolbox research
+```
+
+## Toolbox namespaces
+
+A session stores an ordered, nonempty list of toolbox IDs. Unqualified lookup
+uses deterministic first-wins precedence, so `use project shared` resolves a
+collision from `project`; reversing the order reverses the winner. `add` is an
+ordered idempotent union. Catalogs expose each effective tool once and include
+its toolbox origin.
+
+Each toolbox owns independent tool lineages and immutable versions. Thus
+`formatter@1` in two namespaces is two distinct versions, and an exact-version
+call remains within the winning lineage. Updating, deleting, or rolling back an
+existing visible name affects its winning toolbox; a new name is written to the
+first (primary) toolbox. Deleting a winner reveals the next selected binding.
+Host recovery commands accept `--toolbox` to reach a shadowed lineage.
+
+Selection changes are durable session events. A top-level call snapshots the
+ordered toolbox IDs, so a hot swap affects the next call tree while an already
+running nested tree remains internally consistent. Bindings remain late-bound
+inside that snapshot, preserving write-then-call behavior.
+
+A toolbox's cwd association is routing metadata for cwd defaults. Authored tools
+run in the session's persisted launch cwd; selecting a toolbox associated with
+another directory does not change filesystem context. Namespaces organize and
+compose executable code—they do not isolate it or restrict its access.
+
 ## Tool ABI
 
 Every authored source program is a module containing one synchronous entry
@@ -151,6 +199,7 @@ def main(input, ctx):
 A `call_started` event is committed before the source runs, so a tool reading
 the current session sees its own in-progress call. Events use a stable
 per-session sequence and include nested parent call IDs and resolved versions.
+New events also carry stable toolbox and tool-version identities.
 
 ## Model adapter boundary
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import stat
 import sys
 from pathlib import Path
@@ -435,6 +437,274 @@ def main(input, ctx):
 
     assert result["written"]["active"] is True
     assert result["called"] == {"ready": True}
+
+
+def test_toolbox_selection_replace_union_remove_and_cwd_default(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    cwd_default = kernel.list_toolboxes()[0]["name"]
+    kernel.create_toolbox("alpha", cwd=tmp_path)
+    kernel.create_toolbox("beta")
+    session_id = kernel.create_session()
+
+    selected = kernel.select_toolboxes(session_id, ["alpha", "beta"], mode="use")
+    assert [item["name"] for item in selected] == ["alpha", "beta"]
+    assert selected[0]["primary"] is True
+
+    selected = kernel.select_toolboxes(
+        session_id, ["beta", "beta", cwd_default], mode="add"
+    )
+    assert [item["name"] for item in selected] == [
+        "alpha",
+        "beta",
+        cwd_default,
+    ]
+    assert [
+        item["name"]
+        for item in kernel.select_toolboxes(session_id, ["alpha"], mode="remove")
+    ] == ["beta", cwd_default]
+
+    kernel.set_cwd_default("alpha", cwd=tmp_path)
+    assert [item["name"] for item in kernel.reset_toolboxes(session_id)] == ["alpha"]
+    assert [
+        item["name"]
+        for item in kernel.select_toolboxes(session_id, ["alpha"], mode="remove")
+    ] == ["alpha"]
+    events = kernel.read_session(session_id, limit=100)["events"]
+    assert sum(event["kind"] == "toolbox_selection_changed" for event in events) == 5
+
+
+def test_sessionless_host_operations_do_not_create_saved_sessions(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+
+    kernel.bindings()
+    kernel.catalog()
+    kernel.tool_definitions()
+    kernel.write_tool(
+        name="host_tool",
+        description="Written without a conversation.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return True\n",
+    )
+
+    assert kernel.list_sessions()["sessions"] == []
+
+
+def test_cwd_association_is_the_default_routing_source(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    database = tmp_path / "toolbox.db"
+    kernel = Kernel(database, cwd=first)
+
+    kernel.create_toolbox("research", cwd=second)
+    reopened = Kernel(database, cwd=second)
+    session_id = reopened.create_session()
+
+    assert [item["name"] for item in reopened.active_toolboxes(session_id)] == [
+        "research"
+    ]
+    research = next(
+        item for item in reopened.list_toolboxes() if item["name"] == "research"
+    )
+    assert research["default"] is True
+
+
+def test_missing_cwd_is_a_structured_toolbox_error(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+
+    with pytest.raises(ToolboxError) as error:
+        kernel.create_toolbox("missing", cwd=tmp_path / "absent")
+
+    assert error.value.code == "invalid_cwd"
+
+
+def test_toolbox_union_collisions_versions_mutations_and_core_order(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    kernel.create_toolbox("alpha")
+    kernel.create_toolbox("beta")
+    session_id = kernel.create_session()
+
+    kernel.select_toolboxes(session_id, ["alpha"], mode="use")
+    write(
+        kernel,
+        "same",
+        "def main(input, ctx):\n    return 'alpha'\n",
+        session_id=session_id,
+    )
+    write(
+        kernel,
+        "search_tools",
+        "def main(input, ctx):\n    return {'origin': 'alpha'}\n",
+        session_id=session_id,
+        input_schema=CORE_SCHEMAS["search_tools"],
+        base_version=1,
+    )
+
+    kernel.select_toolboxes(session_id, ["beta"], mode="use")
+    write(
+        kernel,
+        "same",
+        "def main(input, ctx):\n    return 'beta-v1'\n",
+        session_id=session_id,
+    )
+    write(
+        kernel,
+        "same",
+        "def main(input, ctx):\n    return 'beta-v2'\n",
+        session_id=session_id,
+        base_version=1,
+    )
+
+    kernel.select_toolboxes(session_id, ["alpha", "beta"], mode="use")
+    assert call_tool(kernel, "same", {}, session_id=session_id) == "alpha"
+    assert call_tool(kernel, "same", {}, session_id=session_id, version=1) == "alpha"
+    assert kernel.tool_definitions(session_id=session_id)[1]["description"] == (
+        "Test tool search_tools."
+    )
+    matches = [
+        item for item in kernel.catalog(session_id=session_id) if item["name"] == "same"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["toolbox"] == "alpha"
+
+    kernel.select_toolboxes(session_id, ["beta", "alpha"], mode="use")
+    assert call_tool(kernel, "same", {}, session_id=session_id) == "beta-v2"
+    assert call_tool(kernel, "same", {}, session_id=session_id, version=1) == "beta-v1"
+    kernel.delete_tool("same", session_id=session_id)
+    assert call_tool(kernel, "same", {}, session_id=session_id) == "alpha"
+    assert kernel.rollback("same", version=1, toolbox="beta") == {
+        "name": "same",
+        "from_version": None,
+        "to_version": 1,
+    }
+    assert call_tool(kernel, "same", {}, session_id=session_id) == "beta-v1"
+
+
+def test_session_toolbox_selection_survives_reopen_and_is_isolated(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "toolbox.db"
+    kernel = Kernel(database, cwd=tmp_path)
+    kernel.create_toolbox("alpha")
+    kernel.create_toolbox("beta")
+    first = kernel.create_session()
+    second = kernel.create_session()
+    kernel.select_toolboxes(first, ["alpha", "beta"], mode="use")
+    kernel.select_toolboxes(second, ["beta"], mode="use")
+
+    reopened = Kernel(database, cwd=tmp_path)
+
+    assert [item["name"] for item in reopened.active_toolboxes(first)] == [
+        "alpha",
+        "beta",
+    ]
+    assert [item["name"] for item in reopened.active_toolboxes(second)] == ["beta"]
+
+
+def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE tool_versions (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL,
+            description TEXT NOT NULL, schema_json TEXT NOT NULL, source TEXT NOT NULL,
+            created_at TEXT NOT NULL, UNIQUE(name, version)
+        );
+        CREATE TABLE bindings (
+            name TEXT PRIMARY KEY,
+            tool_id INTEGER NOT NULL REFERENCES tool_versions(id)
+        );
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL,
+            kind TEXT NOT NULL, call_id TEXT, parent_call_id TEXT, tool_name TEXT,
+            tool_version INTEGER, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(session_id, seq)
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO tool_versions VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            1,
+            "legacy_tool",
+            1,
+            "Legacy tool.",
+            json.dumps({"type": "object"}),
+            "def main(input, ctx):\n    return 'legacy'\n",
+            "2026-01-01T00:00:00+00:00",
+        ),
+    )
+    connection.execute("INSERT INTO bindings VALUES ('legacy_tool', 1)")
+    connection.execute(
+        "INSERT INTO sessions VALUES ('old-session', '2026-01-01T00:00:00+00:00')"
+    )
+    connection.execute(
+        """
+        INSERT INTO events VALUES (
+            1, 'old-session', 1, 'call_succeeded', 'call', NULL,
+            'legacy_tool', 1, ?, '2026-01-01T00:00:01+00:00'
+        )
+        """,
+        (json.dumps({"result": "legacy"}),),
+    )
+    connection.commit()
+    connection.close()
+
+    kernel = Kernel(database, cwd=tmp_path)
+
+    assert [item["name"] for item in kernel.list_toolboxes()] == ["legacy"]
+    assert [item["name"] for item in kernel.active_toolboxes("old-session")] == [
+        "legacy"
+    ]
+    assert kernel.call("legacy_tool", {}, session_id="old-session") == "legacy"
+    migrated = kernel.read_session("old-session", limit=100)["events"][0]
+    assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
+    with sqlite3.connect(database) as reopened:
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
+
+
+def test_cli_lists_and_creates_toolbox_namespaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "toolbox.db"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mechagnome",
+            "--db",
+            str(database),
+            "toolboxes",
+            "create",
+            "research",
+            "--cwd",
+            str(tmp_path),
+        ],
+    )
+    assert cli.main() == 0
+    assert '"name": "research"' in capsys.readouterr().out
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mechagnome", "--db", str(database), "toolboxes", "list"],
+    )
+    assert cli.main() == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert "research" in {item["name"] for item in listed}
 
 
 def test_cli_recovery_failure_returns_nonzero(

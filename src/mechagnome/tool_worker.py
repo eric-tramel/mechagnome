@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from mechagnome.kernel import Kernel, ToolboxError
+from mechagnome.kernel import InvocationScope, Kernel, ToolboxError
 
 
 def _write_response(path: Path, response: dict[str, Any]) -> None:
@@ -29,11 +29,18 @@ def main() -> int:
             request["db_path"],
             max_depth=request["max_depth"],
             max_calls=request["max_calls"],
+            cwd=request["cwd"],
+        )
+        scope = InvocationScope(
+            session_id=request["session_id"],
+            toolbox_ids=tuple(request["toolbox_ids"]),
+            cwd=request["cwd"],
         )
         result = kernel.call(
             request["name"],
             request["args"],
             session_id=request["session_id"],
+            scope=scope,
         )
         response = {"ok": True, "result": result}
     except BaseException as error:

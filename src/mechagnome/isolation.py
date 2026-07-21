@@ -48,6 +48,7 @@ class IsolatedToolRunner:
         if cancelled is not None and cancelled():
             raise ToolboxError("cancelled", "rollout stopped")
         after = self._latest_sequence(session_id)
+        scope = self.kernel.snapshot_scope(session_id)
         request = {
             "db_path": str(self.kernel.db_path),
             "max_depth": self.kernel.max_depth,
@@ -55,6 +56,8 @@ class IsolatedToolRunner:
             "name": name,
             "args": args,
             "session_id": session_id,
+            "toolbox_ids": scope.toolbox_ids,
+            "cwd": scope.cwd,
         }
         environment = {
             key: value
@@ -68,20 +71,29 @@ class IsolatedToolRunner:
             request_path = root / "request.json"
             response_path = root / "response.json"
             request_path.write_text(json.dumps(request), encoding="utf-8")
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "mechagnome.tool_worker",
-                    str(request_path),
-                    str(response_path),
-                ],
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            try:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-P",
+                        "-m",
+                        "mechagnome.tool_worker",
+                        str(request_path),
+                        str(response_path),
+                    ],
+                    cwd=scope.cwd,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as error:
+                raise ToolboxError(
+                    "session_cwd_unavailable",
+                    f"cannot launch tool worker in session cwd: {scope.cwd}",
+                    reason=str(error),
+                ) from error
             deadline = time.monotonic() + self.timeout
             while process.poll() is None:
                 after = self._relay(session_id, after, on_event)

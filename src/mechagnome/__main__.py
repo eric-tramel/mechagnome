@@ -164,12 +164,29 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("tui", help="launch the interactive agent interface")
     subparsers.add_parser("demo", help="run the deterministic growth demo")
-    subparsers.add_parser("bindings", help="inspect active bindings")
+    bindings_parser = subparsers.add_parser("bindings", help="inspect active bindings")
+    bindings_parser.add_argument("--toolbox", help="inspect one named toolbox")
     rollback_parser = subparsers.add_parser(
         "rollback", help="restore a prior version without calling editable code"
     )
     rollback_parser.add_argument("name")
     rollback_parser.add_argument("version", type=int)
+    rollback_parser.add_argument("--toolbox", help="target one named toolbox")
+    toolbox_parser = subparsers.add_parser(
+        "toolboxes", help="list and configure toolbox namespaces"
+    )
+    toolbox_actions = toolbox_parser.add_subparsers(
+        dest="toolbox_action", required=True
+    )
+    toolbox_actions.add_parser("list", help="list registered namespaces")
+    create_parser = toolbox_actions.add_parser("create", help="create a namespace")
+    create_parser.add_argument("name")
+    create_parser.add_argument("--cwd", type=Path)
+    default_parser = toolbox_actions.add_parser(
+        "set-default", help="set a cwd's default namespace"
+    )
+    default_parser.add_argument("name")
+    default_parser.add_argument("--cwd", type=Path)
     return parser
 
 
@@ -195,9 +212,17 @@ def main() -> int:
         if args.command == "demo":
             result: Any = demo(kernel)
         elif args.command == "bindings":
-            result = kernel.bindings()
+            result = kernel.bindings(toolbox=args.toolbox, include_origin=True)
+        elif args.command == "rollback":
+            result = kernel.rollback(
+                args.name, version=args.version, toolbox=args.toolbox
+            )
+        elif args.toolbox_action == "list":
+            result = kernel.list_toolboxes()
+        elif args.toolbox_action == "create":
+            result = kernel.create_toolbox(args.name, cwd=args.cwd)
         else:
-            result = kernel.rollback(args.name, version=args.version)
+            result = kernel.set_cwd_default(args.name, cwd=args.cwd)
     except ToolboxError as error:
         result = error.to_dict()
         status = 1
