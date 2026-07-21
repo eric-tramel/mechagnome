@@ -46,6 +46,7 @@ class ToolEvent(Collapsible):
     """One quiet, expandable tool invocation or observation."""
 
     SYMBOLS = {"call": "→", "response": "✓", "error": "✕"}
+    SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
     def __init__(self, kind: str, tool_name: str, detail: str) -> None:
         self.kind = kind
@@ -60,13 +61,36 @@ class ToolEvent(Collapsible):
             collapsed=True,
             classes=f"tool-event tool-{kind}",
         )
+        self._spinner_index = 0
+        self._spinner_timer = None
+
+    def on_mount(self) -> None:
+        """Start the spinner animation for in-progress calls."""
+        if self.kind == "call":
+            self._start_spinner()
+
+    def _start_spinner(self) -> None:
+        self._spinner_timer = self.set_interval(0.08, self._spin)
+
+    def _spin(self) -> None:
+        frame = self.SPINNER_FRAMES[self._spinner_index % len(self.SPINNER_FRAMES)]
+        self._spinner_index += 1
+        self.title = f"{frame} {self.tool_name}"
+
+    def stop_spinner(self) -> None:
+        """Stop the spinner and restore the static symbol."""
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+        self.title = f"{self.SYMBOLS[self.kind]} {self.tool_name}"
 
     def update_call(self, tool_name: str, detail: str) -> None:
         """Replace a pending dispatcher row with its confirmed target call."""
         self.tool_name = tool_name
         self.detail = detail
-        self.title = f"{self.SYMBOLS['call']} {tool_name}"
         self.detail_widget.update(Text(detail, style="dim"))
+        if self._spinner_timer is None:
+            self.title = f"{self.SYMBOLS['call']} {tool_name}"
 
 
 class ChatFeed(VerticalScroll):
@@ -982,6 +1006,10 @@ class ToolboxApp(App[None]):
         text-style: italic;
     }
 
+    .tool-call CollapsibleTitle {
+        color: #7dd3fc;
+    }
+
     .tool-response CollapsibleTitle {
         color: #789b83;
     }
@@ -1123,6 +1151,7 @@ class ToolboxApp(App[None]):
         self.forwarded_targets: dict[str, str] = {}
         self.forwarded_events: dict[str, ToolEvent] = {}
         self.forwarded_children: dict[str, str] = {}
+        self.active_tool_events: dict[str, ToolEvent] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1327,11 +1356,16 @@ class ToolboxApp(App[None]):
             if target and event.call_id:
                 self.forwarded_targets[event.call_id] = target
                 self.forwarded_events[event.call_id] = displayed
+            if event.call_id:
+                self.active_tool_events[event.call_id] = displayed
             self._set_status(f"calling {name}")
         elif event.kind == "call_succeeded":
             display = self._tool_response(event)
             if display is None:
                 return
+            if event.call_id in self.active_tool_events:
+                self.active_tool_events[event.call_id].stop_spinner()
+                del self.active_tool_events[event.call_id]
             name, detail = display
             self.query_one("#chat", ChatFeed).write_tool("response", name, detail)
             self._refresh_sidebar()
@@ -1351,6 +1385,9 @@ class ToolboxApp(App[None]):
             display = self._tool_response(event, failed=True)
             if display is None:
                 return
+            if event.call_id in self.active_tool_events:
+                self.active_tool_events[event.call_id].stop_spinner()
+                del self.active_tool_events[event.call_id]
             name, detail = display
             self.query_one("#chat", ChatFeed).write_tool("error", name, detail)
             self._set_status(f"{name} failed")
@@ -1358,6 +1395,9 @@ class ToolboxApp(App[None]):
             self._clear_stream()
             self._write_error(str(event.payload.get("message") or event.payload))
         elif event.kind == "cancelled":
+            for tool_event in self.active_tool_events.values():
+                tool_event.stop_spinner()
+            self.active_tool_events.clear()
             partial = self.streamed_text + "".join(self.pending_stream_text)
             self._clear_stream()
             content = partial or str(event.payload.get("message") or "Rollout stopped.")
@@ -1497,6 +1537,7 @@ class ToolboxApp(App[None]):
         self.forwarded_targets.clear()
         self.forwarded_events.clear()
         self.forwarded_children.clear()
+        self.active_tool_events.clear()
         self._show_welcome()
         self._refresh_sidebar()
         self._set_status("new session")

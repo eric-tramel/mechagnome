@@ -57,7 +57,7 @@ def main() -> int:
             model_provider=provider,
         )
         response = {"ok": True, "result": result}
-    except BaseException as error:
+    except Exception as error:
         if isinstance(error, ToolboxError):
             failure = error.to_dict()["error"]
         else:
