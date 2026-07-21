@@ -13,7 +13,16 @@ def main(input, ctx):
 ```
 
 Those two IDs are equal. Nested tools receive new `ToolContext` objects but keep
-the same durable session ID.
+the same durable session ID. A model completion requested by one of those tools
+is different: it becomes its own durable child session. A model session bound
+under that child can create grandchildren in the same way.
+
+Sessions have immutable `kind`, `parent_session_id`, and `origin_call_id`
+metadata. Kinds are `generic` for host/tool-only history, `conversation` for a
+multi-turn agent execution (including `ctx.model_provider.run_agent(...)`
+children), and `completion` for one accepted text-only
+`ctx.model_provider.complete(...)` call. `root_session_id` is derived by
+walking the parent chain rather than stored separately.
 
 ## Session API
 
@@ -21,12 +30,23 @@ the same durable session ID.
 - `ctx.sessions.read(session_id, after=0, limit=50)` reads any saved session.
 - `ctx.sessions.list(limit=20, cursor=0)` lists saved sessions in reverse
   creation order.
+- `ctx.sessions.metadata(session_id=None)` returns identity and lineage for the
+  current or named session.
 
 `current` and `read` return this shape:
 
 ```json
 {
   "session_id": "...",
+  "session": {
+    "id": "...",
+    "parent_session_id": null,
+    "root_session_id": "...",
+    "kind": "conversation",
+    "origin_call_id": null,
+    "cwd": "/workspace",
+    "created_at": "..."
+  },
   "events": [],
   "next_after": null
 }
@@ -44,6 +64,10 @@ events in that page. Limits are clamped to the range 1 through 100.
     {
       "id": "...",
       "cwd": "/workspace",
+      "parent_session_id": null,
+      "root_session_id": "...",
+      "kind": "conversation",
+      "origin_call_id": null,
       "created_at": "...",
       "event_count": 12
     }
@@ -118,6 +142,12 @@ Each event contains:
 Fields that do not apply to an event may be `None`. Common tool-call kinds are
 `call_started`, `call_succeeded`, and `call_failed`; sessions also record model,
 binding, invocation-scope, and toolbox-selection events.
+
+Accepted one-shot model completions record `model_input`, then `model` and
+`final`; provider failures record a sanitized `model_failed` terminal event.
+Invalid requests rejected before provider dispatch do not create a session.
+Each child inherits the exact cwd and ordered toolbox selection snapshotted for
+its parent invocation.
 
 A `call_started` event is committed before authored source begins. A tool that
 calls `ctx.sessions.current()` can therefore see its own in-progress call and

@@ -14,8 +14,8 @@ from typing import Any
 
 import httpx
 
-from mechagnome.harness import ModelStreamEvent, ModelTurn, ToolCall
 from mechagnome.kernel import ToolboxError
+from mechagnome.model_provider import ModelStreamEvent, ModelTurn, ToolCall
 
 DEFAULT_MODEL = "z-ai/glm-5.2"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"

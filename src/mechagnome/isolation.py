@@ -16,7 +16,13 @@ from threading import Thread
 from typing import Any
 
 from mechagnome.kernel import JsonValue, Kernel, ToolboxError
-from mechagnome.model_provider import ModelProvider, _ModelProviderBroker
+from mechagnome.model_provider import (
+    ModelProvider,
+    ModelSession,
+    _BoundedModelProvider,
+    _CompletionProvider,
+    _ModelProviderBroker,
+)
 
 CommittedEventSink = Callable[[dict[str, Any]], None]
 
@@ -88,7 +94,7 @@ class IsolatedToolRunner:
         args: dict[str, Any],
         *,
         session_id: str,
-        model_provider: ModelProvider | None,
+        model_provider: _CompletionProvider | None,
         on_event: CommittedEventSink | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> JsonValue:
@@ -110,13 +116,24 @@ class IsolatedToolRunner:
         session_id: str,
         on_event: CommittedEventSink | None,
         cancelled: Callable[[], bool] | None,
-        model_provider: ModelProvider | None,
+        model_provider: _CompletionProvider | None,
     ) -> JsonValue:
         self._validate_model_provider(model_provider)
         if cancelled is not None and cancelled():
             raise ToolboxError("cancelled", "rollout stopped")
         after = self._latest_sequence(session_id)
         scope = self.kernel.snapshot_scope(session_id)
+        if model_provider is not None and not isinstance(
+            model_provider, _BoundedModelProvider
+        ):
+            gateway = ModelProvider.from_completion_transport(
+                self.kernel, model_provider
+            )
+            model_provider = ModelSession(gateway, session_id).completion_provider(
+                scope
+            )
+        elif isinstance(model_provider, _BoundedModelProvider):
+            model_provider = model_provider.for_scope(scope)
         request = {
             "db_path": str(self.kernel.db_path),
             "max_depth": self.kernel.max_depth,
@@ -269,9 +286,16 @@ class IsolatedToolRunner:
         )
 
     @staticmethod
-    def _validate_model_provider(provider: ModelProvider | None) -> None:
+    def _validate_model_provider(provider: _CompletionProvider | None) -> None:
         if provider is None:
             return
+        if isinstance(provider, _BoundedModelProvider):
+            if provider.supports_cancellation:
+                return
+            raise ToolboxError(
+                "invalid_model_provider",
+                "isolated model providers must support cancellation and reset",
+            )
         if not all(
             callable(getattr(provider, name, None))
             for name in ("complete", "cancel_current", "reset_cancellation")
@@ -282,7 +306,7 @@ class IsolatedToolRunner:
             )
 
     @staticmethod
-    def _cancel_model_provider(provider: ModelProvider | None) -> None:
+    def _cancel_model_provider(provider: _CompletionProvider | None) -> None:
         if provider is None:
             return
         try:
@@ -291,7 +315,7 @@ class IsolatedToolRunner:
             pass
 
     @staticmethod
-    def _reset_model_provider(provider: ModelProvider | None) -> None:
+    def _reset_model_provider(provider: _CompletionProvider | None) -> None:
         if provider is None:
             return
         try:

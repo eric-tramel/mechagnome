@@ -36,7 +36,7 @@ from textual.widgets import (
 
 from mechagnome.harness import AgentEvent, Conversation, Harness, Model, RunCancelled
 from mechagnome.kernel import Kernel
-from mechagnome.model_provider import ModelProvider
+from mechagnome.model_provider import CompletionTransport, ModelProvider
 from mechagnome.openrouter import (
     OpenRouterError,
     OpenRouterModel,
@@ -1223,33 +1223,36 @@ class ToolboxApp(App[None]):
     def __init__(
         self,
         kernel: Kernel,
-        model: Model,
+        model: Model | ModelProvider,
         *,
         model_name: str,
         max_turns: int = 50,
-        model_provider: ModelProvider | None = None,
+        model_provider: CompletionTransport | None = None,
     ) -> None:
         super().__init__()
         self.kernel = kernel
-        self.model = model
-        self.model_provider = model_provider
+        self.model = model.transport if isinstance(model, ModelProvider) else model
         self.model_name = model_name
         self.harness = Harness(kernel, max_turns=max_turns)
+        initial_conversation = self.harness.start(
+            model,
+            model_provider=model_provider,
+        )
+        self.model_provider = initial_conversation.model_session.provider
         self._tab_counter = 0
-        initial = self._make_session_tab()
+        initial = self._make_session_tab(conversation=initial_conversation)
         self.session_tabs = [initial]
         self._active_pane_id = initial.pane_id
         self.rollout_owner: SessionTab | None = None
         self.model_options: list[OpenRouterModelOption] = []
 
-    def _make_session_tab(self) -> SessionTab:
+    def _make_session_tab(
+        self, *, conversation: Conversation | None = None
+    ) -> SessionTab:
         self._tab_counter += 1
         number = self._tab_counter
         return SessionTab(
-            conversation=self.harness.start(
-                self.model,
-                model_provider=self.model_provider,
-            ),
+            conversation=conversation or self.harness.start(self.model_provider),
             pane_id=f"session-{number}",
             label=f"Session {number}",
             chat=ChatFeed(id=f"chat-{number}", classes="session-chat"),
@@ -1748,10 +1751,7 @@ class ToolboxApp(App[None]):
         state = self.active_session
         state.conversation.close()
         self._reset_session_ui(state)
-        state.conversation = self.harness.start(
-            self.model,
-            model_provider=self.model_provider,
-        )
+        state.conversation = self.harness.start(self.model_provider)
         state.chat.clear()
         with self.prevent(Input.Changed):
             self.query_one("#prompt", Input).value = ""
@@ -1851,10 +1851,14 @@ class ToolboxApp(App[None]):
 
     def _show_sessions(self) -> None:
         sessions = self.kernel.list_sessions(limit=15)["sessions"]
-        table = Table("Session", "Events", "Created", box=None, expand=True)
+        table = Table(
+            "Session", "Kind", "Parent", "Events", "Created", box=None, expand=True
+        )
         for session in sessions:
             table.add_row(
-                session["id"][:12],
+                session["id"],
+                session["kind"],
+                (session["parent_session_id"] or "—")[:12],
                 str(session["event_count"]),
                 session["created_at"][:19],
             )
@@ -2116,7 +2120,6 @@ def run_tui(kernel: Kernel, model: Model, *, model_name: str) -> None:
     """Launch the interactive terminal application."""
     ToolboxApp(
         kernel,
-        model,
+        ModelProvider(kernel, model),
         model_name=model_name,
-        model_provider=model if isinstance(model, OpenRouterModel) else None,
     ).run()

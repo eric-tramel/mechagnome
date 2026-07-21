@@ -166,6 +166,14 @@ input-token, or total-output-token budget; a request may incur provider charges
 even if it is later cancelled or its response is rejected. Enforce model and
 spend limits with the host provider as well.
 
+Every accepted `complete()` call creates a distinct durable `completion`
+session. Its `parent_session_id` is the current agent session and its
+`origin_call_id` identifies the exact tool invocation that requested it. The
+child records `model_input`, `model`, and `final` events (or a sanitized
+`model_failed` event), appears in the normal session list, and can be read by
+its own ID. Invalid requests rejected before dispatch consume the shared attempt
+budget but do not create a child session.
+
 The capability can raise
 `invalid_model_request` when request validation rejects message shape or size,
 `model_provider_limit` when the call or response-size limit is exceeded,
@@ -174,6 +182,26 @@ The capability can raise
 `model_provider_protocol` reports a broken worker-to-host connection. Provider
 failures are deliberately sanitized, so authored source should not depend on
 provider-specific exception details.
+
+### Running a child agent
+
+Use `run_agent(prompt)` when the delegated work may need tools or further
+delegation:
+
+```python
+def main(input, ctx):
+    answer = ctx.model_provider.run_agent(
+        f"Investigate this task and return a concise answer: {input['task']}"
+    )
+    return {"answer": answer}
+```
+
+The call is synchronous and returns the child agent's final text. Before any
+model traffic, the provider creates a durable `conversation` session parented
+to the caller's session and attributed to the current tool call. Child agents
+receive the same bounded capability, so a child calling `run_agent()` creates a
+grandchild with the child session as its direct parent. All model and tool
+events are recorded under the session in which they actually occur.
 
 These failures raise `mechagnome.ToolboxError`; inspect its stable `code` only
 when the tool has a meaningful fallback, and re-raise everything else:
@@ -203,6 +231,11 @@ but it grants authored tools authority to spend the configured model account. It
 is credential opacity, not credential separation: authored code still runs as
 the provider client’s OS user and must be treated as trusted code.
 
+Tool model access must be authorized explicitly by the host. Passing only a raw
+root transport to `Harness` does not expose a coincidental `complete()` method
+to authored tools; pass a completion transport explicitly or construct a
+`ModelProvider` intentionally.
+
 The proxy is also an authenticated data-egress capability: every supplied
 message is sent to the configured provider, and authored code can place data
 read from files or saved sessions into those messages. Do not pass sensitive
@@ -212,6 +245,9 @@ data to `complete()` unless disclosure to that provider is explicitly intended.
 
 `ctx.sessions` is a `SessionAccess` object scoped to the caller's durable
 session. `ctx.sessions.id` and `ctx.caller_session_id` are the same ID.
+`ctx.sessions.metadata()` returns that session's kind, direct parent, derived
+root, origin call, cwd, and creation time. Pass another saved ID to inspect its
+lineage.
 
 ```python
 def main(input, ctx):

@@ -32,6 +32,7 @@ from textual.widgets import (
 from mechagnome import (
     Harness,
     Kernel,
+    ModelProvider,
     ModelStreamEvent,
     ModelTurn,
     RunCancelled,
@@ -1257,6 +1258,21 @@ def test_isolated_tool_uses_host_authenticated_model_provider(
     }
     events = kernel.read_session(session_id, limit=100)["events"]
     assert secret not in json.dumps(events)
+    children = [
+        item
+        for item in kernel.list_sessions(limit=100)["sessions"]
+        if item["parent_session_id"] == session_id
+    ]
+    assert len(children) == 1
+    assert children[0]["kind"] == "completion"
+    assert children[0]["origin_call_id"] is not None
+    child_events = kernel.read_session(children[0]["id"], limit=100)["events"]
+    assert [event["kind"] for event in child_events] == [
+        "model_input",
+        "model",
+        "final",
+    ]
+    assert secret not in json.dumps(child_events)
     for database_file in tmp_path.glob("toolbox.db*"):
         assert secret.encode() not in database_file.read_bytes()
 
@@ -1436,6 +1452,31 @@ def test_isolated_runner_rejects_provider_without_cancellation(
             {"topic": "quickstart"},
             session_id=kernel.create_session(),
             model_provider=NonCancellableProvider(),  # type: ignore[arg-type]
+        )
+
+    assert error.value.code == "invalid_model_provider"
+
+
+def test_isolated_runner_rejects_wrapped_provider_without_cancellation(
+    tmp_path: Path,
+) -> None:
+    class NonCancellableTransport:
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            return ModelTurn(text="unused")
+
+        def complete(self, messages: Any) -> str:
+            return "unreachable"
+
+    kernel = Kernel(tmp_path / "toolbox.db")
+    provider = ModelProvider(kernel, NonCancellableTransport())
+    session = provider.start_session()
+
+    with pytest.raises(ToolboxError) as error:
+        IsolatedToolRunner(kernel).call_with_model_provider(
+            "help",
+            {"topic": "quickstart"},
+            session_id=session.session_id,
+            model_provider=session.completion_provider(),
         )
 
     assert error.value.code == "invalid_model_provider"
@@ -1749,7 +1790,8 @@ def test_tui_preserves_model_provider_when_starting_a_new_session(
         model_provider=provider,
     )
     original = app.active_session
-    assert original.conversation.model_provider is provider
+    gateway = app.model_provider
+    assert original.conversation.model_session.provider is gateway
 
     async def exercise() -> None:
         async with app.run_test(size=(120, 40)) as pilot:
@@ -1761,7 +1803,7 @@ def test_tui_preserves_model_provider_when_starting_a_new_session(
             assert len(app.session_tabs) == 2
             assert second is not original
             assert second.conversation.session_id != original.conversation.session_id
-            assert app.conversation.model_provider is provider
+            assert second.conversation.model_session.provider is gateway
             assert original in app.session_tabs
 
             prompt.value = "second draft"

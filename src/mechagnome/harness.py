@@ -3,51 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Event, Lock
-from typing import Any, Protocol
+from typing import Any
 
 from mechagnome.bootstrap import CORE_NAMES
 from mechagnome.isolation import IsolatedToolRunner
 from mechagnome.kernel import JsonValue, Kernel, ToolboxError
-from mechagnome.model_provider import ModelProvider
+from mechagnome.model_provider import (
+    CompletionTransport,
+    ModelProvider,
+    ModelSession,
+    ModelStreamEvent,  # noqa: F401 - compatibility re-export
+    ModelTransport,
+    ModelTurn,
+    ToolCall,
+)
 
-
-@dataclass(frozen=True)
-class ToolCall:
-    """One model-requested core operation."""
-
-    name: str
-    args: dict[str, Any]
-    id: str
-
-
-@dataclass(frozen=True)
-class ModelTurn:
-    """A provider-adapted model response."""
-
-    text: str | None = None
-    calls: tuple[ToolCall, ...] = field(default_factory=tuple)
-    reasoning: str | None = None
-    reasoning_details: tuple[dict[str, Any], ...] = field(default_factory=tuple)
-
-
-@dataclass(frozen=True)
-class ModelStreamEvent:
-    """One text delta or the completed provider-neutral model turn."""
-
-    text_delta: str = ""
-    turn: ModelTurn | None = None
-
-
-class Model(Protocol):
-    """The only adapter a provider integration must implement."""
-
-    def respond(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
-    ) -> ModelTurn:
-        """Return text, core operation calls, or both."""
-        ...
+Model = ModelTransport
 
 
 @dataclass(frozen=True)
@@ -107,29 +80,19 @@ class Conversation:
     def __init__(
         self,
         kernel: Kernel,
-        model: Model,
+        model_session: ModelSession,
         *,
-        session_id: str,
         max_turns: int,
         max_calls_per_turn: int,
         tool_runner: IsolatedToolRunner,
-        model_provider: ModelProvider | None = None,
         messages: list[dict[str, Any]] | None = None,
     ) -> None:
-        if model_provider is not None and not callable(
-            getattr(tool_runner, "call_with_model_provider", None)
-        ):
-            raise ToolboxError(
-                "model_provider_unavailable",
-                "the configured tool runner cannot broker model provider requests",
-            )
         self.kernel = kernel
-        self.model = model
-        self.session_id = session_id
+        self.model_session = model_session
+        self.session_id = model_session.session_id
         self.max_turns = max_turns
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner
-        self.model_provider = model_provider
         self.messages = messages or []
         self._run_lock = Lock()
         self._current_token: _CancellationToken | None = None
@@ -154,12 +117,10 @@ class Conversation:
         finally:
             with self._run_lock:
                 if self._current_token is token:
-                    reset_cancellation = getattr(self.model, "reset_cancellation", None)
-                    if callable(reset_cancellation):
-                        try:
-                            reset_cancellation()
-                        except Exception:
-                            pass
+                    try:
+                        self.model_session.reset_cancellation()
+                    except Exception:
+                        pass
                     self._current_token = None
 
     def cancel(self) -> bool:
@@ -182,12 +143,10 @@ class Conversation:
     def _cancel_locked(self, token: _CancellationToken | None) -> None:
         if token is not None:
             token.cancel()
-        cancel_current = getattr(self.model, "cancel_current", None)
-        if callable(cancel_current):
-            try:
-                cancel_current()
-            except Exception:
-                pass
+        try:
+            self.model_session.cancel_current()
+        except Exception:
+            pass
 
     def _run(
         self,
@@ -206,35 +165,25 @@ class Conversation:
             except Exception as error:
                 if token.cancelled or isinstance(error, RunCancelled):
                     raise RunCancelled from error
-                self._append(
-                    on_event,
-                    "model_failed",
-                    {"type": type(error).__name__, "message": str(error)},
-                )
                 raise
             token.check()
             calls = [
                 {"id": call.id, "name": call.name, "args": call.args}
                 for call in turn.calls
             ]
-            model_payload: dict[str, Any] = {"text": turn.text, "calls": calls}
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
                 "content": turn.text,
                 "tool_calls": calls,
             }
             if turn.reasoning:
-                model_payload["reasoning"] = turn.reasoning
                 assistant_message["reasoning"] = turn.reasoning
             if turn.reasoning_details:
                 details = list(turn.reasoning_details)
-                model_payload["reasoning_details"] = details
                 assistant_message["reasoning_details"] = details
-            self._append(on_event, "model", model_payload)
             self.messages.append(assistant_message)
             if not turn.calls:
                 answer = turn.text or ""
-                self._append(on_event, "final", {"content": answer})
                 return RunResult(self.session_id, answer, turn_number)
 
             oversized_batch = len(turn.calls) > self.max_calls_per_turn
@@ -280,13 +229,15 @@ class Conversation:
         token: _CancellationToken,
     ) -> ModelTurn:
         token.check()
-        stream = getattr(self.model, "stream", None)
-        if not callable(stream):
-            turn = self.model.respond(self.messages, tools)
-            token.check()
-            return turn
         completed: ModelTurn | None = None
-        for event in stream(self.messages, tools):
+        for event in self.model_session._stream_with_recorded_input(
+            self.messages,
+            tools,
+            on_record=lambda kind, payload, seq: self._emit_model_record(
+                sink, kind, payload, seq
+            ),
+            cancelled=lambda: token.cancelled,
+        ):
             token.check()
             if event.text_delta:
                 self._emit_transient(sink, "model_delta", {"text": event.text_delta})
@@ -337,7 +288,9 @@ class Conversation:
                 return call_with_provider(
                     call.name,
                     call.args,
-                    model_provider=self.model_provider,
+                    model_provider=self.model_session.completion_provider(
+                        agent_runner=self._run_child_agent
+                    ),
                     **call_kwargs,
                 )
             return self.tool_runner.call(call.name, call.args, **call_kwargs)
@@ -347,6 +300,16 @@ class Conversation:
             return error.to_dict()
         except Exception as error:  # Generated tools may raise anything.
             return {"error": {"code": "tool_failed", "message": str(error)}}
+
+    def _run_child_agent(self, model_session: ModelSession, prompt: str) -> str:
+        child = Conversation(
+            self.kernel,
+            model_session,
+            max_turns=self.max_turns,
+            max_calls_per_turn=self.max_calls_per_turn,
+            tool_runner=self.tool_runner,
+        )
+        return child.send(prompt).answer
 
     def _append(
         self,
@@ -375,6 +338,16 @@ class Conversation:
                 )
             )
 
+    @staticmethod
+    def _emit_model_record(
+        sink: EventSink | None,
+        kind: str,
+        payload: dict[str, Any],
+        sequence: int,
+    ) -> None:
+        if sink is not None:
+            sink(AgentEvent(kind, payload, sequence))
+
 
 class Harness:
     """Drive a model that can only see the five metaprogramming operations."""
@@ -394,21 +367,38 @@ class Harness:
 
     def start(
         self,
-        model: Model,
+        model: Model | ModelProvider,
         *,
         session_id: str | None = None,
-        model_provider: ModelProvider | None = None,
+        model_provider: CompletionTransport | None = None,
     ) -> Conversation:
         """Start a persistent conversation suitable for a chat interface."""
-        identifier = self.kernel.create_session(session_id)
+        if isinstance(model, ModelProvider):
+            if model.kernel is not self.kernel:
+                raise ToolboxError(
+                    "invalid_model_provider",
+                    "model provider belongs to a different kernel",
+                )
+            if model_provider is not None:
+                raise ToolboxError(
+                    "invalid_model_provider",
+                    "a model provider cannot be combined with a second provider",
+                )
+            provider = model
+        else:
+            provider = ModelProvider.from_transport(
+                self.kernel,
+                model,
+                completions=model_provider,
+            )
+        model_session = provider.start_session(session_id=session_id)
+        identifier = model_session.session_id
         return Conversation(
             self.kernel,
-            model,
-            session_id=identifier,
+            model_session,
             max_turns=self.max_turns,
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
-            model_provider=model_provider,
             messages=self._session_messages(identifier),
         )
 
@@ -461,11 +451,11 @@ class Harness:
 
     def run(
         self,
-        model: Model,
+        model: Model | ModelProvider,
         prompt: str,
         *,
         session_id: str | None = None,
-        model_provider: ModelProvider | None = None,
+        model_provider: CompletionTransport | None = None,
     ) -> RunResult:
         """Run until the model returns a turn with no operation calls."""
         return self.start(

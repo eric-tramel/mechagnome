@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import socket
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Protocol
 
-from mechagnome.kernel import ToolboxError
+from mechagnome.kernel import InvocationScope, Kernel, ToolboxError
 
 MAX_MODEL_CALLS = 8
 MAX_MODEL_MESSAGES = 64
@@ -29,8 +30,45 @@ _ERROR_MESSAGES = {
 }
 
 
-class ModelProvider(Protocol):
-    """Cancellable synchronous text-completion service supplied by the host."""
+@dataclass(frozen=True)
+class ToolCall:
+    """One model-requested core operation."""
+
+    name: str
+    args: dict[str, Any]
+    id: str
+
+
+@dataclass(frozen=True)
+class ModelTurn:
+    """A provider-adapted model response."""
+
+    text: str | None = None
+    calls: tuple[ToolCall, ...] = field(default_factory=tuple)
+    reasoning: str | None = None
+    reasoning_details: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ModelStreamEvent:
+    """One text delta or completed provider-neutral model turn."""
+
+    text_delta: str = ""
+    turn: ModelTurn | None = None
+
+
+class ModelTransport(Protocol):
+    """Raw provider transport hidden behind the session-aware gateway."""
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        """Return one provider-neutral model turn."""
+        ...
+
+
+class CompletionTransport(Protocol):
+    """Raw synchronous text-completion surface used by child sessions."""
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Return text for a validated chat-message sequence."""
@@ -46,11 +84,437 @@ class ModelProvider(Protocol):
 
 
 class _CompletionProvider(Protocol):
-    """Completion-only capability exposed to authored tools."""
+    """Internal model capability already bound to a durable parent session."""
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Return text for a validated chat-message sequence."""
         ...
+
+    def run_agent(self, prompt: str) -> str:
+        """Run a tool-capable child agent in a durable conversation session."""
+        ...
+
+    def for_origin(self, call_id: str) -> _CompletionProvider:
+        """Bind descendants to the authored call that requested them."""
+        ...
+
+    def for_scope(self, scope: InvocationScope) -> _CompletionProvider:
+        """Bind descendants to one frozen parent invocation scope."""
+        ...
+
+    def cancel_current(self) -> None:
+        """Cancel active model work."""
+        ...
+
+    def reset_cancellation(self) -> None:
+        """Make the capability reusable after cancellation."""
+        ...
+
+    @property
+    def supports_cancellation(self) -> bool:
+        """Whether active work can be cooperatively cancelled."""
+        ...
+
+
+class ToolModelProvider:
+    """Narrow model capability exposed to authored tools.
+
+    Binding operations intentionally stay on the trusted invocation layer. A tool
+    can request work, but cannot select its own parent session or origin call.
+    """
+
+    def __init__(self, capability: _BoundedModelProvider) -> None:
+        self._capability = capability
+
+    def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
+        """Run a one-shot completion in a durable child session."""
+        return self._capability.complete(messages)
+
+    def run_agent(self, prompt: str) -> str:
+        """Run a tool-capable agent in a durable child session."""
+        return self._capability.run_agent(prompt)
+
+
+_USE_ROOT_TRANSPORT = object()
+
+
+class ModelProvider:
+    """Host-owned session gateway for every system model invocation."""
+
+    def __init__(
+        self,
+        kernel: Kernel,
+        transport: ModelTransport,
+        *,
+        completion_transport: CompletionTransport | None | object = _USE_ROOT_TRANSPORT,
+        allow_tool_agents: bool = True,
+    ) -> None:
+        self.kernel = kernel
+        self.transport = transport
+        self.allow_tool_agents = allow_tool_agents
+        if completion_transport is _USE_ROOT_TRANSPORT:
+            candidate = transport
+            self.completion_transport = (
+                candidate if callable(getattr(candidate, "complete", None)) else None
+            )
+        else:
+            self.completion_transport = completion_transport
+
+    @classmethod
+    def from_transport(
+        cls,
+        kernel: Kernel,
+        transport: ModelTransport,
+        *,
+        completions: CompletionTransport | None = None,
+    ) -> ModelProvider:
+        """Normalize legacy transports without implicitly granting tool spend."""
+        return cls(
+            kernel,
+            transport,
+            completion_transport=completions,
+            allow_tool_agents=completions is not None,
+        )
+
+    @classmethod
+    def from_completion_transport(
+        cls, kernel: Kernel, transport: CompletionTransport
+    ) -> ModelProvider:
+        """Adapt a legacy tool-only transport at a host boundary."""
+        return cls(
+            kernel,
+            _UnavailableConversationTransport(),
+            completion_transport=transport,
+            allow_tool_agents=False,
+        )
+
+    def start_session(
+        self,
+        *,
+        session_id: str | None = None,
+        parent_scope: InvocationScope | None = None,
+        origin_call_id: str | None = None,
+    ) -> ModelSession:
+        """Create a root/child conversation or resume an existing root."""
+        if parent_scope is not None:
+            if session_id is not None:
+                raise ToolboxError(
+                    "invalid_session", "child session IDs are generated by the host"
+                )
+            identifier = self.kernel.create_child_session(
+                parent_scope,
+                kind="conversation",
+                origin_call_id=origin_call_id,
+            )
+        else:
+            identifier = self.kernel.create_session(session_id, kind="conversation")
+            metadata = self.kernel.session_metadata(identifier)
+            if metadata["kind"] != "conversation":
+                raise ToolboxError(
+                    "invalid_session",
+                    f"a {metadata['kind']} session cannot be resumed as a conversation",
+                )
+        return ModelSession(self, identifier)
+
+    def _complete(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        parent_scope: InvocationScope,
+        origin_call_id: str | None,
+    ) -> str:
+        normalized = _normalized_messages(messages)
+        child_id = self.kernel.create_child_session(
+            parent_scope,
+            kind="completion",
+            origin_call_id=origin_call_id,
+        )
+        self.kernel.append_event(
+            child_id,
+            "model_input",
+            {"messages": normalized},
+        )
+        complete = (
+            getattr(self.completion_transport, "complete", None)
+            if self.completion_transport is not None
+            else None
+        )
+        if not callable(complete):
+            error = _error("model_provider_unavailable")
+            self.kernel.append_event(child_id, "model_failed", error.to_dict()["error"])
+            raise error
+        try:
+            result = complete(normalized)
+            if not isinstance(result, str):
+                raise _error("model_provider_failed")
+            if len(result.encode("utf-8")) > MAX_MODEL_RESPONSE_BYTES:
+                raise _error("model_provider_limit")
+        except Exception as error:
+            failure = (
+                error
+                if isinstance(error, ToolboxError) and error.code in _ERROR_MESSAGES
+                else _error("model_provider_failed")
+            )
+            self.kernel.append_event(
+                child_id, "model_failed", failure.to_dict()["error"]
+            )
+            raise failure from error
+        self.kernel.append_event(
+            child_id,
+            "model",
+            {"text": result, "calls": []},
+        )
+        self.kernel.append_event(child_id, "final", {"content": result})
+        return result
+
+
+class ModelSession:
+    """A provider bound to one durable, potentially multi-turn agent session."""
+
+    def __init__(self, provider: ModelProvider, session_id: str) -> None:
+        self.provider = provider
+        self.session_id = session_id
+
+    @property
+    def transport(self) -> ModelTransport:
+        return self.provider.transport
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        completed: ModelTurn | None = None
+        for event in self.stream(messages, tools):
+            if event.turn is not None:
+                completed = event.turn
+        assert completed is not None
+        return completed
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        on_record: Callable[[str, dict[str, Any], int], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[ModelStreamEvent]:
+        yield from self._stream(
+            messages,
+            tools,
+            on_record=on_record,
+            cancelled=cancelled,
+            input_recorded=False,
+        )
+
+    def _stream_with_recorded_input(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        on_record: Callable[[str, dict[str, Any], int], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[ModelStreamEvent]:
+        """Dispatch after the conversation has durably recorded its input."""
+        yield from self._stream(
+            messages,
+            tools,
+            on_record=on_record,
+            cancelled=cancelled,
+            input_recorded=True,
+        )
+
+    def _stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        on_record: Callable[[str, dict[str, Any], int], None] | None,
+        cancelled: Callable[[], bool] | None,
+        input_recorded: bool,
+    ) -> Iterator[ModelStreamEvent]:
+        if not input_recorded:
+            self._record("model_input", {"messages": messages}, on_record)
+        completed: ModelTurn | None = None
+        try:
+            stream = getattr(self.transport, "stream", None)
+            events = (
+                stream(messages, tools)
+                if callable(stream)
+                else iter(
+                    (ModelStreamEvent(turn=self.transport.respond(messages, tools)),)
+                )
+            )
+            for event in events:
+                if event.turn is not None:
+                    if completed is not None:
+                        raise ToolboxError(
+                            "invalid_model_stream",
+                            "model stream completed more than once",
+                        )
+                    completed = event.turn
+                else:
+                    yield event
+            if completed is None:
+                raise ToolboxError(
+                    "invalid_model_stream",
+                    "model stream ended without a completed turn",
+                )
+            if cancelled is not None and cancelled():
+                raise ToolboxError("cancelled", "rollout stopped")
+        except Exception as error:
+            is_cancelled = (
+                isinstance(error, ToolboxError) and error.code == "cancelled"
+            ) or (cancelled is not None and cancelled())
+            if not is_cancelled:
+                failure = _error("model_provider_failed")
+                self._record("model_failed", failure.to_dict()["error"], on_record)
+            raise
+
+        payload = _model_payload(completed)
+        self._record("model", payload, on_record)
+        if not completed.calls:
+            self._record("final", {"content": completed.text or ""}, on_record)
+        yield ModelStreamEvent(turn=completed)
+
+    def completion_provider(
+        self,
+        scope: InvocationScope | None = None,
+        *,
+        agent_runner: Callable[[ModelSession, str], str] | None = None,
+    ) -> _BoundedModelProvider:
+        active_scope = (
+            scope
+            if scope is not None
+            else self.provider.kernel.snapshot_scope(self.session_id)
+        )
+        return _bind_model_provider(
+            _SessionCompletionProvider(
+                self.provider,
+                active_scope,
+                agent_runner=agent_runner,
+            )
+        )
+
+    def _record(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        sink: Callable[[str, dict[str, Any], int], None] | None,
+    ) -> None:
+        sequence = self.provider.kernel.append_event(self.session_id, kind, payload)
+        if sink is not None:
+            sink(kind, payload, sequence)
+
+    def cancel_current(self) -> None:
+        seen: set[int] = set()
+        for target in (self.transport, self.provider.completion_transport):
+            if target is None or id(target) in seen:
+                continue
+            seen.add(id(target))
+            cancel = getattr(target, "cancel_current", None)
+            if callable(cancel):
+                cancel()
+
+    def reset_cancellation(self) -> None:
+        seen: set[int] = set()
+        for target in (self.transport, self.provider.completion_transport):
+            if target is None or id(target) in seen:
+                continue
+            seen.add(id(target))
+            reset = getattr(target, "reset_cancellation", None)
+            if callable(reset):
+                reset()
+
+
+class _UnavailableConversationTransport:
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        raise _error("model_provider_unavailable")
+
+
+def _model_payload(turn: ModelTurn) -> dict[str, Any]:
+    calls = [
+        {"id": call.id, "name": call.name, "args": call.args} for call in turn.calls
+    ]
+    payload: dict[str, Any] = {"text": turn.text, "calls": calls}
+    if turn.reasoning:
+        payload["reasoning"] = turn.reasoning
+    if turn.reasoning_details:
+        payload["reasoning_details"] = list(turn.reasoning_details)
+    return payload
+
+
+class _SessionCompletionProvider:
+    """Restricted child-session capability bound to trusted host context."""
+
+    def __init__(
+        self,
+        provider: ModelProvider,
+        scope: InvocationScope,
+        origin_call_id: str | None = None,
+        agent_runner: Callable[[ModelSession, str], str] | None = None,
+    ) -> None:
+        self._provider = provider
+        self._scope = scope
+        self._origin_call_id = origin_call_id
+        self._agent_runner = agent_runner
+
+    def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
+        return self._provider._complete(
+            messages,
+            parent_scope=self._scope,
+            origin_call_id=self._origin_call_id,
+        )
+
+    def for_origin(self, call_id: str) -> _SessionCompletionProvider:
+        return _SessionCompletionProvider(
+            self._provider,
+            self._scope,
+            call_id,
+            self._agent_runner,
+        )
+
+    def for_scope(self, scope: InvocationScope) -> _SessionCompletionProvider:
+        return _SessionCompletionProvider(
+            self._provider,
+            scope,
+            self._origin_call_id,
+            self._agent_runner,
+        )
+
+    def run_agent(self, prompt: str) -> str:
+        if not isinstance(prompt, str) or not prompt:
+            raise _error("invalid_model_request")
+        if self._agent_runner is None:
+            raise _error("model_provider_unavailable")
+        if not self._provider.allow_tool_agents:
+            raise _error("model_provider_unavailable")
+        child = self._provider.start_session(
+            parent_scope=self._scope,
+            origin_call_id=self._origin_call_id,
+        )
+        return self._agent_runner(child, prompt)
+
+    def cancel_current(self) -> None:
+        ModelSession(self._provider, self._scope.session_id).cancel_current()
+
+    def reset_cancellation(self) -> None:
+        ModelSession(self._provider, self._scope.session_id).reset_cancellation()
+
+    @property
+    def supports_cancellation(self) -> bool:
+        targets = []
+        if self._provider.completion_transport is not None:
+            targets.append(self._provider.completion_transport)
+        if self._agent_runner is not None and self._provider.allow_tool_agents:
+            targets.append(self._provider.transport)
+        return all(
+            all(
+                callable(getattr(target, name, None))
+                for name in ("cancel_current", "reset_cancellation")
+            )
+            for target in targets
+        )
 
 
 def _error(code: str) -> ToolboxError:
@@ -95,18 +559,38 @@ class _UnavailableModelProvider:
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         raise _error("model_provider_unavailable")
 
+    def run_agent(self, prompt: str) -> str:
+        raise _error("model_provider_unavailable")
+
+    def for_origin(self, call_id: str) -> _UnavailableModelProvider:
+        return self
+
+    def for_scope(self, scope: InvocationScope) -> _UnavailableModelProvider:
+        return self
+
+    def cancel_current(self) -> None:
+        pass
+
+    def reset_cancellation(self) -> None:
+        pass
+
+    @property
+    def supports_cancellation(self) -> bool:
+        return True
+
 
 class _BoundedModelProvider:
-    def __init__(self, provider: _CompletionProvider) -> None:
+    def __init__(
+        self,
+        provider: _CompletionProvider,
+        *,
+        budget: _ModelCallBudget | None = None,
+    ) -> None:
         self._provider = provider
-        self._calls = 0
-        self._lock = Lock()
+        self._budget = budget or _ModelCallBudget()
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
-        with self._lock:
-            self._calls += 1
-            if self._calls > MAX_MODEL_CALLS:
-                raise _error("model_provider_limit")
+        self._budget.consume()
         normalized = _normalized_messages(messages)
         try:
             result = self._provider.complete(normalized)
@@ -127,13 +611,62 @@ class _BoundedModelProvider:
             raise _error("model_provider_limit")
         return result
 
+    def run_agent(self, prompt: str) -> str:
+        self._budget.consume()
+        if not isinstance(prompt, str) or not prompt:
+            raise _error("invalid_model_request")
+        try:
+            result = self._provider.run_agent(prompt)
+        except ToolboxError as error:
+            code = (
+                error.code if error.code in _ERROR_MESSAGES else "model_provider_failed"
+            )
+            raise _error(code) from error
+        except Exception as error:
+            raise _error("model_provider_failed") from error
+        if not isinstance(result, str):
+            raise _error("model_provider_failed")
+        return result
+
+    def for_origin(self, call_id: str) -> _BoundedModelProvider:
+        provider = self._provider.for_origin(call_id)
+        return _BoundedModelProvider(provider, budget=self._budget)
+
+    def for_scope(self, scope: InvocationScope) -> _BoundedModelProvider:
+        provider = self._provider.for_scope(scope)
+        return _BoundedModelProvider(provider, budget=self._budget)
+
+    def cancel_current(self) -> None:
+        self._provider.cancel_current()
+
+    def reset_cancellation(self) -> None:
+        self._provider.reset_cancellation()
+
+    @property
+    def supports_cancellation(self) -> bool:
+        return self._provider.supports_cancellation
+
+
+class _ModelCallBudget:
+    def __init__(self) -> None:
+        self._calls = 0
+        self._lock = Lock()
+
+    def consume(self) -> None:
+        with self._lock:
+            self._calls += 1
+            if self._calls > MAX_MODEL_CALLS:
+                raise _error("model_provider_limit")
+
 
 def _bind_model_provider(
     provider: _CompletionProvider | None,
-) -> _CompletionProvider:
+) -> _BoundedModelProvider:
     """Create a fresh per-call-tree facade around a host provider."""
+    if isinstance(provider, _BoundedModelProvider):
+        return provider
     if provider is None:
-        return _UnavailableModelProvider()
+        provider = _UnavailableModelProvider()
     return _BoundedModelProvider(provider)
 
 
@@ -203,17 +736,43 @@ def _receive_frame(
 class _ModelProviderProxy:
     """Worker-local completion capability backed by a host socket."""
 
-    def __init__(self, connection: socket.socket) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        *,
+        origin_call_id: str | None = None,
+        lock: Lock | None = None,
+    ) -> None:
         self._connection = connection
-        self._lock = Lock()
+        self._origin_call_id = origin_call_id
+        self._lock = lock or Lock()
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
-        normalized = _normalized_messages(messages)
+        return self._request("complete", messages=messages)
+
+    def run_agent(self, prompt: str) -> str:
+        return self._request("run_agent", prompt=prompt)
+
+    def _request(
+        self,
+        operation: str,
+        *,
+        messages: Sequence[Mapping[str, str]] | None = None,
+        prompt: str | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "op": operation,
+            "origin_call_id": self._origin_call_id,
+        }
+        if operation == "complete":
+            assert messages is not None
+            payload["messages"] = _normalized_messages(messages)
+        else:
+            if not isinstance(prompt, str) or not prompt:
+                raise _error("invalid_model_request")
+            payload["prompt"] = prompt
         with self._lock:
-            _send_frame(
-                self._connection,
-                {"op": "complete", "messages": normalized},
-            )
+            _send_frame(self._connection, payload)
             response = _receive_frame(self._connection)
         if response is None or response.get("ok") not in {True, False}:
             raise _error("model_provider_protocol")
@@ -233,11 +792,34 @@ class _ModelProviderProxy:
             raise _error("model_provider_protocol")
         raise _error(str(code))
 
+    def for_origin(self, call_id: str) -> _ModelProviderProxy:
+        return _ModelProviderProxy(
+            self._connection,
+            origin_call_id=call_id,
+            lock=self._lock,
+        )
+
+    def for_scope(self, scope: InvocationScope) -> _ModelProviderProxy:
+        """Keep the scope fixed by the host-side broker binding."""
+        return self
+
+    def cancel_current(self) -> None:
+        pass
+
+    def reset_cancellation(self) -> None:
+        pass
+
+    @property
+    def supports_cancellation(self) -> bool:
+        return True
+
 
 class _ModelProviderBroker:
     """Host-side broker retaining the concrete authenticated provider."""
 
-    def __init__(self, connection: socket.socket, provider: ModelProvider) -> None:
+    def __init__(
+        self, connection: socket.socket, provider: _CompletionProvider
+    ) -> None:
         self._connection = connection
         self._provider = _bind_model_provider(provider)
 
@@ -259,10 +841,29 @@ class _ModelProviderBroker:
             self._connection.close()
 
     def _handle(self, request: dict[str, Any]) -> dict[str, Any]:
-        if set(request) != {"op", "messages"} or request.get("op") != "complete":
+        operation = request.get("op")
+        expected = (
+            {"op", "messages", "origin_call_id"}
+            if operation == "complete"
+            else {"op", "prompt", "origin_call_id"}
+            if operation == "run_agent"
+            else set()
+        )
+        if set(request) != expected or (
+            request.get("origin_call_id") is not None
+            and not isinstance(request.get("origin_call_id"), str)
+        ):
             return {"ok": False, "error": {"code": "model_provider_protocol"}}
         try:
-            text = self._provider.complete(request["messages"])
+            provider = self._provider
+            origin_call_id = request["origin_call_id"]
+            if origin_call_id is not None:
+                provider = provider.for_origin(origin_call_id)
+            text = (
+                provider.complete(request["messages"])
+                if operation == "complete"
+                else provider.run_agent(request["prompt"])
+            )
         except ToolboxError as error:
             code = (
                 error.code if error.code in _ERROR_MESSAGES else "model_provider_failed"

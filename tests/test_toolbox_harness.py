@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from mechagnome import Harness, Kernel, ModelTurn, ToolboxError, ToolCall
+from mechagnome import Harness, Kernel, ModelProvider, ModelTurn, ToolboxError, ToolCall
 from mechagnome import __main__ as cli
 from mechagnome.bootstrap import CORE_NAMES, CORE_SCHEMAS, HELP_SOURCE
 
@@ -174,6 +174,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "ctx.sessions.read(session_id, after=0, limit=50)",
         "ctx.sessions.list(limit=20, cursor=0)",
         "ctx.model_provider.complete([",
+        "ctx.model_provider.run_agent(",
         "ctx.kernel.catalog(include_core=True)",
         "ctx.kernel.submit_tool_feedback(...)",
         "ctx.kernel.read_tool_source(name, version=None)",
@@ -185,7 +186,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
     composition = kernel.call("help", {"topic": "composition"})
     assert "Each nested invocation receives its own context object" in composition
     assert "base_version" in composition
-    assert "eight completion attempts per top-level call tree" in composition
+    assert "eight delegated-model attempts per top-level call tree" in composition
 
     assert "model_provider_unavailable" in authoring
     assert "model_provider_limit" in authoring
@@ -498,8 +499,67 @@ def test_schema_two_database_migrates_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 3
+    assert version == 4
     assert table is not None
+
+
+def test_schema_three_database_migrates_real_pre_lineage_sessions(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    root = kernel.create_session("legacy-root")
+    kernel.append_event(root, "legacy_event", {"kept": True})
+    selected = kernel.active_toolboxes(root)
+    with closing(kernel._connect()) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            "CREATE TABLE sessions_v3 ("
+            "id TEXT PRIMARY KEY, cwd TEXT, created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO sessions_v3 (id, cwd, created_at) "
+            "SELECT id, cwd, created_at FROM sessions"
+        )
+        connection.execute("DROP TABLE sessions")
+        connection.execute("ALTER TABLE sessions_v3 RENAME TO sessions")
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+
+    reopened = kernel_at(tmp_path)
+    metadata = reopened.session_metadata(root)
+    assert metadata["kind"] == "generic"
+    assert metadata["parent_session_id"] is None
+    assert metadata["root_session_id"] == root
+    assert reopened.read_session(root, limit=100)["events"][0]["payload"] == {
+        "kept": True
+    }
+    assert reopened.active_toolboxes(root) == selected
+    with closing(reopened._connect()) as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        index = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'sessions_parent_created'"
+        ).fetchone()
+        trigger = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'sessions_lineage_immutable'"
+        ).fetchone()
+    assert {"parent_session_id", "kind", "origin_call_id"} <= columns
+    assert index is not None
+    assert trigger is not None
+
+    with (
+        closing(reopened._connect()) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="session lineage is immutable"),
+    ):
+        connection.execute(
+            "UPDATE sessions SET kind = 'conversation' WHERE id = ?", (root,)
+        )
+
+    reopened_again = kernel_at(tmp_path)
+    assert reopened_again.session_metadata(root) == metadata
 
 
 def test_versions_exact_calls_and_stale_base(tmp_path: Path) -> None:
@@ -679,6 +739,301 @@ def test_model_provider_propagates_through_nested_tool_calls(tmp_path: Path) -> 
     }
     assert kernel.call("call_tool", single, model_provider=provider).endswith("fresh")
     assert provider.calls == 17
+
+
+def test_child_sessions_inherit_frozen_scope_and_expose_lineage(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    kernel.create_toolbox("alpha")
+    kernel.create_toolbox("beta")
+    root = kernel.create_session(kind="conversation")
+    kernel.select_toolboxes(root, ["alpha", "beta"], mode="use")
+    frozen = kernel.snapshot_scope(root)
+    kernel.select_toolboxes(root, ["beta"], mode="use")
+
+    child = kernel.create_child_session(frozen, kind="completion")
+
+    assert [item["name"] for item in kernel.active_toolboxes(child)] == [
+        "alpha",
+        "beta",
+    ]
+    metadata = kernel.session_metadata(child)
+    assert metadata["parent_session_id"] == root
+    assert metadata["root_session_id"] == root
+    assert metadata["kind"] == "completion"
+    assert kernel.read_session(child)["session"] == metadata
+    listed = {item["id"]: item for item in kernel.list_sessions(limit=100)["sessions"]}
+    assert listed[child]["parent_session_id"] == root
+    assert listed[child]["root_session_id"] == root
+
+    with (
+        closing(kernel._connect()) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="session lineage is immutable"),
+    ):
+        connection.execute(
+            "UPDATE sessions SET parent_session_id = NULL WHERE id = ?", (child,)
+        )
+
+
+def test_nested_tool_completion_records_inner_origin_and_child_log(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "ask",
+        "def main(input, ctx):\n"
+        "    return ctx.model_provider.complete([\n"
+        "        {'role': 'user', 'content': input['prompt']},\n"
+        "    ])\n",
+    )
+    write(
+        kernel,
+        "delegate",
+        "def main(input, ctx):\n"
+        "    return ctx.call_tool('ask', {'prompt': input['prompt']})\n",
+    )
+    root = kernel.create_session(kind="conversation")
+    provider = ProviderUsingModel()
+
+    assert (
+        kernel.call(
+            "call_tool",
+            {"name": "delegate", "args": {"prompt": "nested"}},
+            session_id=root,
+            model_provider=provider,
+        )
+        == "nested completion"
+    )
+
+    root_events = kernel.read_session(root, limit=100)["events"]
+    ask_call = next(
+        event
+        for event in root_events
+        if event["kind"] == "call_started" and event["tool_name"] == "ask"
+    )
+    children = [
+        session
+        for session in kernel.list_sessions(limit=100)["sessions"]
+        if session["parent_session_id"] == root
+    ]
+    assert len(children) == 1
+    child = children[0]
+    assert child["origin_call_id"] == ask_call["call_id"]
+    assert child["kind"] == "completion"
+    assert [
+        event["kind"] for event in kernel.read_session(child["id"], limit=100)["events"]
+    ] == ["model_input", "model", "final"]
+
+
+def test_provider_sessions_form_recursive_parent_chain(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    provider = ModelProvider(kernel, ProviderUsingModel())
+    root = provider.start_session()
+    child = provider.start_session(parent_scope=kernel.snapshot_scope(root.session_id))
+
+    assert (
+        child.completion_provider().complete(
+            [{"role": "user", "content": "grandchild"}]
+        )
+        == "nested completion"
+    )
+
+    sessions = kernel.list_sessions(limit=100)["sessions"]
+    grandchild = next(
+        session
+        for session in sessions
+        if session["parent_session_id"] == child.session_id
+    )
+    assert kernel.session_metadata(child.session_id)["parent_session_id"] == (
+        root.session_id
+    )
+    assert grandchild["root_session_id"] == root.session_id
+    assert grandchild["kind"] == "completion"
+
+
+def test_direct_model_session_traffic_is_durably_logged(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    provider = ModelProvider(kernel, ProviderUsingModel())
+    session = provider.start_session()
+
+    turn = session.respond([{"role": "user", "content": "direct"}], [])
+
+    assert turn.calls
+    events = kernel.read_session(session.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["model_input", "model"]
+    assert events[0]["payload"]["messages"] == [{"role": "user", "content": "direct"}]
+
+
+def test_isolated_tools_can_run_recursive_first_class_agents(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "delegate",
+        "def main(input, ctx):\n    return ctx.model_provider.run_agent('child')\n",
+    )
+    write(
+        kernel,
+        "child_delegate",
+        "def main(input, ctx):\n"
+        "    return {\n"
+        "        'session_id': ctx.sessions.id,\n"
+        "        'parent_id': ctx.sessions.metadata()['parent_session_id'],\n"
+        "        'answer': ctx.model_provider.run_agent('grandchild'),\n"
+        "    }\n",
+    )
+
+    class RecursiveAgentTransport:
+        def __init__(self) -> None:
+            self.child_observation: dict[str, Any] | None = None
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            prompt = next(
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            )
+            observations = [
+                message for message in messages if message["role"] == "tool"
+            ]
+            if prompt == "root" and not observations:
+                return ModelTurn(
+                    calls=(
+                        ToolCall("call_tool", {"name": "delegate", "args": {}}, "d"),
+                    )
+                )
+            if prompt == "child" and not observations:
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "call_tool",
+                            {"name": "child_delegate", "args": {}},
+                            "cd",
+                        ),
+                    )
+                )
+            if prompt == "grandchild":
+                return ModelTurn(text="grandchild answer")
+            if prompt == "child":
+                self.child_observation = observations[-1]["content"]
+                return ModelTurn(text="child answer")
+            return ModelTurn(text="root answer")
+
+        def complete(self, messages: Any) -> str:
+            return "unused"
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+    transport = RecursiveAgentTransport()
+    result = Harness(kernel).run(ModelProvider(kernel, transport), "root")
+
+    sessions = kernel.list_sessions(limit=100)["sessions"]
+    root = kernel.session_metadata(result.session_id)
+    child = next(
+        session
+        for session in sessions
+        if session["parent_session_id"] == root["id"]
+        and session["kind"] == "conversation"
+    )
+    grandchild = next(
+        session
+        for session in sessions
+        if session["parent_session_id"] == child["id"]
+        and session["kind"] == "conversation"
+    )
+    assert result.answer == "root answer"
+    assert child["root_session_id"] == root["id"]
+    assert grandchild["root_session_id"] == root["id"]
+    assert transport.child_observation == {
+        "session_id": child["id"],
+        "parent_id": root["id"],
+        "answer": "grandchild answer",
+    }
+    child_calls = kernel.read_session(child["id"], limit=100)["events"]
+    child_call = next(
+        event
+        for event in child_calls
+        if event["kind"] == "call_started" and event["tool_name"] == "child_delegate"
+    )
+    assert grandchild["origin_call_id"] == child_call["call_id"]
+    assert [
+        event["kind"]
+        for event in kernel.read_session(grandchild["id"], limit=100)["events"]
+    ] == ["user", "model", "final"]
+
+
+def test_child_agent_tools_see_child_identity_and_create_grandchildren(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "child_probe",
+        "def main(input, ctx):\n"
+        "    return {\n"
+        "        'id': ctx.sessions.id,\n"
+        "        'caller': ctx.caller_session_id,\n"
+        "        'metadata': ctx.sessions.metadata(),\n"
+        "        'answer': ctx.model_provider.complete([\n"
+        "            {'role': 'user', 'content': 'nested'},\n"
+        "        ]),\n"
+        "    }\n",
+    )
+
+    class ChildAgentTransport:
+        def __init__(self) -> None:
+            self.observation: dict[str, Any] | None = None
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            observations = [item for item in messages if item["role"] == "tool"]
+            if not observations:
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "call_tool",
+                            {"name": "child_probe", "args": {}},
+                            "probe",
+                        ),
+                    )
+                )
+            self.observation = observations[-1]["content"]
+            return ModelTurn(text="done")
+
+        def complete(self, messages: Any) -> str:
+            return "grandchild answer"
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+    transport = ChildAgentTransport()
+    provider = ModelProvider(kernel, transport)
+    root = provider.start_session()
+    child = provider.start_session(parent_scope=kernel.snapshot_scope(root.session_id))
+
+    Harness(kernel).start(provider, session_id=child.session_id).send("probe")
+
+    assert transport.observation is not None
+    assert transport.observation["id"] == child.session_id
+    assert transport.observation["caller"] == child.session_id
+    assert transport.observation["metadata"]["parent_session_id"] == root.session_id
+    grandchildren = [
+        session
+        for session in kernel.list_sessions(limit=100)["sessions"]
+        if session["parent_session_id"] == child.session_id
+        and session["kind"] == "completion"
+    ]
+    assert len(grandchildren) == 1
+    grandchild = grandchildren[0]
+    assert grandchild["root_session_id"] == root.session_id
+    assert grandchild["origin_call_id"] is not None
 
 
 def test_model_provider_is_predictably_unavailable_for_direct_calls(
@@ -1130,7 +1485,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 4
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -1318,7 +1673,7 @@ def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
     ]
 
 
-def test_harness_explicitly_binds_and_can_disable_model_provider(
+def test_harness_routes_root_and_tool_traffic_through_one_provider(
     tmp_path: Path,
 ) -> None:
     kernel = kernel_at(tmp_path)
@@ -1341,11 +1696,29 @@ def test_harness_explicitly_binds_and_can_disable_model_provider(
     assert result.answer == "nested completion"
     assert model.provider_messages == [[{"role": "user", "content": "nested"}]]
 
-    disabled = Harness(kernel).run(
-        ProviderUsingModel(),
-        "ask without a provider",
+    implicit = Harness(kernel).run(
+        ModelProvider(kernel, ProviderUsingModel()),
+        "ask through the unified provider",
     )
-    assert "model_provider_unavailable" in disabled.answer
+    assert implicit.answer == "nested completion"
+
+
+def test_raw_root_transport_does_not_implicitly_grant_tool_model_spend(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "ask",
+        "def main(input, ctx):\n"
+        "    return ctx.model_provider.complete([\n"
+        "        {'role': 'user', 'content': 'nested'},\n"
+        "    ])\n",
+    )
+
+    result = Harness(kernel).run(ProviderUsingModel(), "try nested")
+
+    assert "model_provider_unavailable" in result.answer
 
 
 def test_harness_preserves_providerless_legacy_tool_runner_signature(
@@ -1378,12 +1751,11 @@ def test_harness_preserves_providerless_legacy_tool_runner_signature(
     assert result.answer == "{'legacy': True}"
     assert runner.calls == ["call_tool"]
 
-    with pytest.raises(ToolboxError) as error:
-        Harness(kernel, tool_runner=runner).start(
-            ProviderUsingModel(),
-            model_provider=ProviderUsingModel(),
-        )
-    assert error.value.code == "model_provider_unavailable"
+    conversation = Harness(kernel, tool_runner=runner).start(
+        ProviderUsingModel(),
+        model_provider=ProviderUsingModel(),
+    )
+    assert conversation.model_session.provider is not None
 
 
 def test_harness_exposes_only_five_operations_and_saves_everything(

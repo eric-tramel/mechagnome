@@ -199,11 +199,13 @@ Tools can read durable sessions:
 ```python
 def main(input, ctx):
     caller_session_id = ctx.caller_session_id
+    lineage = ctx.sessions.metadata()
     current = ctx.sessions.current(after=0, limit=50)
     previous = ctx.sessions.list(limit=20, cursor=0)
     older = ctx.sessions.read(input["session_id"], after=0, limit=50)
     return {
         "caller_session_id": caller_session_id,
+        "lineage": lineage,
         "current": current,
         "previous": previous,
         "older": older,
@@ -229,17 +231,25 @@ def main(input, ctx):
 
 `complete()` accepts 1–64 text messages whose roles are `system`, `user`, or
 `assistant`, and returns text. One top-level tool call tree may make at most
-eight attempts; requests and responses are size-bounded. If a harness has no
-provider, the call raises `model_provider_unavailable`.
+eight attempts; requests and responses are size-bounded. Every accepted call
+implicitly creates a logged `completion` session whose parent is the tool's
+current session and whose origin is the actual nested tool call ID.
+
+For tool-capable delegation, `ctx.model_provider.run_agent(prompt)` runs a full
+child agent and returns its final text. The provider implicitly creates a
+logged `conversation` child first. That agent receives the same capability, so
+further delegation produces a correctly parented session chain.
 
 ## Model adapter boundary
 
-The TUI uses the bundled streaming `OpenRouterModel`, while `Harness` itself
-remains provider-neutral. An adapter receives the accumulated messages and the
-same five operation definitions on every turn, then returns a `ModelTurn`:
+The TUI wraps the bundled streaming `OpenRouterModel` in a host-owned
+`ModelProvider`. The provider creates/binds durable sessions and is the sole
+route from the harness to raw model transport. A transport adapter receives the
+accumulated messages and the same five operation definitions on every turn,
+then returns a `ModelTurn`:
 
 ```python
-from mechagnome import Harness, Kernel, ModelTurn, ToolCall
+from mechagnome import Harness, Kernel, ModelProvider, ModelTurn, ToolCall
 
 
 class MyModel:
@@ -250,21 +260,19 @@ class MyModel:
         )
 
 
-result = Harness(Kernel(".toolbox/toolbox.db")).run(
-    MyModel(),
+kernel = Kernel(".toolbox/toolbox.db")
+provider = ModelProvider(kernel, MyModel())
+result = Harness(kernel).run(
+    provider,
     "Build what you need to solve this task.",
 )
 ```
 
-For persistent interactive use, `Harness.start(model)` returns a `Conversation`;
-each `send()` reuses its message history and durable session ID.
-
-`Harness.start()` and `Harness.run()` accept an explicit `model_provider=`.
-Passing the outer model is the usual choice when it also implements
-`complete()`, `cancel_current()`, and `reset_cancellation()`. The default is
-`None`, so embedding code must opt in before authored tools receive model-spend
-authority. The bundled TUI opts its OpenRouter model in. Provider objects are
-runtime-only and are never restored from session history.
+For persistent interactive use, `Harness.start(provider)` returns a
+`Conversation`; each `send()` reuses its message history and durable session ID.
+Passing a raw transport remains supported as a compatibility convenience and is
+immediately wrapped in one provider. Provider objects are runtime-only and are
+never restored from session history.
 
 Adapters may additionally implement `stream(messages, tools)` and yield
 `ModelStreamEvent(text_delta=...)` values followed by exactly one
