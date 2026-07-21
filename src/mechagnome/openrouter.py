@@ -21,12 +21,34 @@ DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_KEY_ENV = "OPENROUTER_API_KEY"
 MAX_STREAM_BYTES = 4_000_000
 
+# Open-ended nested objects are not represented consistently by every model or
+# provider behind an OpenAI-compatible tool-calling endpoint. Keep the kernel's
+# object-based ABI and use explicit JSON strings only at this transport boundary.
+JSON_OBJECT_ARGUMENTS = {
+    "write_tool": {
+        "input_schema": (
+            "A JSON-encoded JSON Schema object for the authored tool's input. "
+            'For example: {"type":"object","properties":{"query":'
+            '{"type":"string"}},"required":["query"],'
+            '"additionalProperties":false}'
+        ),
+    },
+    "call_tool": {
+        "args": (
+            "A JSON-encoded object containing the target tool's arguments. "
+            'Use "{}" when the tool takes no input.'
+        ),
+    },
+}
+
 DEFAULT_SYSTEM_PROMPT = """\
 You are the agent inside Mechagnome, a persistent metaprogrammable toolbox.
 You can only directly call help, search_tools, read_tool_source, write_tool, and
 call_tool. The toolbox begins with no domain-specific user tools. Search before
 creating duplicates; build small reusable Python tools when they improve the
 task; call and repair them immediately; and reuse them across later requests.
+Request independent operations together in modest batches. Keep an operation
+in a later turn when it depends on the output of an earlier operation.
 Tools may call other tools through ctx.call_tool, read current or historical
 sessions through ctx.sessions, and use the ordinary Linux/Python environment.
 Use help when you need the tool ABI or examples. Core operation source is also
@@ -117,7 +139,7 @@ class OpenRouterModel:
                 *self._wire_messages(messages),
             ],
             "tools": [self._wire_tool(tool) for tool in tools],
-            "parallel_tool_calls": False,
+            "parallel_tool_calls": True,
             "stream": True,
         }
         try:
@@ -358,14 +380,49 @@ class OpenRouterModel:
 
     @staticmethod
     def _wire_tool(tool: dict[str, Any]) -> dict[str, Any]:
+        parameters = tool["input_schema"]
+        json_arguments = JSON_OBJECT_ARGUMENTS.get(tool["name"])
+        if json_arguments:
+            parameters = dict(parameters)
+            properties = dict(parameters.get("properties", {}))
+            for name, description in json_arguments.items():
+                properties[name] = {
+                    "type": "string",
+                    "description": description,
+                }
+            parameters["properties"] = properties
         return {
             "type": "function",
             "function": {
                 "name": tool["name"],
                 "description": tool["description"],
-                "parameters": tool["input_schema"],
+                "parameters": parameters,
             },
         }
+
+    @staticmethod
+    def _to_wire_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        wired = dict(args)
+        for field in JSON_OBJECT_ARGUMENTS.get(name, {}):
+            value = wired.get(field)
+            if isinstance(value, dict):
+                wired[field] = json.dumps(value, separators=(",", ":"))
+        return wired
+
+    @staticmethod
+    def _from_wire_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        decoded = dict(args)
+        for field in JSON_OBJECT_ARGUMENTS.get(name, {}):
+            value = decoded.get(field)
+            if not isinstance(value, str):
+                continue
+            try:
+                decoded[field] = json.loads(value)
+            except json.JSONDecodeError:
+                # Preserve malformed model output so the core operation can
+                # return a normal repairable tool observation.
+                pass
+        return decoded
 
     @staticmethod
     def _wire_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -385,7 +442,11 @@ class OpenRouterModel:
                             "type": "function",
                             "function": {
                                 "name": call["name"],
-                                "arguments": json.dumps(call["args"]),
+                                "arguments": json.dumps(
+                                    OpenRouterModel._to_wire_args(
+                                        call["name"], call["args"]
+                                    )
+                                ),
                             },
                         }
                         for call in calls
@@ -419,9 +480,10 @@ class OpenRouterModel:
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
             if not isinstance(args, dict):
                 raise TypeError("tool arguments are not an object")
+            name = function["name"]
             return ToolCall(
-                name=function["name"],
-                args=args,
+                name=name,
+                args=OpenRouterModel._from_wire_args(name, args),
                 id=item.get("id") or uuid.uuid4().hex,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:

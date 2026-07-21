@@ -69,6 +69,20 @@ credential name are deliberately pinned to OpenRouter. OpenRouter uses its
 normalized Chat Completions tool-calling interface; the request is identified
 as `mechagnome` through `X-OpenRouter-Title`.
 
+Mechagnome explicitly allows a model to request several independent operations
+in one turn. Operations are returned to the model in request order; an
+operation that needs another operation's result belongs in a later turn. A
+batch is limited to 16 operations by default; oversized batches are rejected
+without partial execution and receive repairable observations asking the model
+to split the work.
+
+Some OpenAI-compatible model providers cannot reliably generate arbitrary
+nested objects in tool calls. The OpenRouter adapter therefore exposes
+`write_tool.input_schema` and `call_tool.args` as clearly described,
+JSON-encoded strings on the wire, then decodes them back to objects before they
+reach the provider-neutral harness. The stored tool ABI and editable core tools
+remain object-based.
+
 ## Deterministic proof
 
 The network-free demo remains available for inspecting the core mechanism:

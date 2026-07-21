@@ -181,16 +181,25 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert captured["authorization"] == "Bearer test-key"
     assert captured["title"] == "mechagnome"
     assert captured["body"]["model"] == "z-ai/glm-5.2"
-    assert captured["body"]["parallel_tool_calls"] is False
+    assert captured["body"]["parallel_tool_calls"] is True
     assert captured["body"]["stream"] is True
     assert captured["body"]["messages"][0]["role"] == "system"
-    assert [tool["function"]["name"] for tool in captured["body"]["tools"]] == [
+    tools = {
+        tool["function"]["name"]: tool["function"] for tool in captured["body"]["tools"]
+    }
+    assert list(tools) == [
         "help",
         "search_tools",
         "read_tool_source",
         "write_tool",
         "call_tool",
     ]
+    write_schema = tools["write_tool"]["parameters"]["properties"]["input_schema"]
+    call_schema = tools["call_tool"]["parameters"]["properties"]["args"]
+    assert write_schema["type"] == "string"
+    assert "JSON-encoded JSON Schema object" in write_schema["description"]
+    assert call_schema["type"] == "string"
+    assert "JSON-encoded object" in call_schema["description"]
     assert turn.calls[0].name == "help"
     assert turn.calls[0].args == {"topic": "quickstart"}
 
@@ -239,6 +248,110 @@ def test_openrouter_adapter_serializes_prior_tool_results(tmp_path: Path) -> Non
     ]
 
     assert model.respond(messages, kernel.tool_definitions()).text == "Ready."
+
+
+def test_openrouter_adapter_round_trips_objects_and_keeps_parallel_calls(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    input_schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prior_call = body["messages"][-1]["tool_calls"][0]["function"]
+        prior_args = json.loads(prior_call["arguments"])
+        assert json.loads(prior_args["input_schema"]) == input_schema
+        return sse_response(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "tool-2",
+                                    "function": {
+                                        "name": "call_tool",
+                                        "arguments": json.dumps(
+                                            {
+                                                "name": "search",
+                                                "args": json.dumps({"query": "gnomes"}),
+                                            }
+                                        ),
+                                    },
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "tool-3",
+                                    "function": {
+                                        "name": "help",
+                                        "arguments": '{"topic":"composition"}',
+                                    },
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+            finish_reason="tool_calls",
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "tool-1",
+                    "name": "write_tool",
+                    "args": {
+                        "name": "search",
+                        "description": "Search for gnomes.",
+                        "input_schema": input_schema,
+                        "source": "def main(input, ctx):\n    return input\n",
+                    },
+                }
+            ],
+        }
+    ]
+
+    turn = model.respond(messages, kernel.tool_definitions())
+
+    assert turn.calls == (
+        ToolCall(
+            name="call_tool",
+            args={"name": "search", "args": {"query": "gnomes"}},
+            id="tool-2",
+        ),
+        ToolCall(
+            name="help",
+            args={"topic": "composition"},
+            id="tool-3",
+        ),
+    )
+
+
+def test_openrouter_adapter_preserves_malformed_json_for_tool_repair() -> None:
+    call = OpenRouterModel._tool_call(
+        {
+            "id": "tool-1",
+            "function": {
+                "name": "write_tool",
+                "arguments": '{"input_schema":""}',
+            },
+        }
+    )
+
+    assert call.args == {"input_schema": ""}
 
 
 @pytest.mark.parametrize(
