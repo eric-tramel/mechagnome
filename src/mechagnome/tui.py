@@ -108,6 +108,18 @@ class ToolEvent(Collapsible):
         if self._spinner_timer is None:
             self.title = self._render_title(self.SYMBOLS["call"])
 
+    def finish(self, kind: str, tool_name: str, detail: str) -> None:
+        """Turn an in-progress invocation into its final outcome in place."""
+        call_detail = self.detail
+        self.kind = kind
+        self.tool_name = tool_name
+        self.remove_class("tool-call")
+        self.add_class(f"tool-{kind}")
+        outcome = "response" if kind == "response" else "error"
+        self.detail = f"arguments\n{call_detail}\n\n{outcome}\n{detail}"
+        self.detail_widget.update(Text(self.detail, style="dim"))
+        self.stop_spinner()
+
     def _render_title(self, symbol: str) -> str:
         return escape(f"{symbol} {self.tool_name}{self.argument_summary}")
 
@@ -1384,11 +1396,12 @@ class ToolboxApp(App[None]):
             display = self._tool_response(event)
             if display is None:
                 return
-            if event.call_id in self.active_tool_events:
-                self.active_tool_events[event.call_id].stop_spinner()
-                del self.active_tool_events[event.call_id]
             name, detail = display
-            self.query_one("#chat", ChatFeed).write_tool("response", name, detail)
+            active = self.active_tool_events.pop(event.call_id, None)
+            if active is None:
+                self.query_one("#chat", ChatFeed).write_tool("response", name, detail)
+            else:
+                active.finish("response", name, detail)
             self._refresh_sidebar()
         elif event.kind == "binding_changed":
             name = str(event.payload.get("name") or event.tool_name or "tool")
@@ -1406,11 +1419,12 @@ class ToolboxApp(App[None]):
             display = self._tool_response(event, failed=True)
             if display is None:
                 return
-            if event.call_id in self.active_tool_events:
-                self.active_tool_events[event.call_id].stop_spinner()
-                del self.active_tool_events[event.call_id]
             name, detail = display
-            self.query_one("#chat", ChatFeed).write_tool("error", name, detail)
+            active = self.active_tool_events.pop(event.call_id, None)
+            if active is None:
+                self.query_one("#chat", ChatFeed).write_tool("error", name, detail)
+            else:
+                active.finish("error", name, detail)
             self._set_status(f"{name} failed")
         elif event.kind in {"model_failed", "harness_failed"}:
             self._stop_active_tool_events()
