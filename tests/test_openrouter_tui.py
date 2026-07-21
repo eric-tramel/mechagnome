@@ -9,11 +9,13 @@ import signal
 import sys
 import threading
 import time
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from rich.console import Console
 from rich.syntax import Syntax
 from rich.text import Text
 from textual.widgets import Button, Input, RichLog, Select, Static
@@ -36,13 +38,34 @@ from mechagnome.openrouter import (
     OpenRouterModel,
 )
 from mechagnome.tui import (
+    ChatFeed,
     DeleteToolScreen,
     ModelSelectionScreen,
     NamespaceNameScreen,
     ReasoningEffortScreen,
     ToolboxApp,
+    ToolEvent,
     ToolManagerScreen,
 )
+
+
+def chat_text(app: ToolboxApp) -> str:
+    """Render mounted chat entries as plain text for headless assertions."""
+    output = StringIO()
+    console = Console(
+        file=output,
+        width=120,
+        color_system=None,
+        force_terminal=False,
+    )
+    for entry in app.query_one("#chat", ChatFeed).children:
+        if isinstance(entry, ToolEvent):
+            console.print(
+                f"{ToolEvent.SYMBOLS[entry.kind]} {entry.tool_name}\n{entry.detail}"
+            )
+        elif isinstance(entry, Static):
+            console.print(entry.content)
+    return output.getvalue().rstrip()
 
 
 class FinalModel:
@@ -1215,9 +1238,7 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
             await pilot.pause()
             assert app.streamed_text == ""
             assert app.query_one("#stream", Static).display is False
-            chat = "\n".join(
-                line.text for line in app.query_one("#chat", RichLog).lines
-            )
+            chat = chat_text(app)
             assert "Partial response" in chat
 
     try:
@@ -1310,9 +1331,7 @@ def test_escape_stops_streaming_rollout_and_records_cancellation(
             await pilot.pause()
             assert app.busy is False
             assert prompt.disabled is False
-            chat = "\n".join(
-                line.text for line in app.query_one("#chat", RichLog).lines
-            )
+            chat = chat_text(app)
             assert "stopped" in chat
 
     try:
@@ -1542,6 +1561,7 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
     async def submit(pilot: Any, value: str) -> None:
         prompt = app.query_one("#prompt", Input)
         prompt.value = value
+        prompt.focus()
         await pilot.press("enter")
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -1549,15 +1569,26 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
     async def exercise() -> None:
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(pilot, "build a hello tool")
-            chat = "\n".join(
-                line.text for line in app.query_one("#chat", RichLog).lines
-            )
+            chat = chat_text(app)
             tools = "\n".join(
                 line.text for line in app.query_one("#tools", RichLog).lines
             )
             assert "write_tool" in chat
-            assert "call_tool" in chat
+            assert "call_tool" not in chat
             assert "hello" in chat
+            activity = [(event.kind, event.tool_name) for event in app.query(ToolEvent)]
+            assert activity.count(("call", "hello")) == 1
+            assert activity.count(("response", "hello")) == 1
+            assert all(event.collapsed for event in app.query(ToolEvent))
+            hello_call = next(
+                event
+                for event in app.query(ToolEvent)
+                if event.kind == "call" and event.tool_name == "hello"
+            )
+            assert hello_call._title.styles.text_style.italic is True
+            assert hello_call.detail_widget.styles.border.top[0] == "round"
+            await pilot.click(hello_call)
+            assert hello_call.collapsed is False
             assert "hello  v1" in tools
             assert "1 user" in str(app.query_one("#model-info", Static).render())
 
@@ -1568,14 +1599,153 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
             await pilot.pause()
             await submit(pilot, "/sessions")
             old_session = app.conversation.session_id
-            inspection = "\n".join(
-                line.text for line in app.query_one("#chat", RichLog).lines
-            )
+            inspection = chat_text(app)
             assert "saved sessions" in inspection
             assert old_session[:12] in inspection
             await submit(pilot, "/new")
             assert app.conversation.session_id != old_session
             assert len(kernel.list_sessions(limit=10)["sessions"]) == 2
+
+    asyncio.run(exercise())
+
+
+class SingleToolModel:
+    """Call one authored tool, then stop."""
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        self.turn = 0
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.turn += 1
+        if self.turn == 1:
+            return ModelTurn(
+                calls=(
+                    ToolCall("call_tool", {"name": self.tool_name, "args": {}}, "use"),
+                )
+            )
+        return ModelTurn(text="Observed the result.")
+
+
+def replace_call_tool(kernel: Kernel, source: str) -> None:
+    current = kernel.read_tool_source("call_tool")
+    kernel.write_tool(
+        name="call_tool",
+        description="Test dispatcher replacement.",
+        input_schema=current["input_schema"],
+        source=source,
+        base_version=current["version"],
+    )
+
+
+def test_tui_collapses_forwarded_tool_failure_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.write_tool(
+        name="boom",
+        description="Raise a test error.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    raise RuntimeError('broken')\n",
+    )
+    app = ToolboxApp(kernel, SingleToolModel("boom"), model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "run boom"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            activity = [(event.kind, event.tool_name) for event in app.query(ToolEvent)]
+            assert activity == [("call", "boom"), ("error", "boom")]
+            assert "call_tool" not in chat_text(app)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    (
+        "target",
+        "target_source",
+        "dispatcher_source",
+        "expected_kind",
+        "expected_name",
+        "expected_fragment",
+    ),
+    [
+        (
+            "boom",
+            "def main(input, ctx):\n    raise RuntimeError('child broke')\n",
+            (
+                "def main(input, ctx):\n"
+                "    try:\n"
+                "        return ctx.kernel.execute(input['name'], input['args'])\n"
+                "    except Exception:\n"
+                "        return {'recovered': True}\n"
+            ),
+            "response",
+            "boom",
+            '"recovered": true',
+        ),
+        (
+            "okay",
+            "def main(input, ctx):\n    return {'child': 'success'}\n",
+            (
+                "def main(input, ctx):\n"
+                "    ctx.kernel.execute(input['name'], input['args'])\n"
+                "    raise RuntimeError('outer broke')\n"
+            ),
+            "error",
+            "okay",
+            "outer broke",
+        ),
+        (
+            "unused",
+            "def main(input, ctx):\n    return 'not called'\n",
+            "def main(input, ctx):\n    return {'intercepted': input['name']}\n",
+            "response",
+            "call_tool",
+            '"intercepted": "unused"',
+        ),
+    ],
+)
+def test_tui_uses_authoritative_dispatcher_outcome(
+    tmp_path: Path,
+    target: str,
+    target_source: str,
+    dispatcher_source: str,
+    expected_kind: str,
+    expected_name: str,
+    expected_fragment: str,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.write_tool(
+        name=target,
+        description="Exercise dispatcher behavior.",
+        input_schema={"type": "object"},
+        source=target_source,
+    )
+    replace_call_tool(kernel, dispatcher_source)
+    app = ToolboxApp(kernel, SingleToolModel(target), model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = f"run {target}"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            activity = list(app.query(ToolEvent))
+            assert [(event.kind, event.tool_name) for event in activity] == [
+                ("call", expected_name),
+                (expected_kind, expected_name),
+            ]
+            assert expected_fragment in activity[1].detail
 
     asyncio.run(exercise())
 
@@ -1624,9 +1794,7 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
             assert "identity  v1  [beta]" in sidebar
             assert "beta + alpha" in str(app.query_one("#model-info", Static).render())
             await submit(pilot, "/toolbox list")
-            chat = "\n".join(
-                line.text for line in app.query_one("#chat", RichLog).lines
-            )
+            chat = chat_text(app)
             assert "toolbox namespaces" in chat
 
     asyncio.run(exercise())

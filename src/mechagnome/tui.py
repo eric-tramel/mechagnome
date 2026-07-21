@@ -21,6 +21,7 @@ from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widgets import (
     Button,
+    Collapsible,
     Footer,
     Header,
     Input,
@@ -38,6 +39,50 @@ from mechagnome.openrouter import (
     OpenRouterModel,
     OpenRouterModelOption,
 )
+
+
+class ToolEvent(Collapsible):
+    """One quiet, expandable tool invocation or observation."""
+
+    SYMBOLS = {"call": "→", "response": "✓", "error": "✕"}
+
+    def __init__(self, kind: str, tool_name: str, detail: str) -> None:
+        self.kind = kind
+        self.tool_name = tool_name
+        self.detail = detail
+        self.detail_widget = Static(
+            Text(detail, style="dim"), classes="tool-event-detail"
+        )
+        super().__init__(
+            self.detail_widget,
+            title=f"{self.SYMBOLS[kind]} {tool_name}",
+            collapsed=True,
+            classes=f"tool-event tool-{kind}",
+        )
+
+    def update_call(self, tool_name: str, detail: str) -> None:
+        """Replace a pending dispatcher row with its confirmed target call."""
+        self.tool_name = tool_name
+        self.detail = detail
+        self.title = f"{self.SYMBOLS['call']} {tool_name}"
+        self.detail_widget.update(Text(detail, style="dim"))
+
+
+class ChatFeed(VerticalScroll):
+    """Scrollable chat entries with interactive tool events."""
+
+    def write(self, renderable: Any) -> None:
+        self.mount(Static(renderable, classes="chat-entry"))
+        self.call_after_refresh(self.scroll_end, animate=False)
+
+    def write_tool(self, kind: str, tool_name: str, detail: str) -> ToolEvent:
+        event = ToolEvent(kind, tool_name, detail)
+        self.mount(event)
+        self.call_after_refresh(self.scroll_end, animate=False)
+        return event
+
+    def clear(self) -> None:
+        self.remove_children()
 
 
 class DeleteToolScreen(ModalScreen[bool]):
@@ -905,7 +950,56 @@ class ToolboxApp(App[None]):
         border: round #34465a;
         padding: 0 1;
         background: #0d131b;
+        overflow-x: hidden;
+        overflow-y: auto;
         scrollbar-color: #516b85;
+    }
+
+    .chat-entry {
+        width: 1fr;
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    .tool-event {
+        width: 1fr;
+        height: auto;
+        margin-bottom: 1;
+        padding: 0;
+        border-top: none;
+        background: transparent;
+    }
+
+    .tool-event:focus-within {
+        background-tint: #d7e0ea 3%;
+    }
+
+    .tool-event CollapsibleTitle {
+        height: 1;
+        padding: 0 1;
+        color: #7890a6;
+        text-style: italic;
+    }
+
+    .tool-response CollapsibleTitle {
+        color: #789b83;
+    }
+
+    .tool-error CollapsibleTitle {
+        color: #b98989;
+    }
+
+    .tool-event Contents {
+        padding: 0 0 0 2;
+    }
+
+    .tool-event-detail {
+        width: 1fr;
+        height: auto;
+        padding: 0 1;
+        border: round #34465a;
+        background: #101821;
+        color: #a8b8c8;
     }
 
     #sidebar {
@@ -1020,11 +1114,14 @@ class ToolboxApp(App[None]):
         self.streamed_text = ""
         self.pending_stream_text: list[str] = []
         self.stream_timer: Timer | None = None
+        self.forwarded_targets: dict[str, str] = {}
+        self.forwarded_events: dict[str, ToolEvent] = {}
+        self.forwarded_children: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="workspace"):
-            yield RichLog(id="chat", wrap=True, markup=False, auto_scroll=True)
+            yield ChatFeed(id="chat")
             with Vertical(id="sidebar"):
                 yield Static("MODEL", classes="sidebar-title")
                 yield Static(id="model-info")
@@ -1198,7 +1295,7 @@ class ToolboxApp(App[None]):
         elif event.kind == "model":
             content = str(event.payload.get("text") or "")
             if content:
-                self.query_one("#chat", RichLog).write(
+                self.query_one("#chat", ChatFeed).write(
                     Panel(
                         Markdown(content),
                         title=self._active_model_name,
@@ -1210,33 +1307,32 @@ class ToolboxApp(App[None]):
             self._set_status("planning" if event.payload.get("calls") else "answering")
         elif event.kind == "call_started":
             name = str(event.tool_name or "tool")
-            detail = self._compact(event.payload.get("args"))
-            arrow = "↳" if event.parent_call_id else "→"
-            self.query_one("#chat", RichLog).write(
-                Panel(
-                    Text(detail, style="dim"),
-                    title=f"{arrow} {name}",
-                    title_align="left",
-                    border_style="cyan",
-                )
+            args = event.payload.get("args")
+            if self._forwarded_child(event, name, args):
+                return
+            target: str | None = None
+            if name == "call_tool" and isinstance(args, dict):
+                requested = args.get("name")
+                if isinstance(requested, str):
+                    target = requested
+            displayed = self.query_one("#chat", ChatFeed).write_tool(
+                "call", name, self._compact(args)
             )
+            if target and event.call_id:
+                self.forwarded_targets[event.call_id] = target
+                self.forwarded_events[event.call_id] = displayed
             self._set_status(f"calling {name}")
         elif event.kind == "call_succeeded":
-            name = str(event.tool_name or "tool")
-            detail = self._compact(event.payload.get("result"))
-            self.query_one("#chat", RichLog).write(
-                Panel(
-                    Text(detail, style="dim"),
-                    title=f"✓ {name}",
-                    title_align="left",
-                    border_style="green",
-                )
-            )
+            display = self._tool_response(event)
+            if display is None:
+                return
+            name, detail = display
+            self.query_one("#chat", ChatFeed).write_tool("response", name, detail)
             self._refresh_sidebar()
         elif event.kind == "binding_changed":
             name = str(event.payload.get("name") or event.tool_name or "tool")
             version = event.payload.get("to_version")
-            self.query_one("#chat", RichLog).write(
+            self.query_one("#chat", ChatFeed).write(
                 Panel(
                     Text(f"active version → v{version}"),
                     title=f"toolbox · {name}",
@@ -1246,10 +1342,12 @@ class ToolboxApp(App[None]):
             )
             self._refresh_sidebar()
         elif event.kind == "call_failed":
-            name = str(event.tool_name or "tool")
-            self._write_error(
-                f"{name}: {event.payload.get('message') or event.payload}"
-            )
+            display = self._tool_response(event, failed=True)
+            if display is None:
+                return
+            name, detail = display
+            self.query_one("#chat", ChatFeed).write_tool("error", name, detail)
+            self._set_status(f"{name} failed")
         elif event.kind in {"model_failed", "harness_failed"}:
             self._clear_stream()
             self._write_error(str(event.payload.get("message") or event.payload))
@@ -1257,7 +1355,7 @@ class ToolboxApp(App[None]):
             partial = self.streamed_text + "".join(self.pending_stream_text)
             self._clear_stream()
             content = partial or str(event.payload.get("message") or "Rollout stopped.")
-            self.query_one("#chat", RichLog).write(
+            self.query_one("#chat", ChatFeed).write(
                 Panel(
                     Markdown(content),
                     title=f"{self._active_model_name} · stopped",
@@ -1377,7 +1475,7 @@ class ToolboxApp(App[None]):
                 "primary" if active and active["primary"] else "yes" if active else ""
             )
             table.add_row(toolbox["name"], marker, str(toolbox["cwd"] or "—"))
-        self.query_one("#chat", RichLog).write(
+        self.query_one("#chat", ChatFeed).write(
             Panel(table, title="toolbox namespaces", border_style="blue")
         )
 
@@ -1386,7 +1484,10 @@ class ToolboxApp(App[None]):
         if self.busy:
             return
         self.conversation = self.harness.start(self.model)
-        self.query_one("#chat", RichLog).clear()
+        self.query_one("#chat", ChatFeed).clear()
+        self.forwarded_targets.clear()
+        self.forwarded_events.clear()
+        self.forwarded_children.clear()
         self._show_welcome()
         self._refresh_sidebar()
         self._set_status("new session")
@@ -1417,7 +1518,7 @@ class ToolboxApp(App[None]):
                 binding["kind"],
                 binding["toolbox"],
             )
-        self.query_one("#chat", RichLog).write(
+        self.query_one("#chat", ChatFeed).write(
             Panel(table, title="active toolbox", border_style="blue")
         )
 
@@ -1436,7 +1537,7 @@ class ToolboxApp(App[None]):
 
     def action_show_help(self) -> None:
         """Show local TUI commands."""
-        self.query_one("#chat", RichLog).write(
+        self.query_one("#chat", ChatFeed).write(
             Panel(
                 Markdown(
                     "**Commands**\n\n"
@@ -1465,13 +1566,13 @@ class ToolboxApp(App[None]):
                 str(session["event_count"]),
                 session["created_at"][:19],
             )
-        self.query_one("#chat", RichLog).write(
+        self.query_one("#chat", ChatFeed).write(
             Panel(table, title="saved sessions", border_style="blue")
         )
 
     def _show_welcome(self) -> None:
         readiness = "ready" if getattr(self.model, "ready", True) else "API key missing"
-        self.query_one("#chat", RichLog).write(
+        self.query_one("#chat", ChatFeed).write(
             Panel(
                 Markdown(
                     f"**{self._active_model_name}** · {readiness}\n\n"
@@ -1488,7 +1589,7 @@ class ToolboxApp(App[None]):
             )
 
     def _write_user(self, prompt: str) -> None:
-        self.query_one("#chat", RichLog).write(
+        self.query_one("#chat", ChatFeed).write(
             Panel(
                 Markdown(prompt),
                 title="you",
@@ -1498,7 +1599,7 @@ class ToolboxApp(App[None]):
         )
 
     def _write_error(self, message: str) -> None:
-        self.query_one("#chat", RichLog).write(
+        self.query_one("#chat", ChatFeed).write(
             Panel(Text(message), title="error", border_style="red")
         )
         self._set_status("error")
@@ -1586,6 +1687,46 @@ class ToolboxApp(App[None]):
         self.query_one("#status-session", Static).update(
             self.conversation.session_id[:10]
         )
+
+    def _forwarded_child(self, event: AgentEvent, name: str, args: Any) -> bool:
+        parent_id = event.parent_call_id
+        if (
+            event.call_id
+            and parent_id
+            and self.forwarded_targets.get(parent_id) == name
+        ):
+            self.forwarded_children[event.call_id] = parent_id
+            self.forwarded_events[parent_id].update_call(name, self._compact(args))
+            self._set_status(f"calling {name}")
+            return True
+        return False
+
+    def _tool_response(
+        self, event: AgentEvent, *, failed: bool = False
+    ) -> tuple[str, str] | None:
+        call_id = event.call_id
+        if call_id in self.forwarded_children:
+            return None
+        if call_id in self.forwarded_targets:
+            delegated = any(
+                parent_id == call_id for parent_id in self.forwarded_children.values()
+            )
+            name = (
+                self.forwarded_targets[call_id]
+                if delegated
+                else str(event.tool_name or "tool")
+            )
+            self.forwarded_targets.pop(call_id)
+            self.forwarded_events.pop(call_id, None)
+            self.forwarded_children = {
+                child_id: parent_id
+                for child_id, parent_id in self.forwarded_children.items()
+                if parent_id != call_id
+            }
+        else:
+            name = str(event.tool_name or "tool")
+        value = event.payload if failed else event.payload.get("result")
+        return name, self._compact(value)
 
     @staticmethod
     def _compact(value: Any, limit: int = 1600) -> str:
