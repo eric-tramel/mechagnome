@@ -13,3 +13,12 @@ Use these topics as you grow and reuse the toolbox:
 
 Call `help` again with one of those names as the `topic` to read the complete
 Markdown document.
+
+## Project source
+
+The full source for this Mechagnome harness lives on GitHub:
+
+  **https://github.com/eric-tramel/mechagnome**
+
+If you want to modify the harness itself (core operations, asset files, the
+runtime, etc.), clone the repository and edit there.
