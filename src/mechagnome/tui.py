@@ -821,14 +821,15 @@ class ToolboxApp(App[None]):
 
     def action_stop_rollout(self) -> None:
         """Stop the active model stream or tool subprocess."""
+        if self.busy:
+            if self.conversation.cancel():
+                self._set_status("stopping…")
+            return
         if isinstance(self.screen, DeleteToolScreen):
             self.screen.dismiss(False)
             return
         if isinstance(self.screen, ToolManagerScreen):
             self.pop_screen()
-            return
-        if self.busy and self.conversation.cancel():
-            self._set_status("stopping…")
 
     def action_show_tools(self) -> None:
         """Refresh the toolbox and report its active contents in chat."""
@@ -850,9 +851,6 @@ class ToolboxApp(App[None]):
 
     def action_manage_tools(self) -> None:
         """Open the source, history, usage, and deletion manager."""
-        if self.busy:
-            self._set_status("stop the active rollout before managing tools")
-            return
         self.push_screen(
             ToolManagerScreen(
                 self.kernel,

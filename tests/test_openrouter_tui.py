@@ -968,6 +968,42 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
     assert kinds == ["user", "model", "final"]
 
 
+def test_tool_manager_opens_during_streaming_rollout(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingStreamingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "stream while inspecting tools"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set() and app.streamed_text:
+                    break
+
+            assert model.started.is_set()
+            assert app.streamed_text == "Partial"
+            assert app.busy is True
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            assert app.busy is True
+
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            assert app.busy is False
+            assert model.cancelled.is_set()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+
 def test_escape_stops_streaming_rollout_and_records_cancellation(
     tmp_path: Path,
 ) -> None:
