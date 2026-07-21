@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 import pytest
 from rich.console import Console
+from rich.markup import render as render_markup
 from rich.syntax import Syntax
 from rich.text import Text
 from textual.widgets import Button, Input, RichLog, Select, Static
@@ -67,6 +68,11 @@ def chat_text(app: ToolboxApp) -> str:
         elif isinstance(entry, Static):
             console.print(entry.content)
     return output.getvalue().rstrip()
+
+
+def tool_title_text(event: ToolEvent) -> str:
+    """Render a tool event's public Rich-markup title as plain text."""
+    return render_markup(event.title).plain
 
 
 class FinalModel:
@@ -1990,9 +1996,23 @@ def test_escape_terminates_active_tool_subprocess(tmp_path: Path) -> None:
                 await asyncio.sleep(0.01)
             else:
                 raise AssertionError("slow tool never started")
+            slow_call = next(
+                event
+                for event in app.query(ToolEvent)
+                if event.kind == "call" and event.tool_name == "slow"
+            )
+            await asyncio.sleep(0.1)
+            assert slow_call.processing is True
+            assert slow_call._spinner_timer is not None
+            assert (
+                tool_title_text(slow_call).split(" ", 1)[0] in ToolEvent.SPINNER_FRAMES
+            )
             await pilot.press("escape")
             await app.workers.wait_for_complete()
             await pilot.pause()
+            assert slow_call.processing is False
+            assert slow_call._spinner_timer is None
+            assert tool_title_text(slow_call) == "→ slow"
             assert app.busy is False
             assert prompt.disabled is False
 
@@ -2054,7 +2074,13 @@ class ToolWritingModel:
             )
         if self.turn == 2:
             return ModelTurn(
-                calls=(ToolCall("call_tool", {"name": "hello", "args": {}}, "use"),)
+                calls=(
+                    ToolCall(
+                        "call_tool",
+                        {"name": "hello", "args": {"greeting": "hello world"}},
+                        "use",
+                    ),
+                )
             )
         return ModelTurn(text="Built and used hello.")
 
@@ -2092,7 +2118,21 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
                 for event in app.query(ToolEvent)
                 if event.kind == "call" and event.tool_name == "hello"
             )
-            assert hello_call._title.styles.text_style.italic is True
+            hello_response = next(
+                event
+                for event in app.query(ToolEvent)
+                if event.kind == "response" and event.tool_name == "hello"
+            )
+            assert tool_title_text(hello_call) == '→ hello [greeting="hello world"]'
+            assert hello_call.processing is False
+            assert hello_call._spinner_timer is None
+            assert tool_title_text(hello_response) == "✓ hello"
+            call_title = hello_call.query_one("CollapsibleTitle", Static)
+            response_title = hello_response.query_one("CollapsibleTitle", Static)
+            assert call_title.styles.color != response_title.styles.color
+            assert hello_call.styles.margin.bottom == 0
+            assert hello_response.styles.margin.bottom == 0
+            assert call_title.styles.text_style.italic is True
             assert hello_call.detail_widget.styles.border.top[0] == "round"
             await pilot.click(hello_call)
             assert hello_call.collapsed is False
@@ -2114,6 +2154,24 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
             assert len(kernel.list_sessions(limit=10)["sessions"]) == 2
 
     asyncio.run(exercise())
+
+
+def test_tool_argument_summary_is_single_line_and_truncated() -> None:
+    summary = ToolboxApp._argument_summary(
+        {"query": "first line\nsecond line", "limit": 50},
+        limit=32,
+    )
+
+    assert summary.startswith(' [query="first line\\nsecond')
+    assert summary.endswith("…]")
+    assert len(summary) == 32
+    assert "\n" not in summary
+
+    unsafe = ToolboxApp._argument_summary(
+        {"que\n\x1bry": "value", "\x9b": "x"},
+    )
+    assert unsafe == ' [que\\n\\u001bry="value", \\u009b="x"]'
+    assert all(character.isprintable() for character in unsafe)
 
 
 class SingleToolModel:

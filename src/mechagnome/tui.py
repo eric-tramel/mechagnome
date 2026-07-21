@@ -8,6 +8,7 @@ import shlex
 from typing import Any
 
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -48,16 +49,24 @@ class ToolEvent(Collapsible):
     SYMBOLS = {"call": "→", "response": "✓", "error": "✕"}
     SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
-    def __init__(self, kind: str, tool_name: str, detail: str) -> None:
+    def __init__(
+        self,
+        kind: str,
+        tool_name: str,
+        detail: str,
+        argument_summary: str = "",
+    ) -> None:
         self.kind = kind
         self.tool_name = tool_name
         self.detail = detail
+        self.argument_summary = argument_summary
+        self.processing = kind == "call"
         self.detail_widget = Static(
             Text(detail, style="dim"), classes="tool-event-detail"
         )
         super().__init__(
             self.detail_widget,
-            title=f"{self.SYMBOLS[kind]} {tool_name}",
+            title=self._render_title(self.SYMBOLS[kind]),
             collapsed=True,
             classes=f"tool-event tool-{kind}",
         )
@@ -66,31 +75,41 @@ class ToolEvent(Collapsible):
 
     def on_mount(self) -> None:
         """Start the spinner animation for in-progress calls."""
-        if self.kind == "call":
+        if self.processing:
             self._start_spinner()
 
     def _start_spinner(self) -> None:
         self._spinner_timer = self.set_interval(0.08, self._spin)
 
     def _spin(self) -> None:
+        if not self.processing:
+            self.stop_spinner()
+            return
         frame = self.SPINNER_FRAMES[self._spinner_index % len(self.SPINNER_FRAMES)]
         self._spinner_index += 1
-        self.title = f"{frame} {self.tool_name}"
+        self.title = self._render_title(frame)
 
     def stop_spinner(self) -> None:
         """Stop the spinner and restore the static symbol."""
+        self.processing = False
         if self._spinner_timer is not None:
             self._spinner_timer.stop()
             self._spinner_timer = None
-        self.title = f"{self.SYMBOLS[self.kind]} {self.tool_name}"
+        self.title = self._render_title(self.SYMBOLS[self.kind])
 
-    def update_call(self, tool_name: str, detail: str) -> None:
+    def update_call(
+        self, tool_name: str, detail: str, argument_summary: str = ""
+    ) -> None:
         """Replace a pending dispatcher row with its confirmed target call."""
         self.tool_name = tool_name
         self.detail = detail
+        self.argument_summary = argument_summary
         self.detail_widget.update(Text(detail, style="dim"))
         if self._spinner_timer is None:
-            self.title = f"{self.SYMBOLS['call']} {tool_name}"
+            self.title = self._render_title(self.SYMBOLS["call"])
+
+    def _render_title(self, symbol: str) -> str:
+        return escape(f"{symbol} {self.tool_name}{self.argument_summary}")
 
 
 class ChatFeed(VerticalScroll):
@@ -110,8 +129,14 @@ class ChatFeed(VerticalScroll):
         entry.update(renderable)
         self.call_after_refresh(self.scroll_end, animate=False)
 
-    def write_tool(self, kind: str, tool_name: str, detail: str) -> ToolEvent:
-        event = ToolEvent(kind, tool_name, detail)
+    def write_tool(
+        self,
+        kind: str,
+        tool_name: str,
+        detail: str,
+        argument_summary: str = "",
+    ) -> ToolEvent:
+        event = ToolEvent(kind, tool_name, detail, argument_summary)
         self.mount(event)
         self.call_after_refresh(self.scroll_end, animate=False)
         return event
@@ -999,7 +1024,7 @@ class ToolboxApp(App[None]):
     .tool-event {
         width: 1fr;
         height: auto;
-        margin-bottom: 1;
+        margin-bottom: 0;
         padding: 0;
         border-top: none;
         background: transparent;
@@ -1344,7 +1369,10 @@ class ToolboxApp(App[None]):
                 if isinstance(requested, str):
                     target = requested
             displayed = self.query_one("#chat", ChatFeed).write_tool(
-                "call", name, self._compact(args)
+                "call",
+                name,
+                self._compact(args),
+                self._argument_summary(args),
             )
             if target and event.call_id:
                 self.forwarded_targets[event.call_id] = target
@@ -1385,12 +1413,11 @@ class ToolboxApp(App[None]):
             self.query_one("#chat", ChatFeed).write_tool("error", name, detail)
             self._set_status(f"{name} failed")
         elif event.kind in {"model_failed", "harness_failed"}:
+            self._stop_active_tool_events()
             self._clear_stream()
             self._write_error(str(event.payload.get("message") or event.payload))
         elif event.kind == "cancelled":
-            for tool_event in self.active_tool_events.values():
-                tool_event.stop_spinner()
-            self.active_tool_events.clear()
+            self._stop_active_tool_events()
             partial = self.streamed_text + "".join(self.pending_stream_text)
             content = partial or str(event.payload.get("message") or "Rollout stopped.")
             self._finish_stream(content, stopped=True)
@@ -1753,8 +1780,14 @@ class ToolboxApp(App[None]):
         if busy:
             self._set_status("thinking…")
         else:
+            self._stop_active_tool_events()
             self._set_status("ready")
             prompt.focus()
+
+    def _stop_active_tool_events(self) -> None:
+        for tool_event in self.active_tool_events.values():
+            tool_event.stop_spinner()
+        self.active_tool_events.clear()
 
     def _set_status(self, message: str) -> None:
         self.query_one("#status-message", Static).update(message)
@@ -1770,7 +1803,11 @@ class ToolboxApp(App[None]):
             and self.forwarded_targets.get(parent_id) == name
         ):
             self.forwarded_children[event.call_id] = parent_id
-            self.forwarded_events[parent_id].update_call(name, self._compact(args))
+            self.forwarded_events[parent_id].update_call(
+                name,
+                self._compact(args),
+                self._argument_summary(args),
+            )
             self._set_status(f"calling {name}")
             return True
         return False
@@ -1809,6 +1846,33 @@ class ToolboxApp(App[None]):
         except (TypeError, ValueError):
             rendered = repr(value)
         return rendered if len(rendered) <= limit else f"{rendered[:limit]}\n…"
+
+    @staticmethod
+    def _argument_summary(value: Any, limit: int = 96) -> str:
+        if not isinstance(value, dict) or not value:
+            return ""
+
+        pairs = []
+        for key, item in value.items():
+            encoded_key = json.dumps(str(key), ensure_ascii=False)
+            rendered_key = ToolboxApp._one_line(encoded_key[1:-1])
+            try:
+                rendered = json.dumps(item, separators=(",", ":"), ensure_ascii=False)
+            except (TypeError, ValueError):
+                rendered = repr(item)
+            pairs.append(f"{rendered_key}={ToolboxApp._one_line(rendered)}")
+
+        summary = f" [{', '.join(pairs)}]"
+        if len(summary) <= limit:
+            return summary
+        return f"{summary[: limit - 2].rstrip()}…]"
+
+    @staticmethod
+    def _one_line(value: str) -> str:
+        return "".join(
+            character if character.isprintable() else f"\\u{ord(character):04x}"
+            for character in value
+        )
 
 
 def run_tui(kernel: Kernel, model: Model, *, model_name: str) -> None:
