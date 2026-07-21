@@ -98,9 +98,10 @@ def test_reopen_refreshes_code_shipped_core_version_one(tmp_path: Path) -> None:
     )
     assert refreshed["input_schema"] == CORE_SCHEMAS["help"]
     assert refreshed["source"] == HELP_SOURCE
-    assert reopened.read_tool_source("help", version=1, toolbox="secondary")[
-        "source"
-    ] == HELP_SOURCE
+    assert (
+        reopened.read_tool_source("help", version=1, toolbox="secondary")["source"]
+        == HELP_SOURCE
+    )
 
 
 def test_reopen_preserves_active_core_version_two_override(tmp_path: Path) -> None:
@@ -163,7 +164,46 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         assert isinstance(document, str)
         assert document.startswith(heading)
 
-    assert "```python" in kernel.call("help", {"topic": "authoring"})
+    authoring = kernel.call("help", {"topic": "authoring"})
+    assert "```python" in authoring
+    assert "## The `ctx` context object" in authoring
+    for public_api in (
+        "ctx.call_tool(name, args, version=None)",
+        "ctx.caller_session_id",
+        "ctx.sessions.current(after=0, limit=50)",
+        "ctx.sessions.read(session_id, after=0, limit=50)",
+        "ctx.sessions.list(limit=20, cursor=0)",
+        "ctx.model_provider.complete([",
+        "ctx.kernel.catalog(include_core=True)",
+        "ctx.kernel.read_tool_source(name, version=None)",
+        "ctx.kernel.write_tool(...)",
+        "ctx.kernel.execute(name, args, version=None)",
+    ):
+        assert public_api in authoring
+
+    composition = kernel.call("help", {"topic": "composition"})
+    assert "Each nested invocation receives its own context object" in composition
+    assert "base_version" in composition
+    assert "eight completion attempts per top-level call tree" in composition
+
+    assert "model_provider_unavailable" in authoring
+    assert "model_provider_limit" in authoring
+    assert "model_provider_protocol" in authoring
+    assert "except ToolboxError as error" in authoring
+    assert "error.code" in authoring
+    assert "1 MiB" in authoring
+    assert "256 KiB" in authoring
+    assert "bounded JSON transport frame" in authoring
+    assert "authenticated data-egress capability" in authoring
+    assert "not a monetary" in authoring
+
+    sessions = kernel.call("help", {"topic": "sessions"})
+    assert "ctx.sessions.id" in sessions
+    assert "next_after" in sessions
+    assert "parent_call_id" in sessions
+    assert "call_succeeded" in sessions
+    assert "call_finished" not in authoring + sessions
+    assert "not isinstance(value, bool)" in authoring
 
 
 def test_help_lists_topics_for_an_unknown_document(tmp_path: Path) -> None:
