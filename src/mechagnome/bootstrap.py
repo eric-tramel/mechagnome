@@ -21,7 +21,6 @@ HELP_SCHEMA = {
     "type": "object",
     "properties": {
         "topic": {"type": "string"},
-        "cursor": {"type": "integer", "minimum": 0},
     },
     "additionalProperties": False,
 }
@@ -77,66 +76,29 @@ HELP_SOURCE = dedent(
     '''\
     """Progressive documentation for agents entering an empty toolbox."""
 
-    PAGES = {
-        "toc": [
-            "quickstart - the write/call loop",
-            "authoring - the Python tool ABI",
-            "sessions - current and historical event access",
-            "composition - tools calling tools",
-            "versioning - immutable versions, activation, and rollback",
-            "core - editing the five base operations",
-        ],
-        "quickstart": [
-            "1. search_tools before creating a duplicate.",
-            "2. write_tool with a small def main(input, ctx) implementation.",
-            "3. call_tool immediately; failures are observations you can repair.",
-            "4. read_tool_source before changing an existing tool.",
-        ],
-        "authoring": [
-            "Source must define def main(input, ctx).",
-            "input is a dict. Return a JSON-serializable value.",
-            "Imports, filesystem access, and subprocesses are ordinary Python.",
-            "This is trusted in-process execution, not a security sandbox.",
-        ],
-        "sessions": [
-            "ctx.sessions.current(after=0, limit=50) reads this live session.",
-            "ctx.sessions.list(limit=20, cursor=0) enumerates saved sessions.",
-            "ctx.sessions.read(session_id, after=0, limit=50) reads any session.",
-            "A call_started event is committed before your tool begins.",
-        ],
-        "composition": [
-            "Use ctx.call_tool(name, args, version=None) inside a tool.",
-            "Nested calls route through the currently active call_tool source.",
-            "Prefer small tools whose descriptions make reuse discoverable.",
-        ],
-        "versioning": [
-            "Every write creates an immutable integer version.",
-            "A successful write atomically moves the active binding.",
-            "base_version rejects a stale activation.",
-            "A running call stays pinned; a self-update affects its next call.",
-        ],
-        "core": [
-            "The five base operations are ordinary readable tool versions.",
-            "Their names and outer schemas are fixed, but their source is editable.",
-            "Privilege follows the active core slot, not copied source text.",
-            "A host-only rollback command can recover a broken core binding.",
-        ],
+    from importlib.resources import files
+
+    DOCUMENTS = {
+        "toc": "index.md",
+        "quickstart": "getting-started/quickstart.md",
+        "authoring": "tools/authoring.md",
+        "composition": "tools/composition.md",
+        "sessions": "runtime/sessions.md",
+        "versioning": "runtime/versioning.md",
+        "core": "runtime/core.md",
     }
 
     def main(input, ctx):
         topic = input.get("topic") or "toc"
-        cursor = max(0, input.get("cursor", 0))
-        if topic not in PAGES:
-            return {"error": f"unknown help topic: {topic}", "topics": list(PAGES)}
-        page_size = 4
-        lines = PAGES[topic]
-        next_cursor = cursor + page_size if cursor + page_size < len(lines) else None
-        return {
-            "topic": topic,
-            "lines": lines[cursor:cursor + page_size],
-            "next_cursor": next_cursor,
-            "topics": list(PAGES) if topic == "toc" else None,
-        }
+        if topic not in DOCUMENTS:
+            return {
+                "error": f"unknown help topic: {topic}",
+                "topics": list(DOCUMENTS),
+            }
+        document = files("mechagnome").joinpath(
+            "assets", "help", *DOCUMENTS[topic].split("/")
+        )
+        return document.read_text(encoding="utf-8")
     '''
 )
 

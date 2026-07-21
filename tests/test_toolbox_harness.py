@@ -90,6 +90,36 @@ def test_bindings_can_order_by_recent_usage_without_changing_payload(
     }
 
 
+def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+
+    toc = kernel.call("help", {})
+    assert toc.startswith("# Mechagnome help\n")
+    assert "`quickstart`" in toc
+
+    headings = {
+        "quickstart": "# Quickstart\n",
+        "authoring": "# Authoring tools\n",
+        "composition": "# Composing tools\n",
+        "sessions": "# Sessions\n",
+        "versioning": "# Versioning\n",
+        "core": "# Core operations\n",
+    }
+    for topic, heading in headings.items():
+        document = kernel.call("help", {"topic": topic})
+        assert isinstance(document, str)
+        assert document.startswith(heading)
+
+    assert "```python" in kernel.call("help", {"topic": "authoring"})
+
+
+def test_help_lists_topics_for_an_unknown_document(tmp_path: Path) -> None:
+    result = kernel_at(tmp_path).call("help", {"topic": "missing"})
+
+    assert result["error"] == "unknown help topic: missing"
+    assert result["topics"][0] == "toc"
+
+
 def test_write_immediately_search_read_and_call(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     source = "def main(input, ctx):\n    return {'echo': input['value']}\n"

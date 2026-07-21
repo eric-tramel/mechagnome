@@ -178,7 +178,7 @@ invoked:
 
 | Slot | Low-level capability |
 | --- | --- |
-| `help` | none; its documentation lives in editable source |
+| `help` | none; its editable source reads bundled Markdown assets |
 | `search_tools` | enumerate active tool metadata |
 | `read_tool_source` | read stored versions |
 | `write_tool` | compile, store, and bind versions |
