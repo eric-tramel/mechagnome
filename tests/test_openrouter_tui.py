@@ -981,6 +981,30 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
     asyncio.run(exercise())
 
 
+def test_tui_toolbox_is_roomy_themed_and_sorted_by_recent_usage(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    kernel.call("help", {"topic": "quickstart"})
+    kernel.call("search_tools", {"query": "missing"})
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(80, 30)):
+            sidebar = app.query_one("#sidebar")
+            tools = app.query_one("#tools", RichLog)
+            rendered = "\n".join(line.text for line in tools.lines)
+
+            assert sidebar.outer_size.width == 42
+            assert tools.styles.background.a == 0
+            assert tools.min_width == 1
+            assert tools.virtual_size.width <= tools.size.width
+            assert rendered.index("search_tools  v1") < rendered.index("help  v1")
+            assert rendered.index("help  v1") < rendered.index("call_tool  v1")
+
+    asyncio.run(exercise())
+
+
 def test_tool_manager_navigates_source_diff_stats_and_deletes(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     creator = kernel.create_session()

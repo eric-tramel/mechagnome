@@ -451,8 +451,8 @@ class ToolboxApp(App[None]):
     }
 
     #sidebar {
-        width: 34;
-        min-width: 28;
+        width: 42;
+        min-width: 36;
         border: round #34465a;
         background: #101821;
     }
@@ -472,8 +472,13 @@ class ToolboxApp(App[None]):
 
     #tools {
         height: 1fr;
-        padding: 0 1;
+        padding: 1 2;
+        background: transparent;
+        color: #d7e0ea;
+        overflow-x: hidden;
+        overflow-y: auto;
         scrollbar-color: #516b85;
+        scrollbar-background: transparent;
     }
 
     #status {
@@ -534,7 +539,7 @@ class ToolboxApp(App[None]):
                 yield Static("MODEL", classes="sidebar-title")
                 yield Static(id="model-info")
                 yield Static("TOOLBOX", classes="sidebar-title")
-                yield RichLog(id="tools", wrap=True, markup=False)
+                yield RichLog(id="tools", wrap=True, markup=False, min_width=1)
         yield Static(id="stream")
         yield Static(id="status")
         yield Input(
@@ -835,7 +840,7 @@ class ToolboxApp(App[None]):
         self._set_status("error")
 
     def _refresh_sidebar(self) -> None:
-        bindings = self.kernel.bindings()
+        bindings = self.kernel.bindings(recent_first=True)
         core_count = sum(binding["kind"] == "core" for binding in bindings)
         user_count = len(bindings) - core_count
         self.query_one("#model-info", Static).update(
@@ -845,15 +850,26 @@ class ToolboxApp(App[None]):
         )
         toolbox = self.query_one("#tools", RichLog)
         toolbox.clear()
-        for binding in bindings:
+        for index, binding in enumerate(bindings):
             style = "cyan" if binding["kind"] == "core" else "green"
             toolbox.write(
                 Text(
                     f"{binding['name']}  v{binding['active_version']}",
                     style=style,
+                    overflow="fold",
+                    no_wrap=False,
                 )
             )
-            toolbox.write(Text(binding["description"], style="dim"))
+            toolbox.write(
+                Text(
+                    binding["description"],
+                    style="dim",
+                    overflow="fold",
+                    no_wrap=False,
+                )
+            )
+            if index < len(bindings) - 1:
+                toolbox.write("")
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy

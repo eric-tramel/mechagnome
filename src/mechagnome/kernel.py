@@ -786,15 +786,26 @@ class Kernel:
             ).fetchone()
         return int(row["version"]) if row is not None else None
 
-    def bindings(self) -> list[dict[str, Any]]:
+    def bindings(self, *, recent_first: bool = False) -> list[dict[str, Any]]:
         """Inspect active bindings without calling editable code."""
+        order_by = (
+            "usage.last_used_at IS NULL, usage.last_used_at DESC, v.name"
+            if recent_first
+            else "v.name"
+        )
         with closing(self._connect()) as connection:
             active_rows = connection.execute(
-                """
+                f"""
                 SELECT v.name, v.version, v.description
                 FROM bindings AS b
                 JOIN tool_versions AS v ON v.id = b.tool_id
-                ORDER BY v.name
+                LEFT JOIN (
+                    SELECT tool_name, MAX(created_at) AS last_used_at
+                    FROM events
+                    WHERE kind = 'call_started' AND tool_name IS NOT NULL
+                    GROUP BY tool_name
+                ) AS usage ON usage.tool_name = v.name
+                ORDER BY {order_by}
                 """
             ).fetchall()
             version_rows = connection.execute(

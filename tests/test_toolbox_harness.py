@@ -70,6 +70,26 @@ def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
     assert all(item["versions"] == [1] for item in reopened.bindings())
 
 
+def test_bindings_can_order_by_recent_usage_without_changing_payload(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+
+    kernel.call("help", {"topic": "quickstart"})
+    kernel.call("search_tools", {"query": "missing"})
+
+    assert [item["name"] for item in kernel.bindings()] == sorted(CORE_NAMES)
+    recent = kernel.bindings(recent_first=True)
+    assert [item["name"] for item in recent[:2]] == ["search_tools", "help"]
+    assert set(recent[0]) == {
+        "name",
+        "active_version",
+        "description",
+        "versions",
+        "kind",
+    }
+
+
 def test_write_immediately_search_read_and_call(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     source = "def main(input, ctx):\n    return {'echo': input['value']}\n"
