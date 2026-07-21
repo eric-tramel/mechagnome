@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import math
 import shlex
 from typing import Any
 
@@ -43,6 +44,23 @@ from mechagnome.openrouter import (
 )
 
 
+def _format_duration(value: Any) -> str:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        return ""
+    if value < 0.1:
+        return "<0.1 ms"
+    if value < 10:
+        return f"{value:.2f} ms"
+    if value < 1000:
+        return f"{value:.1f} ms"
+    return f"{value / 1000:.2f} s"
+
+
 class ToolEvent(Collapsible):
     """One quiet, expandable tool invocation or observation."""
 
@@ -55,11 +73,13 @@ class ToolEvent(Collapsible):
         tool_name: str,
         detail: str,
         argument_summary: str = "",
+        outcome_summary: str = "",
     ) -> None:
         self.kind = kind
         self.tool_name = tool_name
         self.detail = detail
         self.argument_summary = argument_summary
+        self.outcome_summary = outcome_summary
         self.processing = kind == "call"
         self.detail_widget = Static(
             Text(detail, style="dim"), classes="tool-event-detail"
@@ -108,11 +128,14 @@ class ToolEvent(Collapsible):
         if self._spinner_timer is None:
             self.title = self._render_title(self.SYMBOLS["call"])
 
-    def finish(self, kind: str, tool_name: str, detail: str) -> None:
+    def finish(
+        self, kind: str, tool_name: str, detail: str, outcome_summary: str = ""
+    ) -> None:
         """Turn an in-progress invocation into its final outcome in place."""
         call_detail = self.detail
         self.kind = kind
         self.tool_name = tool_name
+        self.outcome_summary = outcome_summary
         self.remove_class("tool-call")
         self.add_class(f"tool-{kind}")
         outcome = "response" if kind == "response" else "error"
@@ -121,7 +144,9 @@ class ToolEvent(Collapsible):
         self.stop_spinner()
 
     def _render_title(self, symbol: str) -> str:
-        return escape(f"{symbol} {self.tool_name}{self.argument_summary}")
+        return escape(
+            f"{symbol} {self.tool_name}{self.argument_summary}{self.outcome_summary}"
+        )
 
 
 class ChatFeed(VerticalScroll):
@@ -147,8 +172,15 @@ class ChatFeed(VerticalScroll):
         tool_name: str,
         detail: str,
         argument_summary: str = "",
+        outcome_summary: str = "",
     ) -> ToolEvent:
-        event = ToolEvent(kind, tool_name, detail, argument_summary)
+        event = ToolEvent(
+            kind,
+            tool_name,
+            detail,
+            argument_summary,
+            outcome_summary,
+        )
         self.mount(event)
         self.call_after_refresh(self.scroll_end, animate=False)
         return event
@@ -971,8 +1003,15 @@ class ToolManagerScreen(Screen[None]):
         table.add_column("Metric", style="cyan")
         table.add_column("Selected version")
         table.add_column("All versions")
+        table.add_row("Version ID", str(version["tool_version_id"]), "—")
         table.add_row(
             "Calls", str(version["call_count"]), str(self.history["call_count"])
+        )
+        table.add_row("Timed calls", str(version["timed_call_count"]), "—")
+        table.add_row(
+            "Average duration",
+            _format_duration(version["average_duration_ms"]) or "unavailable",
+            "—",
         )
         table.add_row(
             "Succeeded",
@@ -1417,12 +1456,14 @@ class ToolboxApp(App[None]):
             display = self._tool_response(event)
             if display is None:
                 return
-            name, detail = display
+            name, detail, outcome_summary = display
             active = self.active_tool_events.pop(event.call_id, None)
             if active is None:
-                self.query_one("#chat", ChatFeed).write_tool("response", name, detail)
+                self.query_one("#chat", ChatFeed).write_tool(
+                    "response", name, detail, outcome_summary=outcome_summary
+                )
             else:
-                active.finish("response", name, detail)
+                active.finish("response", name, detail, outcome_summary)
             self._refresh_sidebar()
         elif event.kind == "binding_changed":
             name = str(event.payload.get("name") or event.tool_name or "tool")
@@ -1440,12 +1481,14 @@ class ToolboxApp(App[None]):
             display = self._tool_response(event, failed=True)
             if display is None:
                 return
-            name, detail = display
+            name, detail, outcome_summary = display
             active = self.active_tool_events.pop(event.call_id, None)
             if active is None:
-                self.query_one("#chat", ChatFeed).write_tool("error", name, detail)
+                self.query_one("#chat", ChatFeed).write_tool(
+                    "error", name, detail, outcome_summary=outcome_summary
+                )
             else:
-                active.finish("error", name, detail)
+                active.finish("error", name, detail, outcome_summary)
             self._set_status(f"{name} failed")
         elif event.kind in {"model_failed", "harness_failed"}:
             self._stop_active_tool_events()
@@ -1852,7 +1895,7 @@ class ToolboxApp(App[None]):
 
     def _tool_response(
         self, event: AgentEvent, *, failed: bool = False
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         call_id = event.call_id
         if call_id in self.forwarded_children:
             return None
@@ -1874,8 +1917,12 @@ class ToolboxApp(App[None]):
             }
         else:
             name = str(event.tool_name or "tool")
-        value = event.payload if failed else event.payload.get("result")
-        return name, self._compact(value)
+        payload = dict(event.payload)
+        duration_ms = payload.pop("duration_ms", None)
+        value = payload if failed else payload.get("result")
+        duration = _format_duration(duration_ms)
+        outcome_summary = f" · completed in {duration}" if duration else ""
+        return name, self._compact(value), outcome_summary
 
     @staticmethod
     def _compact(value: Any, limit: int = 1600) -> str:

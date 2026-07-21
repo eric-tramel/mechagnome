@@ -14,6 +14,7 @@ import pytest
 
 from mechagnome import Harness, Kernel, ModelProvider, ModelTurn, ToolboxError, ToolCall
 from mechagnome import __main__ as cli
+from mechagnome import kernel as kernel_module
 from mechagnome.bootstrap import CORE_NAMES, CORE_SCHEMAS, HELP_SOURCE
 
 
@@ -624,6 +625,14 @@ def test_tool_management_history_usage_provenance_and_deletion(
     assert history["versions"][0]["call_count"] == 2
     assert history["versions"][1]["created_session_id"] == creator_one
     assert history["versions"][1]["call_count"] == 1
+    assert (
+        history["versions"][0]["tool_version_id"]
+        != history["versions"][1]["tool_version_id"]
+    )
+    assert history["versions"][0]["timed_call_count"] == 2
+    assert history["versions"][1]["timed_call_count"] == 1
+    assert history["versions"][0]["average_duration_ms"] >= 0
+    assert history["versions"][1]["average_duration_ms"] >= 0
     assert history["sessions"][0]["session_id"] in {caller, creator_two}
 
     deleted = kernel.delete_tool("number", session_id=creator_two)
@@ -644,6 +653,109 @@ def test_tool_management_history_usage_provenance_and_deletion(
     with pytest.raises(ToolboxError) as core_error:
         kernel.delete_tool("help")
     assert core_error.value.code == "core_tool_required"
+
+
+def test_terminal_timings_are_persisted_and_aggregated_by_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    write(
+        kernel,
+        "timed",
+        "def main(input, ctx):\n    return 'v1'\n",
+    )
+
+    with monkeypatch.context() as patch:
+        ticks = iter((1_000_000_000, 1_002_000_000))
+        patch.setattr(kernel_module.time, "perf_counter_ns", lambda: next(ticks))
+        assert kernel.call("timed", {}, session_id=session_id, version=1) == "v1"
+
+    write(
+        kernel,
+        "timed",
+        "def main(input, ctx):\n"
+        "    if input.get('fail'):\n"
+        "        raise RuntimeError('broken')\n"
+        "    return 'v2'\n",
+        base_version=1,
+    )
+    with monkeypatch.context() as patch:
+        ticks = iter(
+            (
+                2_000_000_000,
+                2_004_000_000,
+                3_000_000_000,
+                3_008_000_000,
+            )
+        )
+        patch.setattr(kernel_module.time, "perf_counter_ns", lambda: next(ticks))
+        assert kernel.call("timed", {}, session_id=session_id) == "v2"
+        with pytest.raises(RuntimeError, match="broken"):
+            kernel.call("timed", {"fail": True}, session_id=session_id)
+
+    history = kernel.tool_history("timed")
+    version_two, version_one = history["versions"]
+    assert version_one["timed_call_count"] == 1
+    assert version_one["average_duration_ms"] == 2.0
+    assert version_two["timed_call_count"] == 2
+    assert version_two["average_duration_ms"] == 6.0
+    assert version_one["tool_version_id"] != version_two["tool_version_id"]
+
+    terminal_events = [
+        event
+        for event in kernel.read_session(session_id, limit=100)["events"]
+        if event["kind"] in {"call_succeeded", "call_failed"}
+        and event["tool_name"] == "timed"
+    ]
+    assert [event["payload"]["duration_ms"] for event in terminal_events] == [
+        2.0,
+        4.0,
+        8.0,
+    ]
+    assert [event["tool_version_id"] for event in terminal_events] == [
+        version_one["tool_version_id"],
+        version_two["tool_version_id"],
+        version_two["tool_version_id"],
+    ]
+
+    for invalid in (None, True, "3", -1):
+        payload = {"result": None}
+        if invalid is not None:
+            payload["duration_ms"] = invalid
+        kernel.append_event(
+            session_id,
+            "call_succeeded",
+            payload,
+            tool_name="timed",
+            tool_version=1,
+            tool_version_id=version_one["tool_version_id"],
+        )
+
+    reopened = kernel_at(tmp_path).tool_history("timed")
+    reopened_v1 = next(item for item in reopened["versions"] if item["version"] == 1)
+    assert reopened_v1["tool_version_id"] == version_one["tool_version_id"]
+    assert reopened_v1["timed_call_count"] == 1
+    assert reopened_v1["average_duration_ms"] == 2.0
+
+
+def test_result_validation_failures_record_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    write(kernel, "not_json", "def main(input, ctx):\n    return {1}\n")
+
+    with monkeypatch.context() as patch:
+        ticks = iter((5_000_000_000, 5_003_000_000))
+        patch.setattr(kernel_module.time, "perf_counter_ns", lambda: next(ticks))
+        with pytest.raises(ToolboxError) as error:
+            kernel.call("not_json", {}, session_id=session_id)
+
+    assert error.value.code == "not_json"
+    terminal = kernel.read_session(session_id, limit=100)["events"][-1]
+    assert terminal["kind"] == "call_failed"
+    assert terminal["payload"]["duration_ms"] == 3.0
 
 
 def test_tools_compose_and_read_the_live_session(tmp_path: Path) -> None:
