@@ -2110,32 +2110,28 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
             assert "call_tool" not in chat
             assert "hello" in chat
             activity = [(event.kind, event.tool_name) for event in app.query(ToolEvent)]
-            assert activity.count(("call", "hello")) == 1
             assert activity.count(("response", "hello")) == 1
+            assert len(activity) == 2
+            assert all(kind == "response" for kind, _ in activity)
             assert all(event.collapsed for event in app.query(ToolEvent))
-            hello_call = next(
-                event
-                for event in app.query(ToolEvent)
-                if event.kind == "call" and event.tool_name == "hello"
-            )
-            hello_response = next(
+            hello = next(
                 event
                 for event in app.query(ToolEvent)
                 if event.kind == "response" and event.tool_name == "hello"
             )
-            assert tool_title_text(hello_call) == '→ hello [greeting="hello world"]'
-            assert hello_call.processing is False
-            assert hello_call._spinner_timer is None
-            assert tool_title_text(hello_response) == "✓ hello"
-            call_title = hello_call.query_one("CollapsibleTitle", Static)
-            response_title = hello_response.query_one("CollapsibleTitle", Static)
-            assert call_title.styles.color != response_title.styles.color
-            assert hello_call.styles.margin.bottom == 0
-            assert hello_response.styles.margin.bottom == 0
-            assert call_title.styles.text_style.italic is True
-            assert hello_call.detail_widget.styles.border.top[0] == "round"
-            await pilot.click(hello_call)
-            assert hello_call.collapsed is False
+            assert tool_title_text(hello) == '✓ hello [greeting="hello world"]'
+            assert hello.processing is False
+            assert hello._spinner_timer is None
+            assert hello.has_class("tool-response")
+            assert hello.has_class("tool-call") is False
+            assert '"greeting": "hello world"' in hello.detail
+            assert '"hello": "world"' in hello.detail
+            response_title = hello.query_one("CollapsibleTitle", Static)
+            assert hello.styles.margin.bottom == 0
+            assert response_title.styles.text_style.italic is True
+            assert hello.detail_widget.styles.border.top[0] == "round"
+            await pilot.click(hello)
+            assert hello.collapsed is False
             assert "hello  v1" in tools
             assert "1 user" in str(app.query_one("#model-info", Static).render())
 
@@ -2226,7 +2222,7 @@ def test_tui_collapses_forwarded_tool_failure_without_duplicates(
             await pilot.pause()
 
             activity = [(event.kind, event.tool_name) for event in app.query(ToolEvent)]
-            assert activity == [("call", "boom"), ("error", "boom")]
+            assert activity == [("error", "boom")]
             assert "call_tool" not in chat_text(app)
 
     asyncio.run(exercise())
@@ -2307,10 +2303,9 @@ def test_tui_uses_authoritative_dispatcher_outcome(
 
             activity = list(app.query(ToolEvent))
             assert [(event.kind, event.tool_name) for event in activity] == [
-                ("call", expected_name),
                 (expected_kind, expected_name),
             ]
-            assert expected_fragment in activity[1].detail
+            assert expected_fragment in activity[0].detail
 
     asyncio.run(exercise())
 
