@@ -1676,12 +1676,14 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
                 if model.started.is_set() and app.streamed_text:
                     break
             assert app.streamed_text == "Partial"
-            assert app.query_one("#stream", Static).display is True
+            stream = app.query_one(".streaming-response", Static)
+            assert stream.parent is app.query_one("#chat", ChatFeed)
+            assert "Partial" in chat_text(app)
             model.release.set()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.streamed_text == ""
-            assert app.query_one("#stream", Static).display is False
+            assert not app.query(".streaming-response")
             chat = chat_text(app)
             assert "Partial response" in chat
 
