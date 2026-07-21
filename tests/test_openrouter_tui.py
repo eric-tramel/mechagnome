@@ -18,6 +18,7 @@ import pytest
 from rich.console import Console
 from rich.markup import render as render_markup
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 from textual.widgets import (
     Button,
@@ -2825,5 +2826,71 @@ def test_tool_manager_navigates_source_diff_stats_and_deletes(tmp_path: Path) ->
             assert manager.query_one("#delete-tool", Button).disabled is True
             assert "number" not in {binding["name"] for binding in kernel.bindings()}
             assert kernel.tool_history("number")["versions"][0]["version"] == 2
+
+    asyncio.run(exercise())
+
+
+def test_tool_manager_displays_feedback_tab(tmp_path: Path) -> None:
+    """The tool manager should show upvotes, downvotes, score, and comments."""
+    kernel = Kernel(tmp_path / "toolbox.db")
+    creator = kernel.create_session()
+    kernel.write_tool(
+        name="greet",
+        description="A friendly greeting tool.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return {'hello': 'world'}",
+        session_id=creator,
+    )
+    # Submit feedback from two different sessions
+    kernel.submit_tool_feedback(
+        "greet", rating=1, comment="Very useful!", session_id=creator
+    )
+    other = kernel.create_session()
+    kernel.submit_tool_feedback(
+        "greet", rating=-1, comment="Needs improvement.", session_id=other
+    )
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            manager = app.screen
+            assert manager.selected_name == "greet"
+
+            # The feedback tab widget should exist and show a Table
+            feedback_widget = manager.query_one("#tool-feedback", Static)
+            feedback_table = feedback_widget.content
+            assert isinstance(feedback_table, Table)
+
+            # Render the table to a string and check the values
+            from io import StringIO
+
+            from rich.console import Console
+
+            buf = StringIO()
+            console = Console(file=buf, width=120, force_terminal=False)
+            console.print(feedback_table)
+            rendered = buf.getvalue()
+
+            assert "Score" in rendered
+            assert "Upvotes" in rendered
+            assert "Downvotes" in rendered
+            assert "Comments" in rendered
+            assert "Very useful!" in rendered
+            assert "Needs improvement." in rendered
+
+            # Verify the underlying history data has feedback per version
+            version = manager._selected_version_record()
+            assert version["feedback"]["upvotes"] == 1
+            assert version["feedback"]["downvotes"] == 1
+            assert version["feedback"]["score"] == 0
+            assert version["feedback"]["comments"] == 2
+            comment_texts = [
+                c["comment"] for c in version["feedback"]["recent_comments"]
+            ]
+            assert "Very useful!" in comment_texts
+            assert "Needs improvement." in comment_texts
 
     asyncio.run(exercise())

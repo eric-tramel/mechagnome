@@ -2184,6 +2184,24 @@ class Kernel:
                 if ids
                 else []
             )
+            feedback_data = {}
+            for vid in ids:
+                feedback_data[vid] = {
+                    **self._feedback_summary(connection, vid),
+                    "recent_comments": [
+                        dict(cr)
+                        for cr in connection.execute(
+                            """
+                            SELECT rating, comment, updated_at
+                            FROM tool_feedback
+                            WHERE tool_version_id = ? AND comment IS NOT NULL
+                            ORDER BY updated_at DESC, id DESC
+                            LIMIT 10
+                            """,
+                            (vid,),
+                        ).fetchall()
+                    ],
+                }
         active_version = int(active_row["version"]) if active_row is not None else None
         grouped: dict[int, list[sqlite3.Row]] = {}
         for event in event_rows:
@@ -2237,6 +2255,16 @@ class Kernel:
                     "timed_call_count": len(durations),
                     "average_duration_ms": (
                         sum(durations) / len(durations) if durations else None
+                    ),
+                    "feedback": feedback_data.get(
+                        int(row["id"]),
+                        {
+                            "score": 0,
+                            "upvotes": 0,
+                            "downvotes": 0,
+                            "comments": 0,
+                            "recent_comments": [],
+                        },
                     ),
                 }
             )
