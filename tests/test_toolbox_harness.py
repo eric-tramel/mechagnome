@@ -175,6 +175,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "ctx.sessions.list(limit=20, cursor=0)",
         "ctx.model_provider.complete([",
         "ctx.kernel.catalog(include_core=True)",
+        "ctx.kernel.submit_tool_feedback(...)",
         "ctx.kernel.read_tool_source(name, version=None)",
         "ctx.kernel.write_tool(...)",
         "ctx.kernel.execute(name, args, version=None)",
@@ -364,6 +365,141 @@ def test_search_exact_name_priority_filtering_and_pagination(tmp_path: Path) -> 
     assert [item["name"] for item in empty["items"]] == ["haystack"]
     assert empty["total"] == 2
     assert empty["next_cursor"] == 1
+
+
+def test_feedback_is_persistent_session_scoped_and_changes_search_ranking(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    common_source = "def main(input, ctx):\n    return 'feedbackmarker'\n"
+    write(kernel, "alpha_candidate", common_source, description="Same candidate.")
+    write(kernel, "beta_candidate", common_source, description="Same candidate.")
+
+    before = kernel.call(
+        "search_tools", {"query": "feedbackmarker", "include_core": False}
+    )
+    assert [item["name"] for item in before["items"]] == [
+        "alpha_candidate",
+        "beta_candidate",
+    ]
+    assert before["items"][0]["feedback"] == {
+        "score": 0,
+        "upvotes": 0,
+        "downvotes": 0,
+        "comments": 0,
+    }
+
+    first = kernel.call(
+        "search_tools",
+        {
+            "feedback": {
+                "name": "alpha_candidate",
+                "rating": -1,
+                "comment": "Returned malformed data.",
+            }
+        },
+        session_id="agent-one",
+    )["feedback"]
+    assert first == {
+        "name": "alpha_candidate",
+        "version": 1,
+        "rating": -1,
+        "comment": "Returned malformed data.",
+        "replaced": False,
+        "aggregate": {
+            "score": -1,
+            "upvotes": 0,
+            "downvotes": 1,
+            "comments": 1,
+        },
+    }
+
+    updated = kernel.call(
+        "search_tools",
+        {"feedback": {"name": "alpha_candidate", "rating": 1}},
+        session_id="agent-one",
+    )["feedback"]
+    assert updated["replaced"] is True
+    assert updated["aggregate"] == {
+        "score": 1,
+        "upvotes": 1,
+        "downvotes": 0,
+        "comments": 0,
+    }
+
+    kernel.call(
+        "search_tools",
+        {"feedback": {"name": "alpha_candidate", "rating": -1}},
+        session_id="agent-two",
+    )
+    kernel.call(
+        "search_tools",
+        {"feedback": {"name": "alpha_candidate", "rating": -1}},
+        session_id="agent-three",
+    )
+    after = kernel.call(
+        "search_tools", {"query": "feedbackmarker", "include_core": False}
+    )
+    assert [item["name"] for item in after["items"]] == [
+        "beta_candidate",
+        "alpha_candidate",
+    ]
+    assert after["items"][1]["feedback"] == {
+        "score": -1,
+        "upvotes": 1,
+        "downvotes": 2,
+        "comments": 0,
+    }
+
+
+def test_feedback_is_version_specific_and_validated(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    source = "def main(input, ctx):\n    return None\n"
+    write(kernel, "rated", source)
+    kernel.call(
+        "search_tools",
+        {"feedback": {"name": "rated", "rating": -1}},
+        session_id="critic",
+    )
+    write(kernel, "rated", source, base_version=1)
+
+    active = next(item for item in kernel.catalog() if item["name"] == "rated")
+    assert active["version"] == 2
+    assert active["feedback"]["downvotes"] == 0
+    old = kernel.submit_tool_feedback(
+        "rated", rating=0, comment="Version one note.", version=1
+    )
+    assert old["version"] == 1
+    assert old["aggregate"]["downvotes"] == 1
+    assert old["aggregate"]["comments"] == 1
+    read_old = kernel.read_tool_source("rated", version=1)
+    assert read_old["feedback"]["recent_comments"][0]["comment"] == (
+        "Version one note."
+    )
+    assert read_old["feedback"]["recent_comments"][0]["rating"] == 0
+
+    with pytest.raises(ToolboxError) as error:
+        kernel.submit_tool_feedback("rated", rating=2)
+    assert error.value.code == "invalid_feedback"
+    with pytest.raises(ToolboxError) as error:
+        kernel.submit_tool_feedback("rated", rating=0, comment="   ")
+    assert error.value.code == "invalid_feedback"
+
+
+def test_schema_two_database_migrates_feedback_storage(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute("DROP TABLE tool_feedback")
+        connection.execute("PRAGMA user_version = 2")
+
+    reopened = kernel_at(tmp_path)
+    with closing(reopened._connect()) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
+        ).fetchone()
+    assert version == 3
+    assert table is not None
 
 
 def test_versions_exact_calls_and_stale_base(tmp_path: Path) -> None:
@@ -994,7 +1130,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 3
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -1177,7 +1313,7 @@ def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
     Harness(kernel_at(tmp_path)).run(model, "Rewrite search.")
 
     assert model.search_descriptions == [
-        "Search active tools by name, description, schema, and source.",
+        "Search active tools and record version-specific ratings and feedback.",
         "Live rewritten search.",
     ]
 
