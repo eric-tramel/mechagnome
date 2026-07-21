@@ -617,7 +617,7 @@ class ToolManagerScreen(Screen[None]):
         scrollbar-color: #516b85;
     }
 
-    #tool-source, #tool-diff, #tool-usage {
+    #tool-source, #tool-diff, #tool-usage, #tool-feedback {
         width: 1fr;
         height: auto;
     }
@@ -688,6 +688,9 @@ class ToolManagerScreen(Screen[None]):
                 with TabPane("Usage & sessions", id="usage-tab"):
                     with VerticalScroll(classes="inspection-scroll"):
                         yield Static(id="tool-usage")
+                with TabPane("Feedback", id="feedback-tab"):
+                    with VerticalScroll(classes="inspection-scroll"):
+                        yield Static(id="tool-feedback")
             yield Static(id="manager-status")
         yield Footer()
 
@@ -928,6 +931,7 @@ class ToolManagerScreen(Screen[None]):
         )
         self.query_one("#tool-diff", Static).update(self._source_diff(version))
         self.query_one("#tool-usage", Static).update(self._usage_table(version))
+        self.query_one("#tool-feedback", Static).update(self._feedback_view(version))
         delete = self.query_one("#delete-tool", Button)
         delete.disabled = self.history["kind"] == "core" or active is None
         self._status(
@@ -1004,6 +1008,32 @@ class ToolManagerScreen(Screen[None]):
                 str(session["call_count"]),
                 str(session["last_called_at"])[:19],
             )
+        return table
+
+    def _feedback_view(self, version: dict[str, Any]) -> Table:
+        """Render up/down votes, score, and recent comments for a version."""
+        feedback = version.get("feedback", {})
+        table = Table(box=None, expand=True, show_header=False)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value")
+        table.add_row("Score", str(feedback.get("score", 0)))
+        table.add_row("Upvotes", str(feedback.get("upvotes", 0)))
+        table.add_row("Downvotes", str(feedback.get("downvotes", 0)))
+        table.add_row("Comments", str(feedback.get("comments", 0)))
+        table.add_section()
+        comments = feedback.get("recent_comments", [])
+        if not comments:
+            table.add_row("No comments recorded", "")
+        else:
+            table.add_row("Rating", "Comment", "Updated")
+            for comment in comments:
+                rating = comment.get("rating", 0)
+                symbol = "+1" if rating == 1 else "-1" if rating == -1 else " 0"
+                table.add_row(
+                    symbol,
+                    str(comment.get("comment", "")),
+                    str(comment.get("updated_at", ""))[:19],
+                )
         return table
 
     def _status(self, message: str) -> None:
