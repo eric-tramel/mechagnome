@@ -6,9 +6,11 @@ import ast
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import sqlite3
+import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
@@ -1953,6 +1955,7 @@ class Kernel:
         )
         logical_slot = tool.name if tool.name in CORE_NAMES else None
         context = ToolContext(self, state, call_id, depth, logical_slot)
+        started_at = time.perf_counter_ns()
         try:
             namespace: dict[str, Any] = {
                 "__name__": f"toolbox_tool_{tool.id}",
@@ -1976,6 +1979,7 @@ class Kernel:
                 )
             _json(result)
         except Exception as error:
+            duration_ms = (time.perf_counter_ns() - started_at) / 1_000_000
             details = (
                 error.to_dict()["error"]
                 if isinstance(error, ToolboxError)
@@ -1984,7 +1988,7 @@ class Kernel:
             self.append_event(
                 state.session_id,
                 "call_failed",
-                details,
+                {**details, "duration_ms": duration_ms},
                 call_id=call_id,
                 parent_call_id=parent_call_id,
                 toolbox_id=tool.toolbox_id,
@@ -1993,10 +1997,11 @@ class Kernel:
                 tool_version_id=tool.id,
             )
             raise
+        duration_ms = (time.perf_counter_ns() - started_at) / 1_000_000
         self.append_event(
             state.session_id,
             "call_succeeded",
-            {"result": result},
+            {"result": result, "duration_ms": duration_ms},
             call_id=call_id,
             parent_call_id=parent_call_id,
             toolbox_id=tool.toolbox_id,
@@ -2165,7 +2170,13 @@ class Kernel:
             event_rows = (
                 connection.execute(
                     f"""
-                    SELECT tool_version_id, kind, session_id, created_at
+                    SELECT tool_version_id, kind, session_id, created_at,
+                           CASE WHEN kind IN ('call_succeeded', 'call_failed')
+                                THEN json_type(payload_json, '$.duration_ms')
+                           END AS duration_type,
+                           CASE WHEN kind IN ('call_succeeded', 'call_failed')
+                                THEN json_extract(payload_json, '$.duration_ms')
+                           END AS duration_ms
                     FROM events WHERE tool_version_id IN ({placeholders})
                     """,
                     ids,
@@ -2182,6 +2193,13 @@ class Kernel:
         for row in version_rows:
             events = grouped.get(int(row["id"]), [])
             calls = [event for event in events if event["kind"] == "call_started"]
+            durations = []
+            for event in events:
+                if event["duration_type"] not in {"integer", "real"}:
+                    continue
+                duration = float(event["duration_ms"])
+                if math.isfinite(duration) and duration >= 0:
+                    durations.append(duration)
             for event in calls:
                 sessions.setdefault(str(event["session_id"]), []).append(
                     str(event["created_at"])
@@ -2198,6 +2216,7 @@ class Kernel:
             versions.append(
                 {
                     "version": version,
+                    "tool_version_id": int(row["id"]),
                     "active": version == active_version,
                     "description": row["description"],
                     "input_schema": json.loads(row["schema_json"]),
@@ -2214,6 +2233,10 @@ class Kernel:
                     "session_count": len({event["session_id"] for event in calls}),
                     "last_called_at": max(
                         (str(event["created_at"]) for event in calls), default=None
+                    ),
+                    "timed_call_count": len(durations),
+                    "average_duration_ms": (
+                        sum(durations) / len(durations) if durations else None
                     ),
                 }
             )

@@ -58,6 +58,7 @@ from mechagnome.tui import (
     ToolboxApp,
     ToolEvent,
     ToolManagerScreen,
+    _format_duration,
 )
 
 
@@ -2391,7 +2392,19 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
                 for event in app.query(ToolEvent)
                 if event.kind == "response" and event.tool_name == "hello"
             )
-            assert tool_title_text(hello) == '✓ hello [greeting="hello world"]'
+            events = kernel.read_session(app.conversation.session_id, limit=100)[
+                "events"
+            ]
+            outer = next(
+                event
+                for event in events
+                if event["kind"] == "call_succeeded"
+                and event["tool_name"] == "call_tool"
+            )
+            assert tool_title_text(hello) == (
+                '✓ hello [greeting="hello world"] · completed in '
+                f"{_format_duration(outer['payload']['duration_ms'])}"
+            )
             assert hello.processing is False
             assert hello._spinner_timer is None
             assert hello.has_class("tool-response")
@@ -2496,6 +2509,19 @@ def test_tui_collapses_forwarded_tool_failure_without_duplicates(
             activity = [(event.kind, event.tool_name) for event in app.query(ToolEvent)]
             assert activity == [("error", "boom")]
             assert "call_tool" not in chat_text(app)
+            failed = next(iter(app.query(ToolEvent)))
+            events = kernel.read_session(app.conversation.session_id, limit=100)[
+                "events"
+            ]
+            outer = next(
+                event
+                for event in events
+                if event["kind"] == "call_failed" and event["tool_name"] == "call_tool"
+            )
+            assert tool_title_text(failed).endswith(
+                f"completed in {_format_duration(outer['payload']['duration_ms'])}"
+            )
+            assert "duration_ms" not in failed.detail
 
     asyncio.run(exercise())
 
@@ -2769,9 +2795,17 @@ def test_tool_manager_navigates_source_diff_stats_and_deletes(tmp_path: Path) ->
             assert "-    return 1\n+    return 2" in diff.code
             assert manager.history["call_count"] == 1
             assert manager.history["versions"][0]["created_session_id"] == creator
+            assert manager.history["versions"][0]["timed_call_count"] == 1
+            assert manager.history["versions"][0]["average_duration_ms"] >= 0
             summary = manager.query_one("#tool-summary", Static).content
             assert isinstance(summary, Text)
             assert "[/bold]" in summary.plain
+            usage = manager.query_one("#tool-usage", Static).content
+            rendered_usage = StringIO()
+            Console(file=rendered_usage, force_terminal=False).print(usage)
+            assert "Version ID" in rendered_usage.getvalue()
+            assert "Timed calls" in rendered_usage.getvalue()
+            assert "Average duration" in rendered_usage.getvalue()
 
             manager.query_one("#version-picker", Select).value = 1
             await pilot.pause()

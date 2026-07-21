@@ -155,6 +155,13 @@ its `parent_call_id`. The corresponding completion or failure event is committed
 only after the source returns or raises. Session reads observe committed state at
 the moment of the call; the context object does not push live updates.
 
+Normal `call_succeeded` and `call_failed` payloads include `duration_ms`, measured
+with a monotonic clock from after `call_started` commits through source loading,
+`main`, nested calls, and result validation. The event's `tool_version_id`
+attributes that sample to the resolved version. Nested durations are inclusive,
+so parent and child durations must not be summed. Calls interrupted by timeout,
+cancellation, or worker failure may have no terminal event or duration sample.
+
 Session access is read-only but not an authorization boundary: a tool can list
 saved sessions and read one when it knows the ID. Do not store secrets in
 session payloads that authored code should not inspect.
