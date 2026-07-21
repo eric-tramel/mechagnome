@@ -661,6 +661,19 @@ def test_conversation_cancellation_closes_active_openrouter_stream(
     assert [event["kind"] for event in events] == ["user", "cancelled"]
 
 
+def test_closed_conversation_rejects_a_late_rollout(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = FinalModel()
+    conversation = Harness(kernel).start(model)
+
+    conversation.close()
+
+    with pytest.raises(RunCancelled):
+        conversation.send("too late")
+    assert model.message_snapshots == []
+    assert kernel.read_session(conversation.session_id, limit=100)["events"] == []
+
+
 class PausingResetModel(FinalModel):
     """Expose rollout teardown so cancellation can race it deterministically."""
 
@@ -799,6 +812,7 @@ class PausingStreamingModel:
     def __init__(self) -> None:
         self.started = threading.Event()
         self.release = threading.Event()
+        self.cancelled = threading.Event()
 
     def stream(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -815,6 +829,7 @@ class PausingStreamingModel:
         raise AssertionError("streaming interface should be preferred")
 
     def cancel_current(self) -> None:
+        self.cancelled.set()
         self.release.set()
 
 
@@ -897,6 +912,62 @@ def test_escape_stops_streaming_rollout_and_records_cancellation(
         FinalModel(), session_id=app.conversation.session_id
     )
     assert resumed.messages == []
+
+
+def test_ctrl_q_stops_active_rollout_before_exiting(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingStreamingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "quit during this stream"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set():
+                    break
+            assert model.started.is_set()
+            await pilot.press("ctrl+q")
+
+    try:
+        asyncio.run(exercise())
+        assert model.cancelled.is_set()
+    finally:
+        model.release.set()
+
+    events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "cancelled"]
+
+
+def test_unmount_stops_active_rollout_before_programmatic_exit(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingStreamingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "exit during this stream"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set():
+                    break
+            assert model.started.is_set()
+            app.exit()
+
+    try:
+        asyncio.run(exercise())
+        assert model.cancelled.is_set()
+    finally:
+        model.release.set()
+
+    events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "cancelled"]
 
 
 class ToolThenFinalModel:

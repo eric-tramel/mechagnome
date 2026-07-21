@@ -119,11 +119,14 @@ class Conversation:
         self.messages = messages or []
         self._run_lock = Lock()
         self._current_token: _CancellationToken | None = None
+        self._closed = False
 
     def send(self, prompt: str, *, on_event: EventSink | None = None) -> RunResult:
         """Send one user message and run until the model returns final text."""
         token = _CancellationToken()
         with self._run_lock:
+            if self._closed:
+                raise RunCancelled
             if self._current_token is not None:
                 raise ToolboxError("conversation_busy", "a rollout is already active")
             self._current_token = token
@@ -151,14 +154,26 @@ class Conversation:
             token = self._current_token
             if token is None:
                 return False
-            token.cancel()
-            cancel_current = getattr(self.model, "cancel_current", None)
-            if callable(cancel_current):
-                try:
-                    cancel_current()
-                except Exception:
-                    pass
+            self._cancel_locked(token)
             return True
+
+    def close(self) -> None:
+        """Prevent future rollouts and cancel one that is starting or active."""
+        with self._run_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._cancel_locked(self._current_token)
+
+    def _cancel_locked(self, token: _CancellationToken | None) -> None:
+        if token is not None:
+            token.cancel()
+        cancel_current = getattr(self.model, "cancel_current", None)
+        if callable(cancel_current):
+            try:
+                cancel_current()
+            except Exception:
+                pass
 
     def _run(
         self,

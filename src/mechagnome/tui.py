@@ -15,6 +15,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Unmount
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widgets import (
@@ -555,6 +556,10 @@ class ToolboxApp(App[None]):
         self._set_busy(False)
         self.query_one("#prompt", Input).focus()
 
+    def on_unmount(self, event: Unmount) -> None:
+        """Release a synchronous rollout before asyncio joins worker threads."""
+        self.conversation.close()
+
     @on(Input.Submitted, "#prompt")
     def submit_prompt(self, event: Input.Submitted) -> None:
         """Handle a slash command or send one message to the agent worker."""
@@ -712,7 +717,7 @@ class ToolboxApp(App[None]):
     def _command(self, prompt: str) -> bool:
         command, _, argument = prompt.partition(" ")
         if command in {"/quit", "/q"}:
-            self.exit()
+            self.action_quit()
         elif command in {"/new", "/reset"}:
             self.action_new_session()
         elif command in {"/tools", "/toolbox"}:
@@ -724,6 +729,11 @@ class ToolboxApp(App[None]):
         else:
             self._write_error(f"unknown command: {command}")
         return True
+
+    def action_quit(self) -> None:
+        """Cancel synchronous work before asking Textual to exit."""
+        self.conversation.close()
+        self.exit()
 
     def action_new_session(self) -> None:
         """Begin a fresh model conversation without deleting toolbox state."""
