@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from mechagnome.kernel import InvocationScope, Kernel, ToolboxError
-from mechagnome.model_provider import _ModelProviderProxy
+from mechagnome.model_provider import _bind_model_provider, _ModelProviderProxy
 
 
 def _write_response(path: Path, response: dict[str, Any]) -> None:
@@ -37,7 +37,7 @@ def main() -> int:
                 )
             os.set_inheritable(provider_fd, False)
             provider_connection = socket.socket(fileno=provider_fd)
-            provider = _ModelProviderProxy(provider_connection)
+            provider = _bind_model_provider(_ModelProviderProxy(provider_connection))
         kernel = Kernel(
             request["db_path"],
             max_depth=request["max_depth"],

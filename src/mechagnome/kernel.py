@@ -19,11 +19,12 @@ from typing import TYPE_CHECKING, Any
 from mechagnome.bootstrap import BOOTSTRAP_TOOLS, CORE_NAMES, CORE_SCHEMAS
 
 if TYPE_CHECKING:
-    from mechagnome.model_provider import _CompletionProvider
+    from mechagnome.model_provider import _BoundedModelProvider
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
+_SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 
@@ -61,7 +62,7 @@ class _InvocationState:
     scope: InvocationScope
     max_depth: int
     max_calls: int
-    model_provider: _CompletionProvider
+    model_provider: _BoundedModelProvider
     calls: int = 0
 
     @property
@@ -118,6 +119,12 @@ class SessionAccess:
         """Read a page of events from the currently running session."""
         return self.read(self.id, after=after, limit=limit)
 
+    def metadata(self, session_id: str | None = None) -> dict[str, Any]:
+        """Return durable identity and lineage for one saved session."""
+        return self._kernel.session_metadata(
+            self.id if session_id is None else session_id
+        )
+
 
 class ToolContext:
     """The functional interface supplied to authored tools."""
@@ -137,7 +144,11 @@ class ToolContext:
         self._logical_slot = logical_slot
         self.caller_session_id = state.session_id
         self.sessions = SessionAccess(kernel, state.session_id)
-        self.model_provider = state.model_provider
+        from mechagnome.model_provider import ToolModelProvider
+
+        self.model_provider = ToolModelProvider(
+            state.model_provider.for_origin(call_id)
+        )
 
     @property
     def kernel(self) -> _KernelCapability:
@@ -319,6 +330,9 @@ class Kernel:
                     )
                     if version == 2:
                         self._migrate_v2(connection)
+                        version = 3
+                    if version == 3:
+                        self._migrate_v3(connection)
                     elif version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -355,6 +369,47 @@ class Kernel:
     @classmethod
     def _migrate_v2(cls, connection: sqlite3.Connection) -> None:
         cls._create_feedback_schema(connection)
+
+    @staticmethod
+    def _migrate_v3(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        if "parent_session_id" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT "
+                "REFERENCES sessions(id)"
+            )
+        if "kind" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'generic' "
+                "CHECK(kind IN ('generic', 'conversation', 'completion'))"
+            )
+        if "origin_call_id" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN origin_call_id TEXT")
+        Kernel._create_session_indexes_and_triggers(connection)
+
+    @staticmethod
+    def _create_session_indexes_and_triggers(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS sessions_parent_created "
+            "ON sessions(parent_session_id, created_at DESC)"
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS sessions_lineage_immutable
+            BEFORE UPDATE OF parent_session_id, kind, origin_call_id ON sessions
+            WHEN OLD.parent_session_id IS NOT NEW.parent_session_id
+              OR OLD.kind IS NOT NEW.kind
+              OR OLD.origin_call_id IS NOT NEW.origin_call_id
+            BEGIN
+                SELECT RAISE(ABORT, 'session lineage is immutable');
+            END
+            """
+        )
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
@@ -411,6 +466,10 @@ class Kernel:
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
                 cwd TEXT,
+                parent_session_id TEXT REFERENCES sessions(id),
+                kind TEXT NOT NULL DEFAULT 'generic'
+                    CHECK(kind IN ('generic', 'conversation', 'completion')),
+                origin_call_id TEXT,
                 created_at TEXT NOT NULL
             )
             """,
@@ -445,6 +504,7 @@ class Kernel:
         )
         for statement in statements:
             connection.execute(statement)
+        Kernel._create_session_indexes_and_triggers(connection)
         Kernel._create_feedback_schema(connection)
 
     def _migrate_legacy(self, connection: sqlite3.Connection) -> None:
@@ -775,18 +835,25 @@ class Kernel:
                 raise
         return {"cwd": canonical, "toolbox": name}
 
-    def create_session(self, session_id: str | None = None) -> str:
-        """Create a durable session with a materialized cwd-default selection."""
+    def create_session(
+        self,
+        session_id: str | None = None,
+        *,
+        kind: str = "generic",
+    ) -> str:
+        """Create a durable root session with a cwd-default selection."""
+        if kind not in _SESSION_KINDS:
+            raise ToolboxError("invalid_session_kind", f"invalid session kind: {kind}")
         identifier = session_id or uuid.uuid4().hex
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 created = connection.execute(
                     """
-                    INSERT OR IGNORE INTO sessions (id, cwd, created_at)
-                    VALUES (?, ?, ?)
+                    INSERT OR IGNORE INTO sessions (id, cwd, kind, created_at)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (identifier, self.cwd, _now()),
+                    (identifier, self.cwd, kind, _now()),
                 ).rowcount
                 selected = connection.execute(
                     "SELECT 1 FROM session_toolboxes WHERE session_id = ?",
@@ -809,6 +876,95 @@ class Kernel:
                         raise ToolboxError(
                             "unknown_session", f"unknown session: {identifier}"
                         )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return identifier
+
+    def create_child_session(
+        self,
+        scope: InvocationScope,
+        *,
+        kind: str,
+        origin_call_id: str | None = None,
+    ) -> str:
+        """Create a host-identified child inheriting one frozen invocation scope."""
+        if kind not in _SESSION_KINDS or kind == "generic":
+            raise ToolboxError("invalid_session_kind", f"invalid child kind: {kind}")
+        identifier = uuid.uuid4().hex
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                parent = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (scope.session_id,)
+                ).fetchone()
+                if parent is None:
+                    raise ToolboxError(
+                        "unknown_session", f"unknown session: {scope.session_id}"
+                    )
+                if origin_call_id is not None:
+                    origin = connection.execute(
+                        """
+                        SELECT 1
+                        FROM events AS started
+                        WHERE started.session_id = ?
+                          AND started.call_id = ?
+                          AND started.kind = 'call_started'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM events AS terminal
+                              WHERE terminal.session_id = started.session_id
+                                AND terminal.call_id = started.call_id
+                                AND terminal.kind IN ('call_succeeded', 'call_failed')
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM events AS child
+                              WHERE child.session_id = started.session_id
+                                AND child.parent_call_id = started.call_id
+                                AND child.kind = 'call_started'
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM events AS child_terminal
+                                    WHERE child_terminal.session_id = child.session_id
+                                      AND child_terminal.call_id = child.call_id
+                                      AND child_terminal.kind IN (
+                                          'call_succeeded', 'call_failed'
+                                      )
+                                )
+                          )
+                        """,
+                        (scope.session_id, origin_call_id),
+                    ).fetchone()
+                    if origin is None:
+                        raise ToolboxError(
+                            "invalid_session_origin",
+                            "origin call is not the active leaf in the parent session",
+                        )
+                connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        id, cwd, parent_session_id, kind, origin_call_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        identifier,
+                        scope.cwd,
+                        scope.session_id,
+                        kind,
+                        origin_call_id,
+                        _now(),
+                    ),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO session_toolboxes (session_id, position, toolbox_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (identifier, position, toolbox_id)
+                        for position, toolbox_id in enumerate(scope.toolbox_ids)
+                    ],
+                )
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -1045,7 +1201,8 @@ class Kernel:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
-                SELECT sessions.id, sessions.cwd, sessions.created_at,
+                SELECT sessions.id, sessions.cwd, sessions.parent_session_id,
+                       sessions.kind, sessions.origin_call_id, sessions.created_at,
                        COUNT(events.id) AS event_count
                 FROM sessions
                 LEFT JOIN events ON events.session_id = sessions.id
@@ -1055,11 +1212,52 @@ class Kernel:
                 """,
                 (limit + 1, cursor),
             ).fetchall()
+            sessions = []
+            for row in rows[:limit]:
+                session = dict(row)
+                session["root_session_id"] = self._root_session_id(
+                    connection, str(row["id"])
+                )
+                sessions.append(session)
         has_more = len(rows) > limit
         return {
-            "sessions": [dict(row) for row in rows[:limit]],
+            "sessions": sessions,
             "next_cursor": cursor + limit if has_more else None,
         }
+
+    @staticmethod
+    def _root_session_id(connection: sqlite3.Connection, session_id: str) -> str:
+        row = connection.execute(
+            """
+            WITH RECURSIVE lineage(id, parent_session_id) AS (
+                SELECT id, parent_session_id FROM sessions WHERE id = ?
+                UNION ALL
+                SELECT sessions.id, sessions.parent_session_id
+                FROM sessions JOIN lineage ON sessions.id = lineage.parent_session_id
+            )
+            SELECT id FROM lineage WHERE parent_session_id IS NULL
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise ToolboxError("unknown_session", f"unknown session: {session_id}")
+        return str(row["id"])
+
+    def session_metadata(self, session_id: str) -> dict[str, Any]:
+        """Return one session's durable identity and derived root."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT id, cwd, parent_session_id, kind, origin_call_id, created_at
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolboxError("unknown_session", f"unknown session: {session_id}")
+            metadata = dict(row)
+            metadata["root_session_id"] = self._root_session_id(connection, session_id)
+        return metadata
 
     def read_session(
         self, session_id: str, *, after: int = 0, limit: int = 50
@@ -1068,11 +1266,17 @@ class Kernel:
         limit = min(100, max(1, limit))
         after = max(0, after)
         with closing(self._connect()) as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            session = connection.execute(
+                """
+                SELECT id, cwd, parent_session_id, kind, origin_call_id, created_at
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
             ).fetchone()
-            if exists is None:
+            if session is None:
                 raise ToolboxError("unknown_session", f"unknown session: {session_id}")
+            metadata = dict(session)
+            metadata["root_session_id"] = self._root_session_id(connection, session_id)
             rows = connection.execute(
                 """
                 SELECT seq, kind, call_id, parent_call_id, toolbox_id, tool_name,
@@ -1092,6 +1296,7 @@ class Kernel:
             events.append(event)
         return {
             "session_id": session_id,
+            "session": metadata,
             "events": events,
             "next_after": events[-1]["seq"] if has_more and events else None,
         }
@@ -1627,21 +1832,34 @@ class Kernel:
         session_id: str | None = None,
         version: int | None = None,
         scope: InvocationScope | None = None,
-        model_provider: _CompletionProvider | None = None,
+        model_provider: Any | None = None,
     ) -> JsonValue:
         """Start a top-level invocation in a durable session."""
-        from mechagnome.model_provider import _bind_model_provider
+        from mechagnome.model_provider import (
+            ModelProvider,
+            ModelSession,
+            _bind_model_provider,
+            _BoundedModelProvider,
+        )
 
         if scope is None and session_id is None:
             identifier = self.create_session()
             active_scope = self.snapshot_scope(identifier)
         else:
             active_scope = self._scope(session_id=session_id, scope=scope)
+        provider = model_provider
+        if provider is not None and not isinstance(provider, _BoundedModelProvider):
+            gateway = ModelProvider.from_completion_transport(self, provider)
+            provider = ModelSession(
+                gateway, active_scope.session_id
+            ).completion_provider(active_scope)
+        bound_provider = _bind_model_provider(provider)
+        bound_provider = bound_provider.for_scope(active_scope)
         state = _InvocationState(
             scope=active_scope,
             max_depth=self.max_depth,
             max_calls=self.max_calls,
-            model_provider=_bind_model_provider(model_provider),
+            model_provider=bound_provider,
         )
         self.append_event(
             active_scope.session_id,

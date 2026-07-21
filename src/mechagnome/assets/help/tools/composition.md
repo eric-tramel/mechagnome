@@ -17,7 +17,12 @@ Each nested invocation receives its own context object. The caller and callee
 share the durable session and the toolbox selection snapshotted for the top-level
 call, while event tracing records distinct call IDs and their parent-child
 relationship. They also share the host-bound `ctx.model_provider` capability and
-its limit of eight completion attempts per top-level call tree.
+its limit of eight delegated-model attempts per top-level call tree. Each
+accepted provider completion is logged in a new child session whose origin is
+the nested tool that requested it. `run_agent()` similarly creates a full
+`conversation` child, and recursive delegation creates grandchildren under the
+agent that made each call. Ordinary nested tool calls themselves remain in the
+shared parent session.
 
 ## Active and pinned calls
 

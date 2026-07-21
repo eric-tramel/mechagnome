@@ -35,7 +35,7 @@ from textual.widgets import (
 
 from mechagnome.harness import AgentEvent, Harness, Model, RunCancelled
 from mechagnome.kernel import Kernel
-from mechagnome.model_provider import ModelProvider
+from mechagnome.model_provider import CompletionTransport, ModelProvider
 from mechagnome.openrouter import (
     OpenRouterError,
     OpenRouterModel,
@@ -1186,22 +1186,22 @@ class ToolboxApp(App[None]):
     def __init__(
         self,
         kernel: Kernel,
-        model: Model,
+        model: Model | ModelProvider,
         *,
         model_name: str,
         max_turns: int = 50,
-        model_provider: ModelProvider | None = None,
+        model_provider: CompletionTransport | None = None,
     ) -> None:
         super().__init__()
         self.kernel = kernel
-        self.model = model
-        self.model_provider = model_provider
+        self.model = model.transport if isinstance(model, ModelProvider) else model
         self.model_name = model_name
         self.harness = Harness(kernel, max_turns=max_turns)
         self.conversation = self.harness.start(
             model,
             model_provider=model_provider,
         )
+        self.model_provider = self.conversation.model_session.provider
         self.busy = False
         self.model_options: list[OpenRouterModelOption] = []
         self.streamed_text = ""
@@ -1616,8 +1616,7 @@ class ToolboxApp(App[None]):
         if self.busy:
             return
         self.conversation = self.harness.start(
-            self.model,
-            model_provider=self.model_provider,
+            self.model_provider,
         )
         self.query_one("#chat", ChatFeed).clear()
         self.forwarded_targets.clear()
@@ -1695,10 +1694,14 @@ class ToolboxApp(App[None]):
 
     def _show_sessions(self) -> None:
         sessions = self.kernel.list_sessions(limit=15)["sessions"]
-        table = Table("Session", "Events", "Created", box=None, expand=True)
+        table = Table(
+            "Session", "Kind", "Parent", "Events", "Created", box=None, expand=True
+        )
         for session in sessions:
             table.add_row(
-                session["id"][:12],
+                session["id"],
+                session["kind"],
+                (session["parent_session_id"] or "—")[:12],
                 str(session["event_count"]),
                 session["created_at"][:19],
             )
@@ -1914,7 +1917,6 @@ def run_tui(kernel: Kernel, model: Model, *, model_name: str) -> None:
     """Launch the interactive terminal application."""
     ToolboxApp(
         kernel,
-        model,
+        ModelProvider(kernel, model),
         model_name=model_name,
-        model_provider=model if isinstance(model, OpenRouterModel) else None,
     ).run()
