@@ -329,11 +329,12 @@ Persist durable tool state explicitly in a suitable file or service rather than
 in module globals, and account for concurrent calls when updating shared state.
 
 Model-requested call trees run in a filtered-environment subprocess with depth,
-call-count, and time bounds. This is operational containment, not credential
-separation or a hostile-code sandbox. Authored code still has the OS access of
-the provider client, and `ctx.model_provider` intentionally grants model-spend
-authority. Run Mechagnome only in a disposable, tightly isolated environment
-with expendable credentials.
+call-count, and time bounds. Required Git configuration and SSH authentication
+variables are preserved so authored tools can use the harness's Git access.
+This is operational containment, not credential separation or a hostile-code
+sandbox. Authored code still has the OS access of the provider client, and
+`ctx.model_provider` intentionally grants model-spend authority. Run Mechagnome
+only in a disposable, tightly isolated environment with expendable credentials.
 
 ## Authoring checklist
 

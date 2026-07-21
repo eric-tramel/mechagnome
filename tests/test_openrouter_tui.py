@@ -1066,6 +1066,67 @@ def test_authored_tools_do_not_inherit_provider_credentials(
     assert result == {"key": None}
 
 
+def test_authored_tools_inherit_git_and_ssh_environment(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    names = (
+        "GIT_ASKPASS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "HOME",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "XDG_CONFIG_HOME",
+        "GIT_TOKEN",
+        "SSH_PRIVATE_KEY",
+        "UNRELATED_SECRET",
+    )
+    kernel.call(
+        "write_tool",
+        {
+            "name": "read_git_environment",
+            "description": "Report Git and SSH environment variables.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import os\n\n"
+                "def main(input, ctx):\n"
+                f"    names = {names!r}\n"
+                "    return {name: os.environ.get(name) for name in names}\n"
+            ),
+        },
+    )
+    expected = {
+        "GIT_ASKPASS": "/tmp/git-askpass",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "test-helper",
+        "HOME": "/tmp/git-home",
+        "SSH_ASKPASS": "/tmp/ssh-askpass",
+        "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        "XDG_CONFIG_HOME": "/tmp/git-config",
+    }
+    for name, value in expected.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("GIT_TOKEN", "sentinel-git-token")
+    monkeypatch.setenv("SSH_PRIVATE_KEY", "sentinel-private-key")
+    monkeypatch.setenv("UNRELATED_SECRET", "sentinel-secret")
+
+    result = IsolatedToolRunner(kernel).call(
+        "call_tool",
+        {"name": "read_git_environment", "args": {}},
+        session_id=kernel.create_session(),
+    )
+
+    assert result == {
+        **expected,
+        "GIT_TOKEN": None,
+        "SSH_PRIVATE_KEY": None,
+        "UNRELATED_SECRET": None,
+    }
+
+
 def test_isolated_model_provider_is_predictably_unavailable(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     kernel.call(

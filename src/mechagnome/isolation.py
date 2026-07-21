@@ -21,14 +21,39 @@ from mechagnome.model_provider import ModelProvider, _ModelProviderBroker
 CommittedEventSink = Callable[[dict[str, Any]], None]
 
 _SAFE_ENVIRONMENT = (
+    "GIT_ASKPASS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_TERMINAL_PROMPT",
+    "HOME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
     "PATH",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "SSH_AUTH_SOCK",
     "TERM",
     "TMPDIR",
     "TZ",
+    "XDG_CONFIG_HOME",
 )
+
+
+def _is_safe_environment_variable(name: str) -> bool:
+    """Whether a host variable is required for basic runtime or Git access."""
+    if name in _SAFE_ENVIRONMENT:
+        return True
+    for prefix in ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"):
+        if name.startswith(prefix):
+            return name.removeprefix(prefix).isdecimal()
+    return False
 
 
 class IsolatedToolRunner:
@@ -104,8 +129,8 @@ class IsolatedToolRunner:
         }
         environment = {
             key: value
-            for key in _SAFE_ENVIRONMENT
-            if (value := os.environ.get(key)) is not None
+            for key, value in os.environ.items()
+            if _is_safe_environment_variable(key)
         }
         environment["PYTHONIOENCODING"] = "utf-8"
 

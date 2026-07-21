@@ -306,12 +306,14 @@ user, an empty or explicitly mounted working directory, outbound network limits,
 and credentials scoped to the experiment. Destroy the environment after use.
 
 Authored tools are arbitrary Python. Each model-requested call tree runs in a
-fresh worker process with a small environment allowlist. Provider requests use
-a host-side broker, so the isolated worker does not receive the concrete client
-or key in its environment or launch request. This is convenient credential
-opacity, **not credential separation**. The provider client and generated code
-run as the same OS user, so on permissive systems a tool may inspect the parent
-process or its memory and recover the OpenRouter key. The proxy also
+fresh worker process with a small environment allowlist. Required Git
+configuration and SSH authentication variables are preserved so tools can use
+the harness's Git access. Provider requests use a host-side broker, so the
+isolated worker does not receive the concrete client or key in its environment
+or launch request. This is convenient credential opacity, **not credential
+separation**. The provider client and generated code run as the same OS user, so
+on permissive systems a tool may inspect the parent process or its memory and
+recover the OpenRouter key. The proxy also
 intentionally lets authored tools spend the configured provider account. Direct
 `Kernel.call(..., model_provider=...)` execution is in-process and makes no
 provider-isolation claim. Treat the experiment key as expendable and assume
