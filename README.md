@@ -59,7 +59,11 @@ those effort levels.
 TUI commands:
 
 - `Esc` stops the active model stream or tool rollout.
-- `/new` starts a fresh saved conversation without clearing tools.
+- `Ctrl+N` or `/new` opens a fresh saved conversation in a new tab without
+  clearing tools. Use `TAB` or click a session tab to switch conversations.
+- `/clear` resets the active tab with a fresh saved session. The previous
+  session remains available in durable session history.
+- `/end` closes the active session tab. Ending the final tab exits the TUI.
 - `/tools` or `Ctrl+T` opens tool management. Select a tool and immutable
   version to inspect syntax-highlighted source, its diff from the prior version,
   creation provenance, per-version call outcomes, and calling sessions. User

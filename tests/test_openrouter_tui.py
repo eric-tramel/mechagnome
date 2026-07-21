@@ -19,7 +19,15 @@ from rich.console import Console
 from rich.markup import render as render_markup
 from rich.syntax import Syntax
 from rich.text import Text
-from textual.widgets import Button, Input, OptionList, RichLog, Select, Static
+from textual.widgets import (
+    Button,
+    Input,
+    OptionList,
+    RichLog,
+    Select,
+    Static,
+    TabbedContent,
+)
 
 from mechagnome import (
     Harness,
@@ -52,7 +60,7 @@ from mechagnome.tui import (
 )
 
 
-def chat_text(app: ToolboxApp) -> str:
+def chat_text(app: ToolboxApp, chat: ChatFeed | None = None) -> str:
     """Render mounted chat entries as plain text for headless assertions."""
     output = StringIO()
     console = Console(
@@ -61,7 +69,7 @@ def chat_text(app: ToolboxApp) -> str:
         color_system=None,
         force_terminal=False,
     )
-    for entry in app.query_one("#chat", ChatFeed).children:
+    for entry in (chat or app.chat).children:
         if isinstance(entry, ToolEvent):
             console.print(
                 f"{ToolEvent.SYMBOLS[entry.kind]} {entry.tool_name}\n{entry.detail}"
@@ -1740,17 +1748,115 @@ def test_tui_preserves_model_provider_when_starting_a_new_session(
         model_name="test/model",
         model_provider=provider,
     )
-    original_session = app.conversation.session_id
-    assert app.conversation.model_provider is provider
+    original = app.active_session
+    assert original.conversation.model_provider is provider
 
     async def exercise() -> None:
         async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first draft"
             await pilot.press("ctrl+n")
             await pilot.pause()
-            assert app.conversation.session_id != original_session
+            second = app.active_session
+            assert len(app.session_tabs) == 2
+            assert second is not original
+            assert second.conversation.session_id != original.conversation.session_id
             assert app.conversation.model_provider is provider
+            assert original in app.session_tabs
+
+            prompt.value = "second draft"
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is original
+            assert prompt.value == "first draft"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is second
+            assert prompt.value == "second draft"
+
+            tabs = app.query_one("#session-tabs", TabbedContent)
+            await pilot.click(tabs.get_tab(original.pane_id))
+            await pilot.pause()
+            assert app.active_session is original
 
     asyncio.run(exercise())
+
+
+def test_clear_resets_one_tab_and_end_closes_it(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+
+    async def submit(pilot: Any, value: str) -> None:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = value
+        prompt.focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            first = app.active_session
+            await submit(pilot, "keep the first tab")
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "keep this draft too"
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            second = app.active_session
+            await submit(pilot, "clear this tab")
+
+            old_conversation = second.conversation
+            old_session_id = old_conversation.session_id
+            pane_id = second.pane_id
+            label = second.label
+            await submit(pilot, "/clear")
+
+            assert app.active_session is second
+            assert second.pane_id == pane_id
+            assert second.label == label
+            assert second.conversation.session_id != old_session_id
+            assert second.conversation.messages == []
+            with pytest.raises(RunCancelled):
+                old_conversation.send("closed")
+            assert "clear this tab" not in chat_text(app, second.chat)
+            assert kernel.read_session(old_session_id, limit=100)["events"]
+            assert len(app.session_tabs) == 2
+            assert first.conversation.messages
+            assert not second.forwarded_targets
+            assert not second.active_tool_events
+
+            replacement = second.conversation
+            await submit(pilot, "/end")
+            with pytest.raises(RunCancelled):
+                replacement.send("closed")
+            assert app.active_session is first
+            assert app.session_tabs == [first]
+            assert first.draft == "keep this draft too"
+            assert prompt.value == "keep this draft too"
+
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            third = app.active_session
+            assert third.pane_id == "session-3"
+            assert third.label == "Session 3"
+
+    asyncio.run(exercise())
+
+
+def test_end_on_final_session_exits_and_closes_conversation(tmp_path: Path) -> None:
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"), FinalModel(), model_name="test/model"
+    )
+    conversation = app.conversation
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)):
+            await app.action_end_session()
+
+    asyncio.run(exercise())
+    with pytest.raises(RunCancelled):
+        conversation.send("closed")
 
 
 class PausingStreamingModel:
@@ -1796,7 +1902,7 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
                     break
             assert app.streamed_text == "Partial"
             stream = app.query_one(".streaming-response", Static)
-            assert stream.parent is app.query_one("#chat", ChatFeed)
+            assert stream.parent is app.chat
             assert "Partial" in chat_text(app)
             model.release.set()
             await app.workers.wait_for_complete()
@@ -1818,6 +1924,64 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
         ]
     ]
     assert kinds == ["user", "model", "final"]
+
+
+def test_tabs_can_switch_during_rollout_without_misrouting_output(
+    tmp_path: Path,
+) -> None:
+    model = PausingStreamingModel()
+    app = ToolboxApp(Kernel(tmp_path / "toolbox.db"), model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            owner = app.active_session
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "stream in the first tab"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set() and owner.streamed_text:
+                    break
+
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            other = app.active_session
+            assert other is not owner
+            assert app.rollout_owner is owner
+            assert prompt.disabled is True
+            assert "Partial" in chat_text(app, owner.chat)
+            assert "Partial" not in chat_text(app, other.chat)
+            assert "Session 1 running" in str(
+                app.query_one("#status-message", Static).render()
+            )
+
+            other_conversation = other.conversation
+            await app.action_clear_session()
+            await app.action_end_session()
+            assert other.conversation is other_conversation
+            assert other in app.session_tabs
+            assert app.rollout_owner is owner
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is owner
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is other
+
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert model.cancelled.is_set()
+            assert app.rollout_owner is None
+            assert prompt.disabled is False
+            assert "stopped" in chat_text(app, owner.chat)
+            assert "Partial" not in chat_text(app, other.chat)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
 
 
 def test_tool_manager_opens_during_streaming_rollout(tmp_path: Path) -> None:
@@ -1863,9 +2027,16 @@ def test_ctrl_t_toggles_tool_manager(tmp_path: Path) -> None:
 
     async def exercise() -> None:
         async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            active = app.active_session
             await pilot.press("ctrl+t")
             await pilot.pause()
             assert isinstance(app.screen, ToolManagerScreen)
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is active
 
             await pilot.press("ctrl+t")
             await pilot.pause()
@@ -2048,6 +2219,13 @@ def test_escape_terminates_active_tool_subprocess(tmp_path: Path) -> None:
                 await asyncio.sleep(0.01)
             else:
                 raise AssertionError("slow tool never started")
+            for _ in range(30):
+                await pilot.pause()
+                if any(
+                    event.kind == "call" and event.tool_name == "slow"
+                    for event in app.query(ToolEvent)
+                ):
+                    break
             slow_call = next(
                 event
                 for event in app.query(ToolEvent)
