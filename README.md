@@ -12,7 +12,7 @@ operations:
 
 - `help`
 - `search_tools`
-- `read_tool_source`
+- `view_tool`
 - `write_tool`
 - `call_tool`
 
@@ -25,8 +25,8 @@ implementations are immutable. Tools live in named toolbox namespaces. Each
 session starts from the toolbox mapped to its working directory and can replace
 or compose its active namespaces without changing the provider-facing five-tool
 surface. Agents can also submit version-specific ratings and comments through
-`search_tools`; aggregate votes are returned with search results and adjust the
-default BM25 relevance score.
+`search_tools`; aggregate votes adjust the default BM25 relevance score, while
+search results expose only each matching tool's name and description.
 
 The fixed part is deliberately small: SQLite storage, version resolution,
 execution, event append, recursion limits, binding changes, and host rollback.
@@ -296,7 +296,7 @@ any other tool version. Privilege comes from the logical core slot being invoked
 | --- | --- |
 | `help` | none; its editable source reads bundled Markdown assets |
 | `search_tools` | enumerate active tool metadata and persist session-scoped feedback |
-| `read_tool_source` | read stored versions |
+| `view_tool` | view stored source, metadata, schemas, and feedback |
 | `write_tool` | compile, store, and bind versions |
 | `call_tool` | resolve and execute a version |
 

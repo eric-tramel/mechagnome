@@ -332,7 +332,7 @@ logical slot in which they run:
 | --- | --- |
 | `help` | none |
 | `search_tools` | `ctx.kernel.catalog(include_core=True)` and `ctx.kernel.submit_tool_feedback(...)` |
-| `read_tool_source` | `ctx.kernel.read_tool_source(name, version=None)` |
+| `view_tool` | `ctx.kernel.view_tool(name, version=None)` |
 | `write_tool` | `ctx.kernel.write_tool(...)` |
 | `call_tool` | `ctx.kernel.execute(name, args, version=None)` |
 
@@ -348,7 +348,10 @@ def main(input, ctx):
     ):
         text = f'{tool["name"]} {tool["description"]}'.lower()
         if query in text:
-            matches.append(tool)
+            matches.append({
+                "name": tool["name"],
+                "description": tool["description"],
+            })
     return {"items": matches}
 ```
 
@@ -356,10 +359,11 @@ The search slot can also persist one rating and optional comment per session and
 tool version with `ctx.kernel.submit_tool_feedback(name, rating=-1,
 comment="reason", version=None)`. Repeated feedback from the same session
 replaces its earlier entry. The default search implementation exposes aggregate
-counts in each catalog item and uses smoothed upvotes and downvotes to adjust
-BM25 relevance. `read_tool_source` returns the aggregate plus the ten most
-recent comments for the selected version. New tool versions begin with no
-inherited feedback.
+counts internally and uses smoothed upvotes and downvotes to adjust BM25
+relevance. Search results contain only tool names and descriptions. `view_tool`
+returns the source, schema, metadata, aggregate feedback, and the ten most recent
+comments for the selected version. New tool versions begin with no inherited
+feedback.
 
 Copying this source into an ordinary tool does not grant catalog access, and a
 core slot cannot use another slot's capability. Privilege follows the active

@@ -255,7 +255,7 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert list(tools) == [
         "help",
         "search_tools",
-        "read_tool_source",
+        "view_tool",
         "write_tool",
         "call_tool",
     ]
@@ -2463,7 +2463,7 @@ class SingleToolModel:
 
 
 def replace_call_tool(kernel: Kernel, source: str) -> None:
-    current = kernel.read_tool_source("call_tool")
+    current = kernel.view_tool("call_tool")
     kernel.write_tool(
         name="call_tool",
         description="Test dispatcher replacement.",

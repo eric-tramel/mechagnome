@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
@@ -214,10 +214,10 @@ class _KernelCapability:
             scope=self._context._state.scope,
         )
 
-    def read_tool_source(self, name: str, version: int | None = None) -> dict[str, Any]:
-        """Read source through the read capability."""
-        self._require("read_tool_source")
-        return self._context._kernel.read_tool_source(
+    def view_tool(self, name: str, version: int | None = None) -> dict[str, Any]:
+        """View a tool through the inspection capability."""
+        self._require("view_tool")
+        return self._context._kernel.view_tool(
             name, version=version, scope=self._context._state.scope
         )
 
@@ -333,6 +333,9 @@ class Kernel:
                         version = 3
                     if version == 3:
                         self._migrate_v3(connection)
+                        version = 4
+                    if version == 4:
+                        self._migrate_v4(connection)
                     elif version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -389,6 +392,51 @@ class Kernel:
         if "origin_call_id" not in columns:
             connection.execute("ALTER TABLE sessions ADD COLUMN origin_call_id TEXT")
         Kernel._create_session_indexes_and_triggers(connection)
+
+    @staticmethod
+    def _migrate_v4(connection: sqlite3.Connection) -> None:
+        """Rename the tool-inspection core slot while preserving its versions."""
+        toolbox_rows = connection.execute("SELECT id FROM toolboxes").fetchall()
+        for toolbox_row in toolbox_rows:
+            toolbox_id = str(toolbox_row["id"])
+            old = connection.execute(
+                "SELECT id FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+                (toolbox_id, "read_tool_source"),
+            ).fetchone()
+            if old is None:
+                continue
+            existing = connection.execute(
+                "SELECT id FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+                (toolbox_id, "view_tool"),
+            ).fetchone()
+            if existing is not None:
+                suffix = 1
+                legacy_name = "view_tool_legacy"
+                while (
+                    connection.execute(
+                        "SELECT 1 FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+                        (toolbox_id, legacy_name),
+                    ).fetchone()
+                    is not None
+                ):
+                    suffix += 1
+                    legacy_name = f"view_tool_legacy_{suffix}"
+                connection.execute(
+                    "UPDATE tool_lineages SET name = ? WHERE id = ?",
+                    (legacy_name, int(existing["id"])),
+                )
+                connection.execute(
+                    "UPDATE bindings SET name = ? WHERE toolbox_id = ? AND name = ?",
+                    (legacy_name, toolbox_id, "view_tool"),
+                )
+            connection.execute(
+                "UPDATE tool_lineages SET name = ? WHERE id = ?",
+                ("view_tool", int(old["id"])),
+            )
+            connection.execute(
+                "UPDATE bindings SET name = ? WHERE toolbox_id = ? AND name = ?",
+                ("view_tool", toolbox_id, "read_tool_source"),
+            )
 
     @staticmethod
     def _create_session_indexes_and_triggers(
@@ -1480,7 +1528,7 @@ class Kernel:
                     rows.append(row)
         return sorted(rows, key=lambda row: str(row["name"]))
 
-    def read_tool_source(
+    def view_tool(
         self,
         name: str,
         *,
@@ -1489,7 +1537,7 @@ class Kernel:
         scope: InvocationScope | None = None,
         toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Read source for an effective or explicitly scoped tool lineage."""
+        """View an effective or explicitly scoped tool lineage in detail."""
         active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
             toolbox_id = self._toolbox_id(connection, toolbox) if toolbox else None

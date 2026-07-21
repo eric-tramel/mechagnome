@@ -68,7 +68,7 @@ SEARCH_SCHEMA = {
     "additionalProperties": False,
 }
 
-READ_SCHEMA = {
+VIEW_SCHEMA = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
@@ -234,7 +234,10 @@ SEARCH_SOURCE = dedent(
             items = sorted(tools, key=lambda tool: tool["name"])
             next_cursor = cursor + limit if cursor + limit < len(items) else None
             result = {
-                "items": items[cursor:cursor + limit],
+                "items": [
+                    {"name": tool["name"], "description": tool["description"]}
+                    for tool in items[cursor:cursor + limit]
+                ],
                 "next_cursor": next_cursor,
                 "total": len(items),
             }
@@ -260,7 +263,10 @@ SEARCH_SOURCE = dedent(
         items = [tool for *_, tool in ranked]
         next_cursor = cursor + limit if cursor + limit < len(items) else None
         result = {
-            "items": items[cursor:cursor + limit],
+            "items": [
+                {"name": tool["name"], "description": tool["description"]}
+                for tool in items[cursor:cursor + limit]
+            ],
             "next_cursor": next_cursor,
             "total": len(items),
         }
@@ -270,12 +276,12 @@ SEARCH_SOURCE = dedent(
     '''
 )
 
-READ_SOURCE = dedent(
+VIEW_SOURCE = dedent(
     '''\
-    """Read the exact stored source and metadata for a tool version."""
+    """View the exact stored source and metadata for a tool version."""
 
     def main(input, ctx):
-        return ctx.kernel.read_tool_source(
+        return ctx.kernel.view_tool(
             input["name"], version=input.get("version")
         )
     '''
@@ -317,15 +323,15 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "search_tools",
-        "Search active tools and record version-specific ratings and feedback.",
+        "Search active tools, returning names and descriptions, and record feedback.",
         SEARCH_SCHEMA,
         SEARCH_SOURCE,
     ),
     BootstrapTool(
-        "read_tool_source",
-        "Read the source and metadata of an active or historical tool version.",
-        READ_SCHEMA,
-        READ_SOURCE,
+        "view_tool",
+        "View source, metadata, schema, and feedback for a tool version.",
+        VIEW_SCHEMA,
+        VIEW_SOURCE,
     ),
     BootstrapTool(
         "write_tool",

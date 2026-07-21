@@ -92,14 +92,14 @@ def test_reopen_refreshes_code_shipped_core_version_one(tmp_path: Path) -> None:
     reopened = kernel_at(tmp_path)
 
     assert reopened.call("help", {}).startswith("# Mechagnome help\n")
-    refreshed = reopened.read_tool_source("help", version=1)
+    refreshed = reopened.view_tool("help", version=1)
     assert refreshed["description"] == (
         "Read progressive documentation for using and extending the toolbox."
     )
     assert refreshed["input_schema"] == CORE_SCHEMAS["help"]
     assert refreshed["source"] == HELP_SOURCE
     assert (
-        reopened.read_tool_source("help", version=1, toolbox="secondary")["source"]
+        reopened.view_tool("help", version=1, toolbox="secondary")["source"]
         == HELP_SOURCE
     )
 
@@ -177,7 +177,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "ctx.model_provider.run_agent(",
         "ctx.kernel.catalog(include_core=True)",
         "ctx.kernel.submit_tool_feedback(...)",
-        "ctx.kernel.read_tool_source(name, version=None)",
+        "ctx.kernel.view_tool(name, version=None)",
         "ctx.kernel.write_tool(...)",
         "ctx.kernel.execute(name, args, version=None)",
     ):
@@ -215,7 +215,7 @@ def test_help_lists_topics_for_an_unknown_document(tmp_path: Path) -> None:
     assert result["topics"][0] == "toc"
 
 
-def test_write_immediately_search_read_and_call(tmp_path: Path) -> None:
+def test_write_immediately_search_view_and_call(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     source = "def main(input, ctx):\n    return {'echo': input['value']}\n"
 
@@ -235,9 +235,9 @@ def test_write_immediately_search_read_and_call(tmp_path: Path) -> None:
     assert call_tool(kernel, "echo", {"value": "hello"}) == {"echo": "hello"}
     search = kernel.call("search_tools", {"query": "echo"})
     assert search["items"][0]["name"] == "echo"
-    read = kernel.call("read_tool_source", {"name": "echo"})
-    assert read["source"] == source
-    assert read["active"] is True
+    viewed = kernel.call("view_tool", {"name": "echo"})
+    assert viewed["source"] == source
+    assert viewed["active"] is True
 
 
 def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None:
@@ -295,6 +295,10 @@ def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None
     assert acronym["items"][0]["name"] == "HTTPClient"
     assert description["items"][0]["name"] == "weatherForecast"
     assert unicode_description["items"][0]["name"] == "notify_user"
+    assert partial["items"][0] == {
+        "name": "send_email",
+        "description": "Deliver an electronic message.",
+    }
 
 
 def test_search_weights_names_above_other_fields(tmp_path: Path) -> None:
@@ -364,6 +368,7 @@ def test_search_exact_name_priority_filtering_and_pagination(tmp_path: Path) -> 
         {"query": "   ", "include_core": False, "limit": 1},
     )
     assert [item["name"] for item in empty["items"]] == ["haystack"]
+    assert set(empty["items"][0]) == {"name", "description"}
     assert empty["total"] == 2
     assert empty["next_cursor"] == 1
 
@@ -383,12 +388,7 @@ def test_feedback_is_persistent_session_scoped_and_changes_search_ranking(
         "alpha_candidate",
         "beta_candidate",
     ]
-    assert before["items"][0]["feedback"] == {
-        "score": 0,
-        "upvotes": 0,
-        "downvotes": 0,
-        "comments": 0,
-    }
+    assert set(before["items"][0]) == {"name", "description"}
 
     first = kernel.call(
         "search_tools",
@@ -445,12 +445,7 @@ def test_feedback_is_persistent_session_scoped_and_changes_search_ranking(
         "beta_candidate",
         "alpha_candidate",
     ]
-    assert after["items"][1]["feedback"] == {
-        "score": -1,
-        "upvotes": 1,
-        "downvotes": 2,
-        "comments": 0,
-    }
+    assert set(after["items"][1]) == {"name", "description"}
 
 
 def test_feedback_is_version_specific_and_validated(tmp_path: Path) -> None:
@@ -473,11 +468,11 @@ def test_feedback_is_version_specific_and_validated(tmp_path: Path) -> None:
     assert old["version"] == 1
     assert old["aggregate"]["downvotes"] == 1
     assert old["aggregate"]["comments"] == 1
-    read_old = kernel.read_tool_source("rated", version=1)
-    assert read_old["feedback"]["recent_comments"][0]["comment"] == (
+    viewed_old = kernel.view_tool("rated", version=1)
+    assert viewed_old["feedback"]["recent_comments"][0]["comment"] == (
         "Version one note."
     )
-    assert read_old["feedback"]["recent_comments"][0]["rating"] == 0
+    assert viewed_old["feedback"]["recent_comments"][0]["rating"] == 0
 
     with pytest.raises(ToolboxError) as error:
         kernel.submit_tool_feedback("rated", rating=2)
@@ -499,7 +494,7 @@ def test_schema_two_database_migrates_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 4
+    assert version == 5
     assert table is not None
 
 
@@ -549,7 +544,6 @@ def test_schema_three_database_migrates_real_pre_lineage_sessions(
     assert {"parent_session_id", "kind", "origin_call_id"} <= columns
     assert index is not None
     assert trigger is not None
-
     with (
         closing(reopened._connect()) as connection,
         pytest.raises(sqlite3.IntegrityError, match="session lineage is immutable"),
@@ -560,6 +554,38 @@ def test_schema_three_database_migrates_real_pre_lineage_sessions(
 
     reopened_again = kernel_at(tmp_path)
     assert reopened_again.session_metadata(root) == metadata
+
+
+def test_schema_four_database_renames_view_core_slot(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    replacement_source = "def main(input, ctx):\n    return {'custom': True}\n"
+    write(
+        kernel,
+        "view_tool",
+        replacement_source,
+        input_schema=CORE_SCHEMAS["view_tool"],
+        base_version=1,
+    )
+    with closing(kernel._connect()) as connection, connection:
+        toolbox_id = connection.execute("SELECT id FROM toolboxes").fetchone()["id"]
+        connection.execute(
+            "UPDATE tool_lineages SET name = 'read_tool_source' "
+            "WHERE toolbox_id = ? AND name = 'view_tool'",
+            (toolbox_id,),
+        )
+        connection.execute(
+            "UPDATE bindings SET name = 'read_tool_source' "
+            "WHERE toolbox_id = ? AND name = 'view_tool'",
+            (toolbox_id,),
+        )
+        connection.execute("PRAGMA user_version = 4")
+
+    reopened = kernel_at(tmp_path)
+
+    assert "read_tool_source" not in {item["name"] for item in reopened.bindings()}
+    current = reopened.view_tool("view_tool")
+    assert current["version"] == 2
+    assert current["source"] == replacement_source
 
 
 def test_versions_exact_calls_and_stale_base(tmp_path: Path) -> None:
@@ -1055,11 +1081,11 @@ def test_model_provider_is_predictably_unavailable_for_direct_calls(
     assert error.value.code == "model_provider_unavailable"
 
 
-def test_all_core_source_is_readable_and_schema_is_pinned(tmp_path: Path) -> None:
+def test_all_core_details_are_viewable_and_schema_is_pinned(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
 
     for name in CORE_NAMES:
-        result = kernel.call("read_tool_source", {"name": name})
+        result = kernel.call("view_tool", {"name": name})
         assert result["source"].startswith('"""')
         assert result["input_schema"] == CORE_SCHEMAS[name]
 
@@ -1485,7 +1511,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 5
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -1668,7 +1694,7 @@ def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
     Harness(kernel_at(tmp_path)).run(model, "Rewrite search.")
 
     assert model.search_descriptions == [
-        "Search active tools and record version-specific ratings and feedback.",
+        "Search active tools, returning names and descriptions, and record feedback.",
         "Live rewritten search.",
     ]
 
