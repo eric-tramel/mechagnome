@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.markup import render as render_markup
 from rich.syntax import Syntax
 from rich.text import Text
-from textual.widgets import Button, Input, RichLog, Select, Static
+from textual.widgets import Button, Input, OptionList, RichLog, Select, Static
 
 from mechagnome import (
     Harness,
@@ -38,6 +38,7 @@ from mechagnome.openrouter import (
     DEFAULT_MODEL,
     OpenRouterError,
     OpenRouterModel,
+    OpenRouterModelOption,
 )
 from mechagnome.tui import (
     ChatFeed,
@@ -1627,6 +1628,57 @@ def test_tui_clicks_to_change_model_and_reasoning_effort(tmp_path: Path) -> None
             assert model.model == "custom/unknown"
             assert model.reasoning_effort is None
             assert reasoning.display is False
+
+    asyncio.run(exercise())
+
+
+def test_model_selector_sorts_and_filters_catalog_options(tmp_path: Path) -> None:
+    options = [
+        OpenRouterModelOption(id="zeta/first", name="Zeta"),
+        OpenRouterModelOption(id="alpha/second", name="Alpha Two"),
+        OpenRouterModelOption(id="alpha/first", name="Alpha One"),
+    ]
+    app = ToolboxApp(
+        kernel=Kernel(tmp_path / "toolbox.db"),
+        model=FinalModel(),
+        model_name="current/model",
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.push_screen(ModelSelectionScreen("current/model", options))
+            await pilot.pause()
+            picker = app.screen.query_one("#model-picker", Select)
+            option_list = picker.query_one(OptionList)
+
+            assert [
+                str(option.prompt)
+                for option in option_list.options
+                if "  ·  " in str(option.prompt)
+            ] == [
+                "Alpha One  ·  alpha/first",
+                "Alpha Two  ·  alpha/second",
+                "Zeta  ·  zeta/first",
+            ]
+
+            app.screen.query_one("#model-name", Input).value = "TWO"
+            await pilot.pause()
+            assert [
+                str(option.prompt)
+                for option in option_list.options
+                if "  ·  " in str(option.prompt)
+            ] == ["Alpha Two  ·  alpha/second"]
+
+            app.screen.query_one("#model-name", Input).value = "alpha/"
+            await pilot.pause()
+            assert [
+                str(option.prompt)
+                for option in option_list.options
+                if "  ·  " in str(option.prompt)
+            ] == [
+                "Alpha One  ·  alpha/first",
+                "Alpha Two  ·  alpha/second",
+            ]
 
     asyncio.run(exercise())
 
