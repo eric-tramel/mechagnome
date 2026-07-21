@@ -113,6 +113,7 @@ class ToolContext:
         self._call_id = call_id
         self._depth = depth
         self._logical_slot = logical_slot
+        self.caller_session_id = state.session_id
         self.sessions = SessionAccess(kernel, state.session_id)
 
     @property

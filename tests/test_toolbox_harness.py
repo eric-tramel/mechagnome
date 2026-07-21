@@ -232,6 +232,8 @@ def test_tool_management_history_usage_provenance_and_deletion(
 def test_tools_compose_and_read_the_live_session(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     session_id = kernel.create_session()
+    session_help = kernel.call("help", {"topic": "sessions"})
+    assert "ctx.caller_session_id" in session_help
     write(kernel, "add", "def main(input, ctx):\n    return input['a'] + input['b']\n")
     write(
         kernel,
@@ -245,7 +247,8 @@ def test_tools_compose_and_read_the_live_session(tmp_path: Path) -> None:
         "def main(input, ctx):\n"
         "    events = ctx.sessions.current(limit=100)['events']\n"
         "    return {\n"
-        "        'session_id': ctx.sessions.id,\n"
+        "        'session_id': ctx.caller_session_id,\n"
+        "        'session_access_id': ctx.sessions.id,\n"
         "        'saw_start': any(e['kind'] == 'call_started' and "
         "e['tool_name'] == 'recall' for e in events),\n"
         "    }\n",
@@ -253,7 +256,11 @@ def test_tools_compose_and_read_the_live_session(tmp_path: Path) -> None:
 
     assert call_tool(kernel, "double", {"x": 9}, session_id=session_id) == 18
     recall = call_tool(kernel, "recall", {}, session_id=session_id)
-    assert recall == {"session_id": session_id, "saw_start": True}
+    assert recall == {
+        "session_id": session_id,
+        "session_access_id": session_id,
+        "saw_start": True,
+    }
 
     events = kernel.read_session(session_id, limit=100)["events"]
     add_starts = [

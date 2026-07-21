@@ -122,10 +122,16 @@ Tools can read durable sessions:
 
 ```python
 def main(input, ctx):
+    caller_session_id = ctx.caller_session_id
     current = ctx.sessions.current(after=0, limit=50)
     previous = ctx.sessions.list(limit=20, cursor=0)
     older = ctx.sessions.read(input["session_id"], after=0, limit=50)
-    return {"current": current, "previous": previous, "older": older}
+    return {
+        "caller_session_id": caller_session_id,
+        "current": current,
+        "previous": previous,
+        "older": older,
+    }
 ```
 
 A `call_started` event is committed before the source runs, so a tool reading
