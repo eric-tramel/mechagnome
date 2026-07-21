@@ -4,7 +4,7 @@ The five base operations are ordinary readable tool versions:
 
 - `help`
 - `search_tools`
-- `read_tool_source`
+- `view_tool`
 - `write_tool`
 - `call_tool`
 

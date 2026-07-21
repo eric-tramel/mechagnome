@@ -107,9 +107,7 @@ def demo(kernel: Kernel) -> dict[str, Any]:
     )
     recalled = _call(kernel, "call_tool", {"name": "recall", "args": {}}, session_id)
 
-    search_source = _call(
-        kernel, "read_tool_source", {"name": "search_tools"}, session_id
-    )
+    search_source = _call(kernel, "view_tool", {"name": "search_tools"}, session_id)
     previous_search_version = search_source["version"]
     _call(
         kernel,
