@@ -238,6 +238,134 @@ def test_write_immediately_search_read_and_call(tmp_path: Path) -> None:
     assert read["active"] is True
 
 
+def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "send_email",
+        "def main(input, ctx):\n    return input['recipient_address']\n",
+        description="Deliver an electronic message.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "recipient_address": {"type": "string"},
+                "subject": {"type": "string"},
+            },
+        },
+    )
+    write(
+        kernel,
+        "weatherForecast",
+        "def main(input, ctx):\n    return 'sunny'\n",
+        description="Look up atmospheric conditions.",
+    )
+    write(
+        kernel,
+        "archive",
+        "def main(input, ctx):\n    return 'delivery_manifest'\n",
+        description="Store a record for later.",
+    )
+    write(
+        kernel,
+        "HTTPClient",
+        "def main(input, ctx):\n    return None\n",
+        description="Make a remote request.",
+    )
+    write(
+        kernel,
+        "notify_user",
+        "def main(input, ctx):\n    return None\n",
+        description="Отправить сообщение получателю.",
+    )
+
+    partial = kernel.call("search_tools", {"query": "send urgent email"})
+    schema = kernel.call("search_tools", {"query": "recipient address"})
+    camel_case = kernel.call("search_tools", {"query": "weather forecast"})
+    source = kernel.call("search_tools", {"query": "delivery manifest"})
+    acronym = kernel.call("search_tools", {"query": "http client"})
+    description = kernel.call("search_tools", {"query": "atmospheric conditions"})
+    unicode_description = kernel.call("search_tools", {"query": "сообщение"})
+
+    assert partial["items"][0]["name"] == "send_email"
+    assert schema["items"][0]["name"] == "send_email"
+    assert camel_case["items"][0]["name"] == "weatherForecast"
+    assert source["items"][0]["name"] == "archive"
+    assert acronym["items"][0]["name"] == "HTTPClient"
+    assert description["items"][0]["name"] == "weatherForecast"
+    assert unicode_description["items"][0]["name"] == "notify_user"
+
+
+def test_search_weights_names_above_other_fields(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(kernel, "rankingmarker_tool", "def main(input, ctx):\n    return None\n")
+    write(
+        kernel,
+        "description_candidate",
+        "def main(input, ctx):\n    return None\n",
+        description="rankingmarker",
+    )
+    write(
+        kernel,
+        "schema_candidate",
+        "def main(input, ctx):\n    return None\n",
+        input_schema={
+            "type": "object",
+            "properties": {"rankingmarker": {"type": "string"}},
+        },
+    )
+    write(
+        kernel,
+        "source_candidate",
+        "def main(input, ctx):\n    return 'rankingmarker'\n",
+    )
+
+    result = kernel.call(
+        "search_tools", {"query": "rankingmarker", "include_core": False}
+    )
+
+    assert [item["name"] for item in result["items"]] == [
+        "rankingmarker_tool",
+        "description_candidate",
+        "schema_candidate",
+        "source_candidate",
+    ]
+
+
+def test_search_exact_name_priority_filtering_and_pagination(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    common_source = "def main(input, ctx):\n    return 'needle needle needle'\n"
+    write(kernel, "needle", "def main(input, ctx):\n    return None\n")
+    write(kernel, "haystack", common_source)
+
+    exact = kernel.call(
+        "search_tools",
+        {"query": "needle", "include_core": False, "limit": 1},
+    )
+    second = kernel.call(
+        "search_tools",
+        {
+            "query": "needle",
+            "include_core": False,
+            "limit": 1,
+            "cursor": exact["next_cursor"],
+        },
+    )
+
+    assert exact["items"][0]["name"] == "needle"
+    assert exact["total"] == 2
+    assert exact["next_cursor"] == 1
+    assert second["items"][0]["name"] == "haystack"
+    assert second["next_cursor"] is None
+
+    empty = kernel.call(
+        "search_tools",
+        {"query": "   ", "include_core": False, "limit": 1},
+    )
+    assert [item["name"] for item in empty["items"]] == ["haystack"]
+    assert empty["total"] == 2
+    assert empty["next_cursor"] == 1
+
+
 def test_versions_exact_calls_and_stale_base(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     version_one = "def main(input, ctx):\n    return 1\n"
