@@ -72,8 +72,18 @@ class ToolEvent(Collapsible):
 class ChatFeed(VerticalScroll):
     """Scrollable chat entries with interactive tool events."""
 
-    def write(self, renderable: Any) -> None:
-        self.mount(Static(renderable, classes="chat-entry"))
+    def write(self, renderable: Any, *, classes: str = "") -> Static:
+        entry_classes = "chat-entry"
+        if classes:
+            entry_classes += f" {classes}"
+        entry = Static(renderable, classes=entry_classes)
+        self.mount(entry)
+        self.call_after_refresh(self.scroll_end, animate=False)
+        return entry
+
+    def update_entry(self, entry: Static, renderable: Any) -> None:
+        """Update a mounted chat entry and keep its latest content visible."""
+        entry.update(renderable)
         self.call_after_refresh(self.scroll_end, animate=False)
 
     def write_tool(self, kind: str, tool_name: str, detail: str) -> ToolEvent:
@@ -1072,15 +1082,6 @@ class ToolboxApp(App[None]):
         color: #c084fc;
     }
 
-    #stream {
-        display: none;
-        height: auto;
-        max-height: 9;
-        padding: 0 1;
-        border: round #a855f7;
-        background: #0d131b;
-    }
-
     #prompt {
         height: 3;
         border: round #516b85;
@@ -1120,6 +1121,7 @@ class ToolboxApp(App[None]):
         self.streamed_text = ""
         self.pending_stream_text: list[str] = []
         self.stream_timer: Timer | None = None
+        self.stream_entry: Static | None = None
         self.forwarded_targets: dict[str, str] = {}
         self.forwarded_events: dict[str, ToolEvent] = {}
         self.forwarded_children: dict[str, str] = {}
@@ -1133,7 +1135,6 @@ class ToolboxApp(App[None]):
                 yield Static(id="model-info")
                 yield Static("TOOLBOX", classes="sidebar-title")
                 yield RichLog(id="tools", wrap=True, markup=False, min_width=1)
-        yield Static(id="stream")
         with Horizontal(id="status"):
             yield Static(id="status-message")
             yield Static("·", classes="status-separator")
@@ -1294,22 +1295,14 @@ class ToolboxApp(App[None]):
             return
         if event.kind == "model_delta":
             self.streamed_text += str(event.payload.get("text") or "")
-            stream = self.query_one("#stream", Static)
-            stream.display = True
-            stream.update(Markdown(self.streamed_text))
+            self._render_stream()
             self._set_status("streaming…")
         elif event.kind == "model":
             content = str(event.payload.get("text") or "")
             if content:
-                self.query_one("#chat", ChatFeed).write(
-                    Panel(
-                        Markdown(content),
-                        title=self._active_model_name,
-                        title_align="left",
-                        border_style="bright_magenta",
-                    )
-                )
-            self._clear_stream()
+                self._finish_stream(content)
+            else:
+                self._clear_stream()
             self._set_status("planning" if event.payload.get("calls") else "answering")
         elif event.kind == "call_started":
             name = str(event.tool_name or "tool")
@@ -1359,16 +1352,8 @@ class ToolboxApp(App[None]):
             self._write_error(str(event.payload.get("message") or event.payload))
         elif event.kind == "cancelled":
             partial = self.streamed_text + "".join(self.pending_stream_text)
-            self._clear_stream()
             content = partial or str(event.payload.get("message") or "Rollout stopped.")
-            self.query_one("#chat", ChatFeed).write(
-                Panel(
-                    Markdown(content),
-                    title=f"{self._active_model_name} · stopped",
-                    title_align="left",
-                    border_style="yellow",
-                )
-            )
+            self._finish_stream(content, stopped=True)
             self._set_status("stopped")
 
     def _queue_stream_delta(self, text: str) -> None:
@@ -1384,20 +1369,59 @@ class ToolboxApp(App[None]):
             return
         self.streamed_text += "".join(self.pending_stream_text)
         self.pending_stream_text.clear()
-        stream = self.query_one("#stream", Static)
-        stream.display = True
-        stream.update(Markdown(self.streamed_text))
+        self._render_stream()
         self._set_status("streaming…")
 
+    def _render_stream(self) -> None:
+        panel = self._model_panel(self.streamed_text)
+        chat = self.query_one("#chat", ChatFeed)
+        if self.stream_entry is None:
+            self.stream_entry = chat.write(panel, classes="streaming-response")
+        else:
+            chat.update_entry(self.stream_entry, panel)
+
+    def _finish_stream(self, content: str, *, stopped: bool = False) -> None:
+        self._reset_stream_state()
+        title = self._active_model_name
+        border_style = "bright_magenta"
+        if stopped:
+            title += " · stopped"
+            border_style = "yellow"
+        panel = self._model_panel(content, title=title, border_style=border_style)
+        chat = self.query_one("#chat", ChatFeed)
+        if self.stream_entry is None:
+            chat.write(panel)
+        else:
+            chat.update_entry(self.stream_entry, panel)
+            self.stream_entry.remove_class("streaming-response")
+            self.stream_entry = None
+
     def _clear_stream(self) -> None:
+        self._reset_stream_state()
+        if self.stream_entry is not None:
+            self.stream_entry.remove()
+            self.stream_entry = None
+
+    def _reset_stream_state(self) -> None:
         if self.stream_timer is not None:
             self.stream_timer.stop()
             self.stream_timer = None
         self.pending_stream_text.clear()
         self.streamed_text = ""
-        stream = self.query_one("#stream", Static)
-        stream.update("")
-        stream.display = False
+
+    def _model_panel(
+        self,
+        content: str,
+        *,
+        title: str | None = None,
+        border_style: str = "bright_magenta",
+    ) -> Panel:
+        return Panel(
+            Markdown(content),
+            title=title or self._active_model_name,
+            title_align="left",
+            border_style=border_style,
+        )
 
     def _command(self, prompt: str) -> bool:
         try:
