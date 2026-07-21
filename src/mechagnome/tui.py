@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import shlex
+from dataclasses import dataclass, field
 from typing import Any
 
 from rich.markdown import Markdown
@@ -33,7 +34,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from mechagnome.harness import AgentEvent, Harness, Model, RunCancelled
+from mechagnome.harness import AgentEvent, Conversation, Harness, Model, RunCancelled
 from mechagnome.kernel import Kernel
 from mechagnome.model_provider import ModelProvider
 from mechagnome.openrouter import (
@@ -155,6 +156,26 @@ class ChatFeed(VerticalScroll):
 
     def clear(self) -> None:
         self.remove_children()
+
+
+@dataclass
+class SessionTab:
+    """UI and conversation state owned by one session tab."""
+
+    conversation: Conversation
+    pane_id: str
+    label: str
+    chat: ChatFeed
+    draft: str = ""
+    status: str = "ready"
+    streamed_text: str = ""
+    pending_stream_text: list[str] = field(default_factory=list)
+    stream_timer: Timer | None = None
+    stream_entry: Static | None = None
+    forwarded_targets: dict[str, str] = field(default_factory=dict)
+    forwarded_events: dict[str, ToolEvent] = field(default_factory=dict)
+    forwarded_children: dict[str, str] = field(default_factory=dict)
+    active_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
 
 
 class DeleteToolScreen(ModalScreen[bool]):
@@ -1019,6 +1040,7 @@ class ToolboxApp(App[None]):
         Binding("escape", "stop_rollout", "Stop", priority=True),
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+n", "new_session", "New session"),
+        Binding("tab", "next_session", "Next session", show=False, priority=True),
         ("ctrl+t", "manage_tools", "Manage tools"),
         ("f1", "show_help", "Help"),
     ]
@@ -1038,8 +1060,23 @@ class ToolboxApp(App[None]):
         height: 1fr;
     }
 
-    #chat {
+    #session-tabs {
         width: 1fr;
+        height: 1fr;
+    }
+
+    #session-tabs > ContentTabs {
+        background: #111923;
+    }
+
+    #session-tabs TabPane {
+        height: 1fr;
+        padding: 0;
+    }
+
+    .session-chat {
+        width: 1fr;
+        height: 1fr;
         border: round #34465a;
         padding: 0 1;
         background: #0d131b;
@@ -1198,25 +1235,58 @@ class ToolboxApp(App[None]):
         self.model_provider = model_provider
         self.model_name = model_name
         self.harness = Harness(kernel, max_turns=max_turns)
-        self.conversation = self.harness.start(
-            model,
-            model_provider=model_provider,
-        )
-        self.busy = False
+        self._tab_counter = 0
+        initial = self._make_session_tab()
+        self.session_tabs = [initial]
+        self._active_pane_id = initial.pane_id
+        self.rollout_owner: SessionTab | None = None
         self.model_options: list[OpenRouterModelOption] = []
-        self.streamed_text = ""
-        self.pending_stream_text: list[str] = []
-        self.stream_timer: Timer | None = None
-        self.stream_entry: Static | None = None
-        self.forwarded_targets: dict[str, str] = {}
-        self.forwarded_events: dict[str, ToolEvent] = {}
-        self.forwarded_children: dict[str, str] = {}
-        self.active_tool_events: dict[str, ToolEvent] = {}
+
+    def _make_session_tab(self) -> SessionTab:
+        self._tab_counter += 1
+        number = self._tab_counter
+        return SessionTab(
+            conversation=self.harness.start(
+                self.model,
+                model_provider=self.model_provider,
+            ),
+            pane_id=f"session-{number}",
+            label=f"Session {number}",
+            chat=ChatFeed(id=f"chat-{number}", classes="session-chat"),
+        )
+
+    @property
+    def active_session(self) -> SessionTab:
+        return next(
+            state
+            for state in self.session_tabs
+            if state.pane_id == self._active_pane_id
+        )
+
+    @property
+    def conversation(self) -> Conversation:
+        """The active conversation, retained as the synchronous command surface."""
+        return self.active_session.conversation
+
+    @property
+    def chat(self) -> ChatFeed:
+        return self.active_session.chat
+
+    @property
+    def busy(self) -> bool:
+        return self.rollout_owner is not None
+
+    @property
+    def streamed_text(self) -> str:
+        return self.active_session.streamed_text
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="workspace"):
-            yield ChatFeed(id="chat")
+            initial = self.active_session
+            with TabbedContent(id="session-tabs", initial=initial.pane_id):
+                with TabPane(initial.label, id=initial.pane_id):
+                    yield initial.chat
             with Vertical(id="sidebar"):
                 yield Static("MODEL", classes="sidebar-title")
                 yield Static(id="model-info")
@@ -1249,13 +1319,39 @@ class ToolboxApp(App[None]):
         self._show_welcome()
         self._refresh_sidebar()
         self._refresh_model_controls()
-        self._set_busy(False)
+        self._refresh_active_controls()
         self.query_one("#prompt", Input).focus()
         self.load_model_options()
 
     def on_unmount(self, event: Unmount) -> None:
         """Release a synchronous rollout before asyncio joins worker threads."""
-        self.conversation.close()
+        for state in self.session_tabs:
+            state.conversation.close()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Leave TAB available for focus traversal on pushed screens."""
+        if action == "next_session" and len(self.screen_stack) != 1:
+            return False
+        return super().check_action(action, parameters)
+
+    @on(TabbedContent.TabActivated, "#session-tabs")
+    def activate_session_tab(self, event: TabbedContent.TabActivated) -> None:
+        """Restore session-local controls when a tab is clicked or selected."""
+        pane_id = event.pane.id
+        if pane_id is None or not any(
+            state.pane_id == pane_id for state in self.session_tabs
+        ):
+            return
+        if self.is_mounted and pane_id != self._active_pane_id:
+            self.active_session.draft = self.query_one("#prompt", Input).value
+        self._active_pane_id = pane_id
+        if self.is_mounted:
+            self._refresh_active_controls()
+
+    @on(Input.Changed, "#prompt")
+    def save_session_draft(self, event: Input.Changed) -> None:
+        """Keep unsent input attached to the active session."""
+        self.active_session.draft = event.value
 
     @work(thread=True, exclusive=True, group="model-catalog", exit_on_error=False)
     def load_model_options(self) -> None:
@@ -1333,20 +1429,23 @@ class ToolboxApp(App[None]):
         self._set_status(f"reasoning → {selection}")
 
     @on(Input.Submitted, "#prompt")
-    def submit_prompt(self, event: Input.Submitted) -> None:
+    async def submit_prompt(self, event: Input.Submitted) -> None:
         """Handle a slash command or send one message to the agent worker."""
         prompt = event.value.strip()
         if not prompt or self.busy:
             return
-        event.input.value = ""
-        if prompt.startswith("/") and self._command(prompt):
+        state = self.active_session
+        state.draft = ""
+        with self.prevent(Input.Changed):
+            event.input.value = ""
+        if prompt.startswith("/") and await self._command(prompt):
             return
-        self._write_user(prompt)
-        self._set_busy(True)
-        self.run_agent(prompt)
+        self._write_user(prompt, state)
+        self._start_rollout(state)
+        self.run_agent(prompt, state)
 
     @work(thread=True, exclusive=True, group="agent", exit_on_error=False)
-    def run_agent(self, prompt: str) -> None:
+    def run_agent(self, prompt: str, state: SessionTab) -> None:
         """Run the synchronous model/tool loop without blocking the terminal UI."""
         error_reported = False
 
@@ -1355,6 +1454,7 @@ class ToolboxApp(App[None]):
             if event.kind == "model_delta":
                 self.call_from_thread(
                     self._queue_stream_delta,
+                    state,
                     str(event.payload.get("text") or ""),
                 )
                 return
@@ -1362,72 +1462,74 @@ class ToolboxApp(App[None]):
                 "model_failed",
                 "harness_failed",
             }
-            self.call_from_thread(self._display_event, event)
+            self.call_from_thread(self._display_event, state, event)
 
         try:
-            self.conversation.send(prompt, on_event=relay)
+            state.conversation.send(prompt, on_event=relay)
         except RunCancelled:
             pass
         except (
             Exception
         ) as error:  # Provider and generated tool errors are user-visible.
             if not error_reported:
-                self.call_from_thread(self._write_error, str(error))
+                self.call_from_thread(self._write_error, str(error), state)
         finally:
-            self.call_from_thread(self._set_busy, False)
-            self.call_from_thread(self._refresh_sidebar)
+            self.call_from_thread(self._finish_rollout, state)
 
-    def _display_event(self, event: AgentEvent) -> None:
+    def _display_event(self, state: SessionTab, event: AgentEvent) -> None:
         if event.kind == "user":
             return
         if event.kind == "model_delta":
-            self.streamed_text += str(event.payload.get("text") or "")
-            self._render_stream()
-            self._set_status("streaming…")
+            state.streamed_text += str(event.payload.get("text") or "")
+            self._render_stream(state)
+            self._set_status("streaming…", state)
         elif event.kind == "model":
             content = str(event.payload.get("text") or "")
             if content:
-                self._finish_stream(content)
+                self._finish_stream(state, content)
             else:
-                self._clear_stream()
-            self._set_status("planning" if event.payload.get("calls") else "answering")
+                self._clear_stream(state)
+            self._set_status(
+                "planning" if event.payload.get("calls") else "answering", state
+            )
         elif event.kind == "call_started":
             name = str(event.tool_name or "tool")
             args = event.payload.get("args")
-            if self._forwarded_child(event, name, args):
+            if self._forwarded_child(state, event, name, args):
                 return
             target: str | None = None
             if name == "call_tool" and isinstance(args, dict):
                 requested = args.get("name")
                 if isinstance(requested, str):
                     target = requested
-            displayed = self.query_one("#chat", ChatFeed).write_tool(
+            displayed = state.chat.write_tool(
                 "call",
                 name,
                 self._compact(args),
                 self._argument_summary(args),
             )
             if target and event.call_id:
-                self.forwarded_targets[event.call_id] = target
-                self.forwarded_events[event.call_id] = displayed
+                state.forwarded_targets[event.call_id] = target
+                state.forwarded_events[event.call_id] = displayed
             if event.call_id:
-                self.active_tool_events[event.call_id] = displayed
-            self._set_status(f"calling {name}")
+                state.active_tool_events[event.call_id] = displayed
+            self._set_status(f"calling {name}", state)
         elif event.kind == "call_succeeded":
-            display = self._tool_response(event)
+            display = self._tool_response(state, event)
             if display is None:
                 return
             name, detail = display
-            active = self.active_tool_events.pop(event.call_id, None)
+            active = state.active_tool_events.pop(event.call_id, None)
             if active is None:
-                self.query_one("#chat", ChatFeed).write_tool("response", name, detail)
+                state.chat.write_tool("response", name, detail)
             else:
                 active.finish("response", name, detail)
-            self._refresh_sidebar()
+            if state is self.active_session:
+                self._refresh_sidebar()
         elif event.kind == "binding_changed":
             name = str(event.payload.get("name") or event.tool_name or "tool")
             version = event.payload.get("to_version")
-            self.query_one("#chat", ChatFeed).write(
+            state.chat.write(
                 Panel(
                     Text(f"active version → v{version}"),
                     title=f"toolbox · {name}",
@@ -1435,81 +1537,84 @@ class ToolboxApp(App[None]):
                     border_style="blue",
                 )
             )
-            self._refresh_sidebar()
+            if state is self.active_session:
+                self._refresh_sidebar()
         elif event.kind == "call_failed":
-            display = self._tool_response(event, failed=True)
+            display = self._tool_response(state, event, failed=True)
             if display is None:
                 return
             name, detail = display
-            active = self.active_tool_events.pop(event.call_id, None)
+            active = state.active_tool_events.pop(event.call_id, None)
             if active is None:
-                self.query_one("#chat", ChatFeed).write_tool("error", name, detail)
+                state.chat.write_tool("error", name, detail)
             else:
                 active.finish("error", name, detail)
-            self._set_status(f"{name} failed")
+            self._set_status(f"{name} failed", state)
         elif event.kind in {"model_failed", "harness_failed"}:
-            self._stop_active_tool_events()
-            self._clear_stream()
-            self._write_error(str(event.payload.get("message") or event.payload))
+            self._stop_active_tool_events(state)
+            self._clear_stream(state)
+            self._write_error(str(event.payload.get("message") or event.payload), state)
         elif event.kind == "cancelled":
-            self._stop_active_tool_events()
-            partial = self.streamed_text + "".join(self.pending_stream_text)
+            self._stop_active_tool_events(state)
+            partial = state.streamed_text + "".join(state.pending_stream_text)
             content = partial or str(event.payload.get("message") or "Rollout stopped.")
-            self._finish_stream(content, stopped=True)
-            self._set_status("stopped")
+            self._finish_stream(state, content, stopped=True)
+            self._set_status("stopped", state)
 
-    def _queue_stream_delta(self, text: str) -> None:
+    def _queue_stream_delta(self, state: SessionTab, text: str) -> None:
         if not text:
             return
-        self.pending_stream_text.append(text)
-        if self.stream_timer is None:
-            self.stream_timer = self.set_timer(0.05, self._flush_stream_delta)
+        state.pending_stream_text.append(text)
+        if state.stream_timer is None:
+            state.stream_timer = self.set_timer(
+                0.05, lambda: self._flush_stream_delta(state)
+            )
 
-    def _flush_stream_delta(self) -> None:
-        self.stream_timer = None
-        if not self.pending_stream_text:
+    def _flush_stream_delta(self, state: SessionTab) -> None:
+        state.stream_timer = None
+        if not state.pending_stream_text:
             return
-        self.streamed_text += "".join(self.pending_stream_text)
-        self.pending_stream_text.clear()
-        self._render_stream()
-        self._set_status("streaming…")
+        state.streamed_text += "".join(state.pending_stream_text)
+        state.pending_stream_text.clear()
+        self._render_stream(state)
+        self._set_status("streaming…", state)
 
-    def _render_stream(self) -> None:
-        panel = self._model_panel(self.streamed_text)
-        chat = self.query_one("#chat", ChatFeed)
-        if self.stream_entry is None:
-            self.stream_entry = chat.write(panel, classes="streaming-response")
+    def _render_stream(self, state: SessionTab) -> None:
+        panel = self._model_panel(state.streamed_text)
+        if state.stream_entry is None:
+            state.stream_entry = state.chat.write(panel, classes="streaming-response")
         else:
-            chat.update_entry(self.stream_entry, panel)
+            state.chat.update_entry(state.stream_entry, panel)
 
-    def _finish_stream(self, content: str, *, stopped: bool = False) -> None:
-        self._reset_stream_state()
+    def _finish_stream(
+        self, state: SessionTab, content: str, *, stopped: bool = False
+    ) -> None:
+        self._reset_stream_state(state)
         title = self._active_model_name
         border_style = "bright_magenta"
         if stopped:
             title += " · stopped"
             border_style = "yellow"
         panel = self._model_panel(content, title=title, border_style=border_style)
-        chat = self.query_one("#chat", ChatFeed)
-        if self.stream_entry is None:
-            chat.write(panel)
+        if state.stream_entry is None:
+            state.chat.write(panel)
         else:
-            chat.update_entry(self.stream_entry, panel)
-            self.stream_entry.remove_class("streaming-response")
-            self.stream_entry = None
+            state.chat.update_entry(state.stream_entry, panel)
+            state.stream_entry.remove_class("streaming-response")
+            state.stream_entry = None
 
-    def _clear_stream(self) -> None:
-        self._reset_stream_state()
-        if self.stream_entry is not None:
-            self.stream_entry.remove()
-            self.stream_entry = None
+    def _clear_stream(self, state: SessionTab) -> None:
+        self._reset_stream_state(state)
+        if state.stream_entry is not None:
+            state.stream_entry.remove()
+            state.stream_entry = None
 
-    def _reset_stream_state(self) -> None:
-        if self.stream_timer is not None:
-            self.stream_timer.stop()
-            self.stream_timer = None
-        self.pending_stream_text.clear()
-        self.streamed_text = ""
+    def _reset_stream_state(self, state: SessionTab) -> None:
+        if state.stream_timer is not None:
+            state.stream_timer.stop()
+            state.stream_timer = None
+        state.pending_stream_text.clear()
+        state.streamed_text = ""
 
     def _model_panel(
         self,
@@ -1525,7 +1630,7 @@ class ToolboxApp(App[None]):
             border_style=border_style,
         )
 
-    def _command(self, prompt: str) -> bool:
+    async def _command(self, prompt: str) -> bool:
         try:
             parts = shlex.split(prompt)
         except ValueError as error:
@@ -1535,8 +1640,12 @@ class ToolboxApp(App[None]):
         arguments = parts[1:]
         if command in {"/quit", "/q"}:
             self.action_quit()
-        elif command in {"/new", "/reset"}:
-            self.action_new_session()
+        elif command == "/new":
+            await self.action_new_session()
+        elif command in {"/clear", "/reset"}:
+            await self.action_clear_session()
+        elif command == "/end":
+            await self.action_end_session()
         elif command == "/tools" or (command == "/toolbox" and not arguments):
             self.action_manage_tools()
         elif command == "/toolbox":
@@ -1551,7 +1660,8 @@ class ToolboxApp(App[None]):
 
     def action_quit(self) -> None:
         """Cancel synchronous work before asking Textual to exit."""
-        self.conversation.close()
+        for state in self.session_tabs:
+            state.conversation.close()
         self.exit()
 
     def _toolbox_command(self, arguments: list[str]) -> None:
@@ -1607,32 +1717,77 @@ class ToolboxApp(App[None]):
                 "primary" if active and active["primary"] else "yes" if active else ""
             )
             table.add_row(toolbox["name"], marker, str(toolbox["cwd"] or "—"))
-        self.query_one("#chat", ChatFeed).write(
-            Panel(table, title="toolbox namespaces", border_style="blue")
-        )
+        self.chat.write(Panel(table, title="toolbox namespaces", border_style="blue"))
 
-    def action_new_session(self) -> None:
-        """Begin a fresh model conversation without deleting toolbox state."""
-        if self.busy:
+    async def action_new_session(self) -> None:
+        """Open and activate a fresh model conversation in a new tab."""
+        state = self._make_session_tab()
+        self.session_tabs.append(state)
+        tabs = self.query_one("#session-tabs", TabbedContent)
+        await tabs.add_pane(
+            TabPane(state.label, state.chat, id=state.pane_id),
+            after=self.session_tabs[-2].pane_id,
+        )
+        tabs.active = state.pane_id
+        self._show_welcome(state)
+        self._set_status("new session", state)
+
+    def action_next_session(self) -> None:
+        """Activate the next open session tab, wrapping at the end."""
+        if len(self.session_tabs) < 2:
             return
-        self.conversation = self.harness.start(
+        index = self.session_tabs.index(self.active_session)
+        target = self.session_tabs[(index + 1) % len(self.session_tabs)]
+        self.query_one("#session-tabs", TabbedContent).active = target.pane_id
+
+    async def action_clear_session(self) -> None:
+        """Reset the active tab with a new durable session."""
+        if self.busy:
+            self._set_status("stop the active rollout before clearing a session")
+            return
+        state = self.active_session
+        state.conversation.close()
+        self._reset_session_ui(state)
+        state.conversation = self.harness.start(
             self.model,
             model_provider=self.model_provider,
         )
-        self.query_one("#chat", ChatFeed).clear()
-        self.forwarded_targets.clear()
-        self.forwarded_events.clear()
-        self.forwarded_children.clear()
-        self.active_tool_events.clear()
-        self._show_welcome()
+        state.chat.clear()
+        with self.prevent(Input.Changed):
+            self.query_one("#prompt", Input).value = ""
+        self._show_welcome(state)
         self._refresh_sidebar()
-        self._set_status("new session")
+        self._set_status("session cleared", state)
+
+    async def action_end_session(self) -> None:
+        """Close the active tab, exiting when it is the final session."""
+        if self.busy:
+            self._set_status("stop the active rollout before ending a session")
+            return
+        state = self.active_session
+        state.conversation.close()
+        self._reset_session_ui(state)
+        if len(self.session_tabs) == 1:
+            self.exit()
+            return
+        index = self.session_tabs.index(state)
+        successor = (
+            self.session_tabs[index + 1]
+            if index + 1 < len(self.session_tabs)
+            else self.session_tabs[index - 1]
+        )
+        self._active_pane_id = successor.pane_id
+        self.session_tabs.remove(state)
+        await self.query_one("#session-tabs", TabbedContent).remove_pane(state.pane_id)
+        self.query_one("#session-tabs", TabbedContent).active = successor.pane_id
 
     def action_stop_rollout(self) -> None:
         """Stop the active model stream or tool subprocess."""
-        if self.busy:
-            if self.conversation.cancel():
-                self._set_status("stopping…")
+        if self.rollout_owner is not None:
+            owner = self.rollout_owner
+            if owner.conversation.cancel():
+                self._set_status("stopping…", owner)
+                self._refresh_active_status()
             return
         if isinstance(self.screen, DeleteToolScreen):
             self.screen.dismiss(False)
@@ -1654,9 +1809,7 @@ class ToolboxApp(App[None]):
                 binding["kind"],
                 binding["toolbox"],
             )
-        self.query_one("#chat", ChatFeed).write(
-            Panel(table, title="active toolbox", border_style="blue")
-        )
+        self.chat.write(Panel(table, title="active toolbox", border_style="blue"))
 
     def action_manage_tools(self) -> None:
         """Toggle the source, history, usage, and deletion manager."""
@@ -1673,12 +1826,15 @@ class ToolboxApp(App[None]):
 
     def action_show_help(self) -> None:
         """Show local TUI commands."""
-        self.query_one("#chat", ChatFeed).write(
+        self.chat.write(
             Panel(
                 Markdown(
                     "**Commands**\n\n"
                     "- `Esc` — stop the active rollout\n"
-                    "- `/new` — start a new saved conversation\n"
+                    "- `Ctrl+N` or `/new` — open a new session tab\n"
+                    "- `TAB` or click — switch session tabs\n"
+                    "- `/clear` — reset the active tab with a fresh session\n"
+                    "- `/end` — close the active session tab\n"
                     "- `/tools` or `Ctrl+T` — toggle tool management\n"
                     "- `/toolbox list` — list namespaces and active order\n"
                     "- `/toolbox create NAME [CWD]` — create a namespace\n"
@@ -1702,13 +1858,12 @@ class ToolboxApp(App[None]):
                 str(session["event_count"]),
                 session["created_at"][:19],
             )
-        self.query_one("#chat", ChatFeed).write(
-            Panel(table, title="saved sessions", border_style="blue")
-        )
+        self.chat.write(Panel(table, title="saved sessions", border_style="blue"))
 
-    def _show_welcome(self) -> None:
+    def _show_welcome(self, state: SessionTab | None = None) -> None:
+        state = state or self.active_session
         readiness = "ready" if getattr(self.model, "ready", True) else "API key missing"
-        self.query_one("#chat", ChatFeed).write(
+        state.chat.write(
             Panel(
                 Markdown(
                     f"**{self._active_model_name}** · {readiness}\n\n"
@@ -1721,11 +1876,12 @@ class ToolboxApp(App[None]):
         )
         if isinstance(self.model, OpenRouterModel) and not self.model.ready:
             self._write_error(
-                f"Set {self.model.api_key_env} in your environment, then restart."
+                f"Set {self.model.api_key_env} in your environment, then restart.",
+                state,
             )
 
-    def _write_user(self, prompt: str) -> None:
-        self.query_one("#chat", ChatFeed).write(
+    def _write_user(self, prompt: str, state: SessionTab | None = None) -> None:
+        (state or self.active_session).chat.write(
             Panel(
                 Markdown(prompt),
                 title="you",
@@ -1734,11 +1890,10 @@ class ToolboxApp(App[None]):
             )
         )
 
-    def _write_error(self, message: str) -> None:
-        self.query_one("#chat", ChatFeed).write(
-            Panel(Text(message), title="error", border_style="red")
-        )
-        self._set_status("error")
+    def _write_error(self, message: str, state: SessionTab | None = None) -> None:
+        state = state or self.active_session
+        state.chat.write(Panel(Text(message), title="error", border_style="red"))
+        self._set_status("error", state)
 
     def _refresh_sidebar(self) -> None:
         bindings = self.kernel.bindings(
@@ -1785,12 +1940,13 @@ class ToolboxApp(App[None]):
         reasoning = self.query_one("#reasoning-selector", Button)
         separator = self.query_one("#reasoning-separator", Static)
         configurable = isinstance(self.model, OpenRouterModel)
-        selector.disabled = not configurable
+        selector.disabled = not configurable or self.busy
         selector.label = self._active_model_name
         current = self._current_model_option()
         show_reasoning = current is not None and bool(current.reasoning_efforts)
         reasoning.display = show_reasoning
         separator.display = show_reasoning
+        reasoning.disabled = self.busy
         if configurable:
             effort = self.model.reasoning_effort or "automatic"
             reasoning.label = f"reasoning: {effort}"
@@ -1808,65 +1964,111 @@ class ToolboxApp(App[None]):
             None,
         )
 
-    def _set_busy(self, busy: bool) -> None:
-        self.busy = busy
+    def _start_rollout(self, state: SessionTab) -> None:
+        self.rollout_owner = state
+        state.status = "thinking…"
         prompt = self.query_one("#prompt", Input)
-        prompt.disabled = busy
-        if busy:
-            self._set_status("thinking…")
-        else:
-            self._stop_active_tool_events()
-            self._set_status("ready")
+        prompt.disabled = True
+        self._refresh_model_controls()
+        self._refresh_active_status()
+
+    def _finish_rollout(self, state: SessionTab) -> None:
+        self._stop_active_tool_events(state)
+        if self.rollout_owner is state:
+            self.rollout_owner = None
+        if state.status not in {"error", "stopped"}:
+            state.status = "ready"
+        prompt = self.query_one("#prompt", Input)
+        prompt.disabled = self.busy
+        self._refresh_model_controls()
+        if state is self.active_session:
+            self._refresh_sidebar()
+        self._refresh_active_status()
+        if not self.busy:
             prompt.focus()
 
-    def _stop_active_tool_events(self) -> None:
-        for tool_event in self.active_tool_events.values():
+    def _stop_active_tool_events(self, state: SessionTab) -> None:
+        for tool_event in state.active_tool_events.values():
             tool_event.stop_spinner()
-        self.active_tool_events.clear()
+        state.active_tool_events.clear()
 
-    def _set_status(self, message: str) -> None:
+    def _set_status(self, message: str, state: SessionTab | None = None) -> None:
+        state = state or self.active_session
+        state.status = message
+        if state is self.active_session:
+            self._refresh_active_status()
+
+    def _refresh_active_status(self) -> None:
+        state = self.active_session
+        message = state.status
+        if self.rollout_owner is not None and self.rollout_owner is not state:
+            message = f"{self.rollout_owner.label} running…"
         self.query_one("#status-message", Static).update(message)
         self.query_one("#status-session", Static).update(
-            self.conversation.session_id[:10]
+            state.conversation.session_id[:10]
         )
 
-    def _forwarded_child(self, event: AgentEvent, name: str, args: Any) -> bool:
+    def _refresh_active_controls(self) -> None:
+        state = self.active_session
+        prompt = self.query_one("#prompt", Input)
+        with self.prevent(Input.Changed):
+            prompt.value = state.draft
+        prompt.disabled = self.busy
+        self._refresh_sidebar()
+        self._refresh_model_controls()
+        self._refresh_active_status()
+        if not self.busy:
+            prompt.focus()
+
+    def _reset_session_ui(self, state: SessionTab) -> None:
+        self._reset_stream_state(state)
+        self._stop_active_tool_events(state)
+        state.stream_entry = None
+        state.forwarded_targets.clear()
+        state.forwarded_events.clear()
+        state.forwarded_children.clear()
+        state.draft = ""
+        state.status = "ready"
+
+    def _forwarded_child(
+        self, state: SessionTab, event: AgentEvent, name: str, args: Any
+    ) -> bool:
         parent_id = event.parent_call_id
         if (
             event.call_id
             and parent_id
-            and self.forwarded_targets.get(parent_id) == name
+            and state.forwarded_targets.get(parent_id) == name
         ):
-            self.forwarded_children[event.call_id] = parent_id
-            self.forwarded_events[parent_id].update_call(
+            state.forwarded_children[event.call_id] = parent_id
+            state.forwarded_events[parent_id].update_call(
                 name,
                 self._compact(args),
                 self._argument_summary(args),
             )
-            self._set_status(f"calling {name}")
+            self._set_status(f"calling {name}", state)
             return True
         return False
 
     def _tool_response(
-        self, event: AgentEvent, *, failed: bool = False
+        self, state: SessionTab, event: AgentEvent, *, failed: bool = False
     ) -> tuple[str, str] | None:
         call_id = event.call_id
-        if call_id in self.forwarded_children:
+        if call_id in state.forwarded_children:
             return None
-        if call_id in self.forwarded_targets:
+        if call_id in state.forwarded_targets:
             delegated = any(
-                parent_id == call_id for parent_id in self.forwarded_children.values()
+                parent_id == call_id for parent_id in state.forwarded_children.values()
             )
             name = (
-                self.forwarded_targets[call_id]
+                state.forwarded_targets[call_id]
                 if delegated
                 else str(event.tool_name or "tool")
             )
-            self.forwarded_targets.pop(call_id)
-            self.forwarded_events.pop(call_id, None)
-            self.forwarded_children = {
+            state.forwarded_targets.pop(call_id)
+            state.forwarded_events.pop(call_id, None)
+            state.forwarded_children = {
                 child_id: parent_id
-                for child_id, parent_id in self.forwarded_children.items()
+                for child_id, parent_id in state.forwarded_children.items()
                 if parent_id != call_id
             }
         else:
