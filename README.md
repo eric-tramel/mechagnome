@@ -58,7 +58,9 @@ TUI commands:
   version to inspect syntax-highlighted source, its diff from the prior version,
   creation provenance, per-version call outcomes, and calling sessions. User
   tools can be deleted from the active toolbox after confirmation; source,
-  versions, usage, and session history remain available for audit.
+  versions, usage, and session history remain available for audit. The
+  namespace controls switch the session to a registered namespace, create a new
+  blank namespace, or rename the current namespace with **Save as…**.
 - `/toolbox list` shows registered namespaces and the current selection.
 - `/toolbox create NAME [CWD]` creates an independently versioned namespace and
   maps the supplied (or current) cwd to it.

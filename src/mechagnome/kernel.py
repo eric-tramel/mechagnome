@@ -665,6 +665,31 @@ class Kernel:
             for row in rows
         ]
 
+    def rename_toolbox(self, name: str, new_name: str) -> dict[str, Any]:
+        """Rename a toolbox without changing its identity or associations."""
+        if not isinstance(new_name, str) or _TOOLBOX_NAME.fullmatch(new_name) is None:
+            raise ToolboxError(
+                "invalid_toolbox_name", f"invalid toolbox name: {new_name!r}"
+            )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                toolbox_id = self._toolbox_id(connection, name)
+                try:
+                    connection.execute(
+                        "UPDATE toolboxes SET name = ? WHERE id = ?",
+                        (new_name, toolbox_id),
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise ToolboxError(
+                        "toolbox_exists", f"toolbox already exists: {new_name}"
+                    ) from error
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {"id": toolbox_id, "name": new_name}
+
     @staticmethod
     def _toolbox_id(connection: sqlite3.Connection, name: str) -> str:
         row = connection.execute(

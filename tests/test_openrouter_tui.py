@@ -35,7 +35,12 @@ from mechagnome.openrouter import (
     OpenRouterError,
     OpenRouterModel,
 )
-from mechagnome.tui import DeleteToolScreen, ToolboxApp, ToolManagerScreen
+from mechagnome.tui import (
+    DeleteToolScreen,
+    NamespaceNameScreen,
+    ToolboxApp,
+    ToolManagerScreen,
+)
 
 
 class FinalModel:
@@ -1344,6 +1349,80 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
                 line.text for line in app.query_one("#chat", RichLog).lines
             )
             assert "toolbox namespaces" in chat
+
+    asyncio.run(exercise())
+
+
+def test_tool_manager_switches_blanks_and_renames_namespaces(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    kernel.create_toolbox("alpha", cwd=tmp_path)
+    kernel.create_toolbox("beta")
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+    session_id = app.conversation.session_id
+    kernel.write_tool(
+        name="alpha_tool",
+        description="Only in alpha.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 'alpha'\n",
+        session_id=session_id,
+    )
+    kernel.select_toolboxes(session_id, ["beta"], mode="use")
+    kernel.write_tool(
+        name="beta_tool",
+        description="Only in beta.",
+        input_schema={"type": "object"},
+        source="def main(input, ctx):\n    return 'beta'\n",
+        session_id=session_id,
+    )
+    kernel.select_toolboxes(session_id, ["alpha"], mode="use")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            manager = app.screen
+            assert manager.selected_namespace == "alpha"
+            assert manager.selected_name == "alpha_tool"
+
+            manager.query_one("#namespace-picker", Select).value = "beta"
+            await pilot.pause()
+            assert [item["name"] for item in kernel.active_toolboxes(session_id)] == [
+                "beta"
+            ]
+            assert manager.selected_namespace == "beta"
+            assert manager.selected_name == "beta_tool"
+
+            await pilot.click("#blank-namespace")
+            await pilot.pause()
+            assert isinstance(app.screen, NamespaceNameScreen)
+            app.screen.query_one("#namespace-name", Input).value = "gamma"
+            await pilot.click("#confirm-namespace")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            manager = app.screen
+            assert manager.selected_namespace == "gamma"
+            assert [item["name"] for item in kernel.active_toolboxes(session_id)] == [
+                "gamma"
+            ]
+            assert "alpha_tool" not in {item["name"] for item in manager.inventory}
+            assert "beta_tool" not in {item["name"] for item in manager.inventory}
+
+            gamma_id = kernel.active_toolboxes(session_id)[0]["id"]
+            await pilot.click("#save-as-namespace")
+            await pilot.pause()
+            assert isinstance(app.screen, NamespaceNameScreen)
+            app.screen.query_one("#namespace-name", Input).value = "renamed"
+            await pilot.click("#confirm-namespace")
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            manager = app.screen
+            assert manager.selected_namespace == "renamed"
+            active = kernel.active_toolboxes(session_id)
+            assert [(item["id"], item["name"]) for item in active] == [
+                (gamma_id, "renamed")
+            ]
+            assert "gamma" not in {item["name"] for item in kernel.list_toolboxes()}
 
     asyncio.run(exercise())
 

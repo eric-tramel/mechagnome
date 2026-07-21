@@ -566,6 +566,40 @@ def test_toolbox_selection_replace_union_remove_and_cwd_default(
     assert sum(event["kind"] == "toolbox_selection_changed" for event in events) == 5
 
 
+def test_toolbox_rename_preserves_identity_tools_and_cwd_default(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    created = kernel.create_toolbox("alpha", cwd=tmp_path)
+    kernel.create_toolbox("beta")
+    session_id = kernel.create_session()
+    write(
+        kernel,
+        "kept",
+        "def main(input, ctx):\n    return 'still here'\n",
+        session_id=session_id,
+    )
+
+    renamed = kernel.rename_toolbox("alpha", "renamed")
+
+    assert renamed == {"id": created["id"], "name": "renamed"}
+    assert [item["name"] for item in kernel.active_toolboxes(session_id)] == ["renamed"]
+    assert call_tool(kernel, "kept", {}, session_id=session_id) == "still here"
+    registered = {item["name"]: item for item in kernel.list_toolboxes()}
+    assert "alpha" not in registered
+    assert registered["renamed"]["id"] == created["id"]
+    assert registered["renamed"]["default"] is True
+    assert registered["renamed"]["cwd"] == str(tmp_path.resolve())
+
+    with pytest.raises(ToolboxError) as duplicate:
+        kernel.rename_toolbox("renamed", "beta")
+    assert duplicate.value.code == "toolbox_exists"
+
+    with pytest.raises(ToolboxError) as invalid:
+        kernel.rename_toolbox("renamed", "not a namespace")
+    assert invalid.value.code == "invalid_toolbox_name"
+
+
 def test_sessionless_host_operations_do_not_create_saved_sessions(
     tmp_path: Path,
 ) -> None:

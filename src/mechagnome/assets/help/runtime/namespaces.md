@@ -9,6 +9,11 @@ ordered idempotent union, remove namespaces, or reset the session to its cwd
 default. A top-level call snapshots the active order for its complete nested
 call tree, so a hot swap affects the next call rather than an in-flight call.
 
+In the TUI, `/tools` or `Ctrl+T` opens tool management. Its namespace picker
+switches the session to another registered namespace. **Blank** creates and
+selects a new core-only namespace, while **Save as…** renames the current
+namespace without changing its tools, history, or cwd association.
+
 Cwd associations select defaults and preserve the session execution directory.
 They organize tools; they are not filesystem restrictions or security
 boundaries.

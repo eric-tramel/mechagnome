@@ -92,6 +92,88 @@ class DeleteToolScreen(ModalScreen[bool]):
         self.dismiss(True)
 
 
+class NamespaceNameScreen(ModalScreen[str | None]):
+    """Collect a namespace name for Blank or Save as."""
+
+    CSS = """
+    NamespaceNameScreen {
+        align: center middle;
+        background: #0008;
+    }
+
+    #namespace-dialog {
+        width: 58;
+        height: auto;
+        border: round #38bdf8;
+        background: #111923;
+        padding: 1 2;
+    }
+
+    #namespace-question, #namespace-name {
+        margin-bottom: 1;
+    }
+
+    #namespace-actions {
+        height: 3;
+        align-horizontal: right;
+    }
+
+    #namespace-actions Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        action_label: str,
+        initial_name: str = "",
+    ) -> None:
+        super().__init__()
+        self.dialog_title = title
+        self.action_label = action_label
+        self.initial_name = initial_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="namespace-dialog"):
+            yield Static(self.dialog_title, id="namespace-question")
+            yield Input(
+                value=self.initial_name,
+                placeholder="Namespace name",
+                id="namespace-name",
+            )
+            with Horizontal(id="namespace-actions"):
+                yield Button("Cancel", id="cancel-namespace")
+                yield Button(
+                    self.action_label,
+                    id="confirm-namespace",
+                    variant="primary",
+                )
+
+    def on_mount(self) -> None:
+        name = self.query_one("#namespace-name", Input)
+        name.focus()
+        name.action_end()
+
+    @on(Input.Submitted, "#namespace-name")
+    def submit_name(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#cancel-namespace")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#confirm-namespace")
+    def confirm(self) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        name = self.query_one("#namespace-name", Input).value.strip()
+        if name:
+            self.dismiss(name)
+
+
 class ToolManagerScreen(Screen[None]):
     """Inspect source, history, diffs, provenance, usage, and bindings."""
 
@@ -113,8 +195,37 @@ class ToolManagerScreen(Screen[None]):
         padding: 1;
     }
 
-    #tool-toolbar {
+    #namespace-toolbar, #tool-toolbar {
         height: 3;
+    }
+
+    #namespace-toolbar {
+        margin-bottom: 1;
+    }
+
+    #namespace-label {
+        width: 12;
+        height: 3;
+        content-align: left middle;
+        color: #7dd3fc;
+        text-style: bold;
+    }
+
+    #namespace-picker {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #blank-namespace {
+        width: 12;
+        margin-right: 1;
+    }
+
+    #save-as-namespace {
+        width: 14;
+    }
+
+    #tool-toolbar {
         margin-bottom: 1;
     }
 
@@ -174,6 +285,9 @@ class ToolManagerScreen(Screen[None]):
         self.kernel = kernel
         self.session_id = session_id
         self.on_toolbox_changed = on_toolbox_changed
+        self.selected_namespace = self.kernel.active_toolboxes(self.session_id)[0][
+            "name"
+        ]
         self.inventory = self._inventory()
         self.selected_name = self.inventory[0]["name"]
         self.history = self.kernel.tool_history(
@@ -184,6 +298,16 @@ class ToolManagerScreen(Screen[None]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="tool-manager"):
+            with Horizontal(id="namespace-toolbar"):
+                yield Static("NAMESPACE", id="namespace-label")
+                yield Select(
+                    self._namespace_options(),
+                    value=self.selected_namespace,
+                    allow_blank=False,
+                    id="namespace-picker",
+                )
+                yield Button("Blank", id="blank-namespace")
+                yield Button("Save as…", id="save-as-namespace")
             with Horizontal(id="tool-toolbar"):
                 yield Select(
                     self._tool_options(),
@@ -214,27 +338,98 @@ class ToolManagerScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self._render_selection()
-        self.query_one("#tool-picker", Select).focus()
+        self.query_one("#namespace-picker", Select).focus()
+
+    @on(Select.Changed, "#namespace-picker")
+    def select_namespace(self, event: Select.Changed) -> None:
+        if event.value is Select.NULL:
+            return
+        name = str(event.value)
+        if name == self.selected_namespace:
+            return
+        try:
+            self.kernel.select_toolboxes(self.session_id, [name], mode="use")
+        except Exception as error:
+            self._status(f"Namespace change failed: {error}")
+            self.query_one("#namespace-picker", Select).value = self.selected_namespace
+            return
+        self.selected_namespace = name
+        self._refresh_after_namespace_change(f"Switched to namespace {name}.")
+
+    @on(Button.Pressed, "#blank-namespace")
+    def blank_namespace(self) -> None:
+        self.app.push_screen(
+            NamespaceNameScreen(
+                title="Create a blank namespace",
+                action_label="Create",
+            ),
+            self._finish_blank_namespace,
+        )
+
+    @on(Button.Pressed, "#save-as-namespace")
+    def save_as_namespace(self) -> None:
+        self.app.push_screen(
+            NamespaceNameScreen(
+                title=f"Rename namespace {self.selected_namespace!r}",
+                action_label="Save as",
+                initial_name=self.selected_namespace,
+            ),
+            self._finish_save_as_namespace,
+        )
+
+    def _finish_blank_namespace(self, name: str | None) -> None:
+        if name is None:
+            return
+        try:
+            self.kernel.create_toolbox(name)
+            self.kernel.select_toolboxes(self.session_id, [name], mode="use")
+        except Exception as error:
+            self._status(f"Blank namespace failed: {error}")
+            return
+        self.selected_namespace = name
+        self._refresh_after_namespace_change(f"Created blank namespace {name}.")
+
+    def _finish_save_as_namespace(self, name: str | None) -> None:
+        if name is None:
+            return
+        if name == self.selected_namespace:
+            self._status("Namespace name unchanged.")
+            return
+        old_name = self.selected_namespace
+        try:
+            self.kernel.rename_toolbox(old_name, name)
+        except Exception as error:
+            self._status(f"Save as failed: {error}")
+            return
+        self.selected_namespace = name
+        self._refresh_after_namespace_change(f"Renamed namespace {old_name} to {name}.")
 
     @on(Select.Changed, "#tool-picker")
     def select_tool(self, event: Select.Changed) -> None:
         if event.value is Select.NULL:
             return
-        self.selected_name = str(event.value)
+        name = str(event.value)
+        if name not in {item["name"] for item in self.inventory}:
+            return
+        self.selected_name = name
         self.history = self.kernel.tool_history(
             self.selected_name, session_id=self.session_id
         )
         self.selected_version = self._initial_version()
         picker = self.query_one("#version-picker", Select)
-        picker.set_options(self._version_options())
-        picker.value = self.selected_version
+        with self.prevent(Select.Changed):
+            picker.set_options(self._version_options())
+            picker.value = self.selected_version
         self._render_selection()
 
     @on(Select.Changed, "#version-picker")
     def select_version(self, event: Select.Changed) -> None:
         if event.value is Select.NULL:
             return
-        self.selected_version = int(event.value)
+        version = int(event.value)
+        if version not in {item["version"] for item in self.history["versions"]}:
+            return
+        self.selected_version = version
         self._render_selection()
 
     @on(Button.Pressed, "#delete-tool")
@@ -268,11 +463,12 @@ class ToolManagerScreen(Screen[None]):
         )
         self.selected_version = self._initial_version()
         tool_picker = self.query_one("#tool-picker", Select)
-        tool_picker.set_options(self._tool_options())
-        tool_picker.value = self.selected_name
         version_picker = self.query_one("#version-picker", Select)
-        version_picker.set_options(self._version_options())
-        version_picker.value = self.selected_version
+        with self.prevent(Select.Changed):
+            tool_picker.set_options(self._tool_options())
+            tool_picker.value = self.selected_name
+            version_picker.set_options(self._version_options())
+            version_picker.value = self.selected_version
         self._render_selection()
         self._status(f"Deleted {self.selected_name} from the active toolbox.")
 
@@ -281,6 +477,41 @@ class ToolManagerScreen(Screen[None]):
             self.kernel.tool_inventory(session_id=self.session_id),
             key=lambda item: (item["kind"] == "core", item["name"]),
         )
+
+    def _namespace_options(self) -> list[tuple[str, str]]:
+        return [
+            (
+                f"{toolbox['name']}  ·  cwd default"
+                if toolbox["default"]
+                else toolbox["name"],
+                toolbox["name"],
+            )
+            for toolbox in self.kernel.list_toolboxes()
+        ]
+
+    def _refresh_after_namespace_change(self, status: str) -> None:
+        self.on_toolbox_changed()
+        self.inventory = self._inventory()
+        available = {item["name"] for item in self.inventory}
+        if self.selected_name not in available:
+            self.selected_name = self.inventory[0]["name"]
+        self.history = self.kernel.tool_history(
+            self.selected_name, session_id=self.session_id
+        )
+        self.selected_version = self._initial_version()
+
+        namespace_picker = self.query_one("#namespace-picker", Select)
+        tool_picker = self.query_one("#tool-picker", Select)
+        version_picker = self.query_one("#version-picker", Select)
+        with self.prevent(Select.Changed):
+            namespace_picker.set_options(self._namespace_options())
+            namespace_picker.value = self.selected_namespace
+            tool_picker.set_options(self._tool_options())
+            tool_picker.value = self.selected_name
+            version_picker.set_options(self._version_options())
+            version_picker.value = self.selected_version
+        self._render_selection()
+        self._status(status)
 
     def _tool_options(self) -> list[tuple[str, str]]:
         options = []
