@@ -16,9 +16,13 @@ Markdown document.
 
 ## Project source
 
-The full source for this Mechagnome harness lives on GitHub:
+Mechagnome is typically installed as a vendored tool (e.g. via `uv tool install`),
+which means the package on disk is a deployed copy, not a working source tree.
+The full source for the harness lives on GitHub:
 
   **https://github.com/eric-tramel/mechagnome**
 
-If you want to modify the harness itself (core operations, asset files, the
-runtime, etc.), clone the repository and edit there.
+Visit the repository to browse the source, open issues, or contribute changes
+to the harness itself (core operations, asset files, the runtime, etc.).
+Modifying a vendored installation in-place will not persist across reinstalls or
+upgrades — work against the GitHub source and reinstall from your fork instead.

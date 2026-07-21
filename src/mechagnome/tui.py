@@ -345,13 +345,15 @@ class ModelSelectionScreen(ModalScreen[str | None]):
     ) -> None:
         super().__init__()
         self.current_model = current_model
-        self.options = options
+        self.options = sorted(
+            options,
+            key=lambda option: (option.name.casefold(), option.id.casefold()),
+        )
         self.options_by_id = {option.id: option for option in options}
+        self._received_initial_input_change = False
 
     def compose(self) -> ComposeResult:
-        picker_options = [
-            (f"{option.name}  ·  {option.id}", option.id) for option in self.options
-        ]
+        picker_options = self._picker_options()
         current = (
             self.current_model
             if self.current_model in self.options_by_id
@@ -392,7 +394,16 @@ class ModelSelectionScreen(ModalScreen[str | None]):
 
     @on(Input.Changed, "#model-name")
     def edit_model(self, event: Input.Changed) -> None:
-        self._show_capability(event.value.strip())
+        model_query = event.value.strip()
+        self._show_capability(model_query)
+        if not self._received_initial_input_change:
+            self._received_initial_input_change = True
+            if model_query == self.current_model:
+                return
+        picker = self.query_one("#model-picker", Select)
+        picker.set_options(self._picker_options(model_query))
+        if model_query in self.options_by_id:
+            picker.value = model_query
 
     @on(Input.Submitted, "#model-name")
     def submit_model(self) -> None:
@@ -421,6 +432,16 @@ class ModelSelectionScreen(ModalScreen[str | None]):
         else:
             message = "Does not expose configurable reasoning effort."
         self.query_one("#model-capability", Static).update(message)
+
+    def _picker_options(self, query: str = "") -> list[tuple[str, str]]:
+        normalized_query = query.casefold()
+        return [
+            (f"{option.name}  ·  {option.id}", option.id)
+            for option in self.options
+            if not normalized_query
+            or normalized_query in option.name.casefold()
+            or normalized_query in option.id.casefold()
+        ]
 
 
 class ReasoningEffortScreen(ModalScreen[str | None]):
