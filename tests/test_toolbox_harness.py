@@ -491,6 +491,27 @@ class ReprogrammingModel:
         return ModelTurn(text="Search changed.")
 
 
+class OversizedBatchModel:
+    """Request a batch wider than the harness permits, then repair it."""
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        observations = [message for message in messages if message["role"] == "tool"]
+        if not observations:
+            return ModelTurn(
+                calls=tuple(
+                    ToolCall("help", {"topic": "toc"}, f"help-{index}")
+                    for index in range(3)
+                )
+            )
+        assert len(observations) == 3
+        assert {
+            observation["content"]["error"]["code"] for observation in observations
+        } == {"too_many_tool_calls"}
+        return ModelTurn(text="I will use a smaller batch next time.")
+
+
 def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
     model = ReprogrammingModel()
 
@@ -520,3 +541,19 @@ def test_harness_exposes_only_five_operations_and_saves_everything(
     assert kinds[0] == "user"
     assert "binding_changed" in kinds
     assert kinds[-1] == "final"
+
+
+def test_harness_rejects_oversized_batches_without_partial_execution(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+
+    result = Harness(kernel, max_calls_per_turn=2).run(
+        OversizedBatchModel(), "Read several help pages."
+    )
+
+    events = kernel.read_session(result.session_id, limit=100)["events"]
+    assert not any(event["kind"] == "call_started" for event in events)
+    observations = [event for event in events if event["kind"] == "tool_observation"]
+    assert len(observations) == 3
+    assert result.answer == "I will use a smaller batch next time."

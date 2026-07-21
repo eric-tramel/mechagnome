@@ -70,6 +70,7 @@ class AgentEvent:
 
 
 EventSink = Callable[[AgentEvent], None]
+DEFAULT_MAX_CALLS_PER_TURN = 16
 
 
 class RunCancelled(ToolboxError):
@@ -105,6 +106,7 @@ class Conversation:
         *,
         session_id: str,
         max_turns: int,
+        max_calls_per_turn: int,
         tool_runner: IsolatedToolRunner,
         messages: list[dict[str, Any]] | None = None,
     ) -> None:
@@ -112,6 +114,7 @@ class Conversation:
         self.model = model
         self.session_id = session_id
         self.max_turns = max_turns
+        self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner
         self.messages = messages or []
         self._run_lock = Lock()
@@ -207,8 +210,21 @@ class Conversation:
                 self._append(on_event, "final", {"content": answer})
                 return RunResult(self.session_id, answer, turn_number)
 
+            oversized_batch = len(turn.calls) > self.max_calls_per_turn
             for call in turn.calls:
-                observation = self._execute(call, on_event, token)
+                if oversized_batch:
+                    observation: JsonValue = {
+                        "error": {
+                            "code": "too_many_tool_calls",
+                            "message": (
+                                f"model requested {len(turn.calls)} operations in one "
+                                f"turn; maximum is {self.max_calls_per_turn}; split "
+                                "independent work into smaller batches"
+                            ),
+                        }
+                    }
+                else:
+                    observation = self._execute(call, on_event, token)
                 token.check()
                 self._append(
                     on_event,
@@ -328,10 +344,12 @@ class Harness:
         kernel: Kernel,
         *,
         max_turns: int = 50,
+        max_calls_per_turn: int = DEFAULT_MAX_CALLS_PER_TURN,
         tool_runner: IsolatedToolRunner | None = None,
     ) -> None:
         self.kernel = kernel
         self.max_turns = max_turns
+        self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner or IsolatedToolRunner(kernel)
 
     def start(self, model: Model, *, session_id: str | None = None) -> Conversation:
@@ -342,6 +360,7 @@ class Harness:
             model,
             session_id=identifier,
             max_turns=self.max_turns,
+            max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
             messages=self._session_messages(identifier),
         )
