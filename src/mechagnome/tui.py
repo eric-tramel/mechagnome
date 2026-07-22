@@ -202,6 +202,7 @@ class SessionTab:
     user_history: list[str] = field(default_factory=list)
     history_index: int | None = None
     history_draft: str = ""
+    running: bool = False
     status: str = "ready"
     streamed_text: str = ""
     pending_stream_text: list[str] = field(default_factory=list)
@@ -1317,7 +1318,6 @@ class ToolboxApp(App[None]):
         initial = self._make_session_tab(conversation=initial_conversation)
         self.session_tabs = [initial]
         self._active_pane_id = initial.pane_id
-        self.rollout_owner: SessionTab | None = None
         self.model_options: list[OpenRouterModelOption] = []
 
     def _make_session_tab(
@@ -1351,7 +1351,7 @@ class ToolboxApp(App[None]):
 
     @property
     def busy(self) -> bool:
-        return self.rollout_owner is not None
+        return any(state.running for state in self.session_tabs)
 
     @property
     def streamed_text(self) -> str:
@@ -1513,9 +1513,9 @@ class ToolboxApp(App[None]):
     async def submit_prompt(self, event: Input.Submitted) -> None:
         """Handle a slash command or send one message to the agent worker."""
         prompt = event.value.strip()
-        if not prompt or self.busy:
-            return
         state = self.active_session
+        if not prompt or state.running:
+            return
         state.user_history.append(prompt)
         state.history_index = None
         state.history_draft = ""
@@ -1528,7 +1528,7 @@ class ToolboxApp(App[None]):
         self._start_rollout(state)
         self.run_agent(prompt, state)
 
-    @work(thread=True, exclusive=True, group="agent", exit_on_error=False)
+    @work(thread=True, group="agent", exit_on_error=False)
     def run_agent(self, prompt: str, state: SessionTab) -> None:
         """Run the synchronous model/tool loop without blocking the terminal UI."""
         error_reported = False
@@ -1869,10 +1869,10 @@ class ToolboxApp(App[None]):
 
     async def action_clear_session(self) -> None:
         """Reset the active tab with a new durable session."""
-        if self.busy:
+        state = self.active_session
+        if state.running:
             self._set_status("stop the active rollout before clearing a session")
             return
-        state = self.active_session
         state.conversation.close()
         self._reset_session_ui(state)
         state.conversation = self.harness.start(self.model_provider)
@@ -1885,10 +1885,10 @@ class ToolboxApp(App[None]):
 
     async def action_end_session(self) -> None:
         """Close the active tab, exiting when it is the final session."""
-        if self.busy:
+        state = self.active_session
+        if state.running:
             self._set_status("stop the active rollout before ending a session")
             return
-        state = self.active_session
         state.conversation.close()
         self._reset_session_ui(state)
         if len(self.session_tabs) == 1:
@@ -1906,11 +1906,11 @@ class ToolboxApp(App[None]):
         self.query_one("#session-tabs", TabbedContent).active = successor.pane_id
 
     def action_stop_rollout(self) -> None:
-        """Stop the active model stream or tool subprocess."""
-        if self.rollout_owner is not None:
-            owner = self.rollout_owner
-            if owner.conversation.cancel():
-                self._set_status("stopping…", owner)
+        """Stop the active tab's model stream or tool subprocess."""
+        state = self.active_session
+        if state.running:
+            if state.conversation.cancel():
+                self._set_status("stopping…", state)
                 self._refresh_active_status()
             return
         if isinstance(self.screen, DeleteToolScreen):
@@ -1954,7 +1954,7 @@ class ToolboxApp(App[None]):
             Panel(
                 Markdown(
                     "**Commands**\n\n"
-                    "- `Esc` — stop the active rollout\n"
+                    "- `Esc` — stop the active tab's rollout\n"
                     "- `Ctrl+N` or `/new` — open a new session tab\n"
                     "- `TAB` or click — switch session tabs\n"
                     "- `/clear` — reset the active tab with a fresh session\n"
@@ -2093,26 +2093,25 @@ class ToolboxApp(App[None]):
         )
 
     def _start_rollout(self, state: SessionTab) -> None:
-        self.rollout_owner = state
+        state.running = True
         state.status = "thinking…"
         prompt = self.query_one("#prompt", Input)
-        prompt.disabled = True
+        prompt.disabled = self.active_session.running
         self._refresh_model_controls()
         self._refresh_active_status()
 
     def _finish_rollout(self, state: SessionTab) -> None:
         self._stop_active_tool_events(state)
-        if self.rollout_owner is state:
-            self.rollout_owner = None
+        state.running = False
         if state.status not in {"error", "stopped"}:
             state.status = "ready"
         prompt = self.query_one("#prompt", Input)
-        prompt.disabled = self.busy
+        prompt.disabled = self.active_session.running
         self._refresh_model_controls()
         if state is self.active_session:
             self._refresh_sidebar()
         self._refresh_active_status()
-        if not self.busy:
+        if state is self.active_session:
             prompt.focus()
 
     def _stop_active_tool_events(self, state: SessionTab) -> None:
@@ -2128,10 +2127,7 @@ class ToolboxApp(App[None]):
 
     def _refresh_active_status(self) -> None:
         state = self.active_session
-        message = state.status
-        if self.rollout_owner is not None and self.rollout_owner is not state:
-            message = f"{self.rollout_owner.label} running…"
-        self.query_one("#status-message", Static).update(message)
+        self.query_one("#status-message", Static).update(state.status)
         self.query_one("#status-session", Static).update(
             state.conversation.session_id[:10]
         )
@@ -2141,11 +2137,11 @@ class ToolboxApp(App[None]):
         prompt = self.query_one("#prompt", Input)
         with self.prevent(Input.Changed):
             prompt.value = state.draft
-        prompt.disabled = self.busy
+        prompt.disabled = state.running
         self._refresh_sidebar()
         self._refresh_model_controls()
         self._refresh_active_status()
-        if not self.busy:
+        if not state.running:
             prompt.focus()
 
     def _reset_session_ui(self, state: SessionTab) -> None:
@@ -2159,6 +2155,7 @@ class ToolboxApp(App[None]):
         state.user_history.clear()
         state.history_index = None
         state.history_draft = ""
+        state.running = False
         state.status = "ready"
 
     def _forwarded_child(

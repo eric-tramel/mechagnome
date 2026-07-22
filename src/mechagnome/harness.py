@@ -138,11 +138,11 @@ class Conversation:
             if self._closed:
                 return
             self._closed = True
-            self._cancel_locked(self._current_token)
+            if self._current_token is not None:
+                self._cancel_locked(self._current_token)
 
-    def _cancel_locked(self, token: _CancellationToken | None) -> None:
-        if token is not None:
-            token.cancel()
+    def _cancel_locked(self, token: _CancellationToken) -> None:
+        token.cancel()
         try:
             self.model_session.cancel_current()
         except Exception:

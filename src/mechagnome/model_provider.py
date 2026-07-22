@@ -116,6 +116,12 @@ class _CompletionProvider(Protocol):
         ...
 
 
+def _bind_session_transport(transport: Any, root_session_id: str) -> Any:
+    """Bind an opt-in transport to one root cancellation domain."""
+    bind = getattr(transport, "for_session", None)
+    return bind(root_session_id) if callable(bind) else transport
+
+
 class ToolModelProvider:
     """Narrow model capability exposed to authored tools.
 
@@ -159,6 +165,20 @@ class ModelProvider:
             )
         else:
             self.completion_transport = completion_transport
+        self._session_transport_lock = Lock()
+        self._session_transports: dict[tuple[int, str], Any] = {}
+
+    def _transport_for_session(self, transport: Any, root_session_id: str) -> Any:
+        """Return one cached transport view per source transport and root."""
+        if transport is None:
+            return None
+        key = (id(transport), root_session_id)
+        with self._session_transport_lock:
+            if key not in self._session_transports:
+                self._session_transports[key] = _bind_session_transport(
+                    transport, root_session_id
+                )
+            return self._session_transports[key]
 
     @classmethod
     def from_transport(
@@ -234,9 +254,15 @@ class ModelProvider:
             "model_input",
             {"messages": normalized},
         )
+        root_session_id = str(
+            self.kernel.session_metadata(parent_scope.session_id)["root_session_id"]
+        )
+        completion_transport = self._transport_for_session(
+            self.completion_transport, root_session_id
+        )
         complete = (
-            getattr(self.completion_transport, "complete", None)
-            if self.completion_transport is not None
+            getattr(completion_transport, "complete", None)
+            if completion_transport is not None
             else None
         )
         if not callable(complete):
@@ -274,10 +300,27 @@ class ModelSession:
     def __init__(self, provider: ModelProvider, session_id: str) -> None:
         self.provider = provider
         self.session_id = session_id
+        root_session_id = str(
+            provider.kernel.session_metadata(session_id)["root_session_id"]
+        )
+        self._bound_transports: dict[int, Any] = {}
+        for transport in (provider.transport, provider.completion_transport):
+            if transport is None or id(transport) in self._bound_transports:
+                continue
+            self._bound_transports[id(transport)] = provider._transport_for_session(
+                transport, root_session_id
+            )
 
     @property
     def transport(self) -> ModelTransport:
-        return self.provider.transport
+        return self._bound_transports[id(self.provider.transport)]
+
+    @property
+    def _completion_transport(self) -> CompletionTransport | None:
+        transport = self.provider.completion_transport
+        if transport is None:
+            return None
+        return self._bound_transports[id(transport)]
 
     def respond(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -405,21 +448,13 @@ class ModelSession:
             sink(kind, payload, sequence)
 
     def cancel_current(self) -> None:
-        seen: set[int] = set()
-        for target in (self.transport, self.provider.completion_transport):
-            if target is None or id(target) in seen:
-                continue
-            seen.add(id(target))
+        for target in self._bound_transports.values():
             cancel = getattr(target, "cancel_current", None)
             if callable(cancel):
                 cancel()
 
     def reset_cancellation(self) -> None:
-        seen: set[int] = set()
-        for target in (self.transport, self.provider.completion_transport):
-            if target is None or id(target) in seen:
-                continue
-            seen.add(id(target))
+        for target in self._bound_transports.values():
             reset = getattr(target, "reset_cancellation", None)
             if callable(reset):
                 reset()
@@ -503,11 +538,12 @@ class _SessionCompletionProvider:
 
     @property
     def supports_cancellation(self) -> bool:
+        session = ModelSession(self._provider, self._scope.session_id)
         targets = []
         if self._provider.completion_transport is not None:
-            targets.append(self._provider.completion_transport)
+            targets.append(session._completion_transport)
         if self._agent_runner is not None and self._provider.allow_tool_agents:
-            targets.append(self._provider.transport)
+            targets.append(session.transport)
         return all(
             all(
                 callable(getattr(target, name, None))

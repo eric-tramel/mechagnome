@@ -58,7 +58,7 @@ those effort levels.
 
 TUI commands:
 
-- `Esc` stops the active model stream or tool rollout.
+- `Esc` stops the active tab's model stream or tool rollout.
 - `Ctrl+N` or `/new` opens a fresh saved conversation in a new tab without
   clearing tools. Use `TAB` or click a session tab to switch conversations.
 - `/clear` resets the active tab with a fresh saved session. The previous

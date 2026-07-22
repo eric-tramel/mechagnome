@@ -5,10 +5,11 @@ from __future__ import annotations
 import socket
 import threading
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import pytest
 
-from mechagnome import ToolboxError
+from mechagnome import Kernel, ModelProvider, ModelTurn, ToolboxError
 from mechagnome.model_provider import (
     MAX_MODEL_CALLS,
     MAX_MODEL_RESPONSE_BYTES,
@@ -35,6 +36,49 @@ class RecordingProvider:
         pass
 
 
+class SessionBindingTransport:
+    def __init__(self) -> None:
+        self.bound_keys: list[str] = []
+        self.completed_keys: list[str] = []
+        self.cancelled_keys: list[str] = []
+        self.reset_keys: list[str] = []
+
+    def for_session(self, root_session_id: str) -> BoundSessionTransport:
+        self.bound_keys.append(root_session_id)
+        return BoundSessionTransport(self, root_session_id)
+
+    def respond(self, messages: object, tools: object) -> ModelTurn:
+        raise AssertionError("unbound transport should not receive model traffic")
+
+    def complete(self, messages: object) -> str:
+        raise AssertionError("unbound transport should not receive completions")
+
+    def cancel_current(self) -> None:
+        raise AssertionError("unbound transport should not be cancelled")
+
+    def reset_cancellation(self) -> None:
+        raise AssertionError("unbound transport should not be reset")
+
+
+class BoundSessionTransport:
+    def __init__(self, transport: SessionBindingTransport, root_key: str) -> None:
+        self.transport = transport
+        self.root_key = root_key
+
+    def respond(self, messages: object, tools: object) -> ModelTurn:
+        return ModelTurn(text=self.root_key)
+
+    def complete(self, messages: object) -> str:
+        self.transport.completed_keys.append(self.root_key)
+        return self.root_key
+
+    def cancel_current(self) -> None:
+        self.transport.cancelled_keys.append(self.root_key)
+
+    def reset_cancellation(self) -> None:
+        self.transport.reset_keys.append(self.root_key)
+
+
 def test_bounded_provider_validates_normalizes_and_counts_attempts() -> None:
     provider = RecordingProvider()
     bounded = _bind_model_provider(provider)
@@ -56,6 +100,30 @@ def test_bounded_provider_validates_normalizes_and_counts_attempts() -> None:
         bounded.complete([{"role": "user", "content": "hello"}])
     assert exhausted.value.code == "model_provider_limit"
     assert len(provider.messages) == MAX_MODEL_CALLS - len(invalid_messages)
+
+
+def test_model_and_completion_transports_bind_to_the_durable_root(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    transport = SessionBindingTransport()
+    provider = ModelProvider(kernel, transport)
+    root = provider.start_session()
+    child = provider.start_session(parent_scope=kernel.snapshot_scope(root.session_id))
+
+    assert child.transport.respond([], []).text == root.session_id
+    completion = child.completion_provider()
+    assert completion.complete([{"role": "user", "content": "hello"}]) == (
+        root.session_id
+    )
+
+    child.cancel_current()
+    child.reset_cancellation()
+
+    assert transport.completed_keys == [root.session_id]
+    assert transport.cancelled_keys == [root.session_id]
+    assert transport.reset_keys == [root.session_id]
+    assert transport.bound_keys == [root.session_id]
 
 
 def test_bounded_provider_sanitizes_failures_and_enforces_result_limit() -> None:

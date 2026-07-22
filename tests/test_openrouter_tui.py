@@ -985,6 +985,94 @@ def test_conversation_cancellation_closes_active_openrouter_stream(
     assert [event["kind"] for event in events] == ["user", "cancelled"]
 
 
+def test_openrouter_cancellation_is_isolated_between_root_sessions(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    streams = {
+        "first": PausingSSEStream(),
+        "second": PausingSSEStream(),
+    }
+
+    def response(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=streams[prompt],
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(response)),
+    )
+    provider = ModelProvider(kernel, model)
+    conversations = {
+        name: Harness(kernel).start(provider) for name in ("first", "second")
+    }
+    results: dict[str, str] = {}
+    failures: dict[str, BaseException] = {}
+
+    def run(name: str) -> None:
+        try:
+            results[name] = conversations[name].send(name).answer
+        except BaseException as error:
+            failures[name] = error
+
+    threads = {
+        name: threading.Thread(target=run, args=(name,)) for name in conversations
+    }
+    for thread in threads.values():
+        thread.start()
+    assert streams["first"].started.wait(timeout=1)
+    assert streams["second"].started.wait(timeout=1)
+
+    assert conversations["first"].cancel() is True
+    threads["first"].join(timeout=2)
+    assert threads["first"].is_alive() is False
+    assert streams["first"].closed is True
+    assert streams["second"].closed is False
+    assert threads["second"].is_alive() is True
+
+    streams["second"].release.set()
+    threads["second"].join(timeout=2)
+
+    assert threads["second"].is_alive() is False
+    assert isinstance(failures["first"], RunCancelled)
+    assert "second" not in failures
+    assert results["second"] == "Partial"
+
+
+def test_openrouter_pre_registration_cancellation_is_root_local() -> None:
+    requests: list[str] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        requests.append(prompt)
+        return sse_response({"choices": [{"delta": {"content": prompt}}]})
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(response)),
+    )
+    first = model.for_session("first-root")
+    second = model.for_session("second-root")
+
+    first.cancel_current()
+
+    assert second.respond([{"role": "user", "content": "second"}], []).text == (
+        "second"
+    )
+    with pytest.raises(OpenRouterError) as cancelled:
+        first.respond([{"role": "user", "content": "first"}], [])
+    assert cancelled.value.code == "openrouter_cancelled"
+    assert requests == ["second"]
+
+    first.reset_cancellation()
+
+
 def test_closed_conversation_rejects_a_late_rollout(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     model = FinalModel()
@@ -1986,6 +2074,56 @@ class PausingStreamingModel:
         self.release.set()
 
 
+class ConcurrentPausingModel:
+    """Pause independent root sessions so overlap and cancellation are observable."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.started: dict[str, threading.Event] = {}
+        self.releases: dict[str, threading.Event] = {}
+        self.cancelled: set[str] = set()
+
+    def for_session(self, root_session_id: str) -> BoundConcurrentPausingModel:
+        with self._lock:
+            self.started.setdefault(root_session_id, threading.Event())
+            self.releases.setdefault(root_session_id, threading.Event())
+        return BoundConcurrentPausingModel(self, root_session_id)
+
+    def wait_until_started(self, root_session_id: str) -> bool:
+        return self.started[root_session_id].wait(timeout=1)
+
+    def release(self, root_session_id: str) -> None:
+        self.releases[root_session_id].set()
+
+
+class BoundConcurrentPausingModel:
+    def __init__(self, model: ConcurrentPausingModel, root_session_id: str) -> None:
+        self.model = model
+        self.root_session_id = root_session_id
+
+    def stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> Any:
+        prompt = str(messages[-1]["content"])
+        self.model.started[self.root_session_id].set()
+        yield ModelStreamEvent(text_delta=f"Partial {prompt}")
+        self.model.releases[self.root_session_id].wait(timeout=3)
+        text = f"Finished {prompt}"
+        yield ModelStreamEvent(turn=ModelTurn(text=text))
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        raise AssertionError("streaming interface should be preferred")
+
+    def cancel_current(self) -> None:
+        self.model.cancelled.add(self.root_session_id)
+        self.model.release(self.root_session_id)
+
+    def reset_cancellation(self) -> None:
+        pass
+
+
 def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     model = PausingStreamingModel()
@@ -2026,62 +2164,119 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
     assert kinds == ["user", "model", "final"]
 
 
-def test_tabs_can_switch_during_rollout_without_misrouting_output(
+def test_tabs_can_run_concurrently_without_misrouting_output(
     tmp_path: Path,
 ) -> None:
-    model = PausingStreamingModel()
+    model = ConcurrentPausingModel()
     app = ToolboxApp(Kernel(tmp_path / "toolbox.db"), model, model_name="test/model")
 
     async def exercise() -> None:
         async with app.run_test(size=(120, 40)) as pilot:
-            owner = app.active_session
+            first = app.active_session
+            first_id = first.conversation.session_id
             prompt = app.query_one("#prompt", Input)
-            prompt.value = "stream in the first tab"
+            prompt.value = "first tab"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause()
-                if model.started.is_set() and owner.streamed_text:
-                    break
+            assert model.wait_until_started(first_id)
 
             await pilot.press("ctrl+n")
             await pilot.pause()
-            other = app.active_session
-            assert other is not owner
-            assert app.rollout_owner is owner
-            assert prompt.disabled is True
-            assert "Partial" in chat_text(app, owner.chat)
-            assert "Partial" not in chat_text(app, other.chat)
-            assert "Session 1 running" in str(
-                app.query_one("#status-message", Static).render()
-            )
+            second = app.active_session
+            second_id = second.conversation.session_id
+            assert second is not first
+            assert prompt.disabled is False
 
-            other_conversation = other.conversation
-            await app.action_clear_session()
-            await app.action_end_session()
-            assert other.conversation is other_conversation
-            assert other in app.session_tabs
-            assert app.rollout_owner is owner
+            prompt.value = "second tab"
+            await pilot.press("enter")
+            assert model.wait_until_started(second_id)
+            for _ in range(30):
+                await pilot.pause()
+                if first.streamed_text and second.streamed_text:
+                    break
 
-            await pilot.press("tab")
-            await pilot.pause()
-            assert app.active_session is owner
-            await pilot.press("tab")
-            await pilot.pause()
-            assert app.active_session is other
+            assert first.running is True
+            assert second.running is True
+            assert app.busy is True
+            assert "Partial first tab" in chat_text(app, first.chat)
+            assert "Partial second tab" in chat_text(app, second.chat)
 
-            await pilot.press("escape")
+            model.release(second_id)
+            for _ in range(30):
+                await pilot.pause()
+                if not second.running:
+                    break
+            assert first.running is True
+            assert second.running is False
+            assert prompt.disabled is False
+            assert "Finished second tab" in chat_text(app, second.chat)
+            assert "Finished second tab" not in chat_text(app, first.chat)
+
+            model.release(first_id)
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert model.cancelled.is_set()
-            assert app.rollout_owner is None
+            assert first.running is False
+            assert app.busy is False
             assert prompt.disabled is False
-            assert "stopped" in chat_text(app, owner.chat)
-            assert "Partial" not in chat_text(app, other.chat)
+            assert "Finished first tab" in chat_text(app, first.chat)
+            assert "Finished first tab" not in chat_text(app, second.chat)
 
-    try:
-        asyncio.run(exercise())
-    finally:
-        model.release.set()
+    asyncio.run(exercise())
+
+
+def test_active_tab_cancellation_and_idle_teardown_are_session_local(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = ConcurrentPausingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            first = app.active_session
+            first_id = first.conversation.session_id
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "keep running"
+            await pilot.press("enter")
+            assert model.wait_until_started(first_id)
+
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            second = app.active_session
+            second_id = second.conversation.session_id
+            prompt.value = "cancel me"
+            await pilot.press("enter")
+            assert model.wait_until_started(second_id)
+
+            await pilot.press("escape")
+            for _ in range(30):
+                await pilot.pause()
+                if not second.running:
+                    break
+            assert second_id in model.cancelled
+            assert first_id not in model.cancelled
+            assert first.running is True
+            assert second.running is False
+            assert "stopped" in chat_text(app, second.chat)
+
+            old_second = second.conversation
+            await app.action_clear_session()
+            assert second.conversation is not old_second
+            await app.action_end_session()
+            assert second not in app.session_tabs
+            assert app.active_session is first
+
+            await app.action_clear_session()
+            await app.action_end_session()
+            assert first in app.session_tabs
+            assert first.running is True
+
+            model.release(first_id)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert first.running is False
+            assert first_id not in model.cancelled
+
+    asyncio.run(exercise())
 
 
 def test_tool_manager_opens_during_streaming_rollout(tmp_path: Path) -> None:

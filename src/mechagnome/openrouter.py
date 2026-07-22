@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
@@ -23,6 +23,7 @@ DEFAULT_KEY_ENV = "OPENROUTER_API_KEY"
 MAX_STREAM_BYTES = 4_000_000
 MAX_COMPLETION_TOKENS = 2048
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_DEFAULT_SESSION = object()
 
 # Open-ended nested objects are not represented consistently by every model or
 # provider behind an OpenAI-compatible tool-calling endpoint. Keep the kernel's
@@ -75,6 +76,15 @@ class OpenRouterModelOption:
     reasoning_mandatory: bool = False
 
 
+@dataclass
+class _ActiveSession:
+    """Cancelable OpenRouter resources active in one root session."""
+
+    clients: dict[int, httpx.Client] = field(default_factory=dict)
+    responses: dict[int, httpx.Response] = field(default_factory=dict)
+    cancel_requested: bool = False
+
+
 class OpenRouterModel:
     """Streaming OpenRouter Chat Completions model adapter."""
 
@@ -96,10 +106,7 @@ class OpenRouterModel:
         self.timeout = timeout
         self.client = client
         self._active_lock = Lock()
-        self._active_client: httpx.Client | None = None
-        self._active_client_closeable = False
-        self._active_response: httpx.Response | None = None
-        self._cancel_requested = False
+        self._active_sessions: dict[object, _ActiveSession] = {}
 
     @property
     def ready(self) -> bool:
@@ -108,21 +115,37 @@ class OpenRouterModel:
 
     def cancel_current(self) -> None:
         """Close the active streaming response so a blocked read wakes promptly."""
+        self._cancel_session(_DEFAULT_SESSION)
+
+    def reset_cancellation(self) -> None:
+        """Discard the direct-call cancellation latch after a rollout ends."""
+        self._reset_session(_DEFAULT_SESSION)
+
+    def for_session(self, root_session_id: str) -> _SessionOpenRouterModel:
+        """Return a view whose cancellation is isolated to one durable root."""
+        return _SessionOpenRouterModel(self, root_session_id)
+
+    def _cancel_session(self, session_key: object) -> None:
         with self._active_lock:
-            self._cancel_requested = True
-            response = self._active_response
-            client = self._active_client if self._active_client_closeable else None
-        if response is not None:
+            state = self._active_sessions.setdefault(session_key, _ActiveSession())
+            state.cancel_requested = True
+            responses = list(state.responses.values())
+            clients = list(state.clients.values())
+        for response in responses:
             with suppress(Exception):
                 response.close()
-        if client is not None:
+        for client in clients:
             with suppress(Exception):
                 client.close()
 
-    def reset_cancellation(self) -> None:
-        """Discard a cancellation latch when its conversation rollout has ended."""
+    def _reset_session(self, session_key: object) -> None:
         with self._active_lock:
-            self._cancel_requested = False
+            state = self._active_sessions.get(session_key)
+            if state is None:
+                return
+            state.cancel_requested = False
+            if not state.clients and not state.responses:
+                self._active_sessions.pop(session_key, None)
 
     def available_models(self) -> list[OpenRouterModelOption]:
         """Return text models that can use Mechagnome's tool-calling surface."""
@@ -201,8 +224,16 @@ class OpenRouterModel:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelTurn:
         """Consume a streaming OpenRouter response into one model turn."""
+        return self._respond(messages, tools, _DEFAULT_SESSION)
+
+    def _respond(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        session_key: object,
+    ) -> ModelTurn:
         completed: ModelTurn | None = None
-        for event in self.stream(messages, tools):
+        for event in self._stream(messages, tools, session_key):
             if event.turn is not None:
                 completed = event.turn
         if completed is None:
@@ -213,6 +244,11 @@ class OpenRouterModel:
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Return a text-only completion without the outer agent prompt or tools."""
+        return self._complete(messages, _DEFAULT_SESSION)
+
+    def _complete(
+        self, messages: Sequence[Mapping[str, str]], session_key: object
+    ) -> str:
         if not self.api_key:
             raise OpenRouterError(
                 "missing_api_key",
@@ -229,11 +265,15 @@ class OpenRouterModel:
             if self.client is None:
                 with (
                     httpx.Client(timeout=self.timeout) as client,
-                    self._active(client=client, close_client_on_cancel=True),
+                    self._active(
+                        session_key,
+                        client=client,
+                        close_client_on_cancel=True,
+                    ),
                 ):
-                    return self._completion_response(client, body)
-            with self._active(client=self.client):
-                return self._completion_response(self.client, body)
+                    return self._completion_response(client, body, session_key)
+            with self._active(session_key, client=self.client):
+                return self._completion_response(self.client, body, session_key)
         except (httpx.HTTPError, httpx.StreamError) as error:
             raise OpenRouterError(
                 "openrouter_transport", f"OpenRouter request failed: {error}"
@@ -243,6 +283,14 @@ class OpenRouterModel:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> Iterator[ModelStreamEvent]:
         """Yield OpenRouter text deltas and one assembled final turn."""
+        yield from self._stream(messages, tools, _DEFAULT_SESSION)
+
+    def _stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        session_key: object,
+    ) -> Iterator[ModelStreamEvent]:
         if not self.api_key:
             raise OpenRouterError(
                 "missing_api_key",
@@ -265,19 +313,23 @@ class OpenRouterModel:
             if self.client is None:
                 with (
                     httpx.Client(timeout=self.timeout) as client,
-                    self._active(client=client, close_client_on_cancel=True),
+                    self._active(
+                        session_key,
+                        client=client,
+                        close_client_on_cancel=True,
+                    ),
                 ):
-                    yield from self._stream_response(client, body)
+                    yield from self._stream_response(client, body, session_key)
             else:
-                with self._active(client=self.client):
-                    yield from self._stream_response(self.client, body)
+                with self._active(session_key, client=self.client):
+                    yield from self._stream_response(self.client, body, session_key)
         except (httpx.HTTPError, httpx.StreamError) as error:
             raise OpenRouterError(
                 "openrouter_transport", f"OpenRouter request failed: {error}"
             ) from error
 
     def _stream_response(
-        self, client: httpx.Client, body: dict[str, Any]
+        self, client: httpx.Client, body: dict[str, Any], session_key: object
     ) -> Iterator[ModelStreamEvent]:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -298,7 +350,7 @@ class OpenRouterModel:
                 },
                 json=body,
             ) as response,
-            self._active(response=response),
+            self._active(session_key, response=response),
         ):
             if response.is_error:
                 response.read()
@@ -456,7 +508,9 @@ class OpenRouterModel:
             )
         )
 
-    def _completion_response(self, client: httpx.Client, body: dict[str, Any]) -> str:
+    def _completion_response(
+        self, client: httpx.Client, body: dict[str, Any], session_key: object
+    ) -> str:
         deadline = time.monotonic() + self.timeout
         response_bytes = bytearray()
         with (
@@ -466,7 +520,7 @@ class OpenRouterModel:
                 headers={**self._headers(), "Accept": "application/json"},
                 json=body,
             ) as response,
-            self._active(response=response),
+            self._active(session_key, response=response),
         ):
             if response.is_error:
                 response.read()
@@ -521,20 +575,21 @@ class OpenRouterModel:
     @contextmanager
     def _active(
         self,
+        session_key: object,
         *,
         client: httpx.Client | None = None,
         response: httpx.Response | None = None,
         close_client_on_cancel: bool = False,
     ) -> Iterator[None]:
         with self._active_lock:
-            if client is not None:
-                self._active_client = client
-                self._active_client_closeable = close_client_on_cancel
+            state = self._active_sessions.setdefault(session_key, _ActiveSession())
+            if client is not None and close_client_on_cancel:
+                state.clients[id(client)] = client
             if response is not None:
-                self._active_response = response
-            cancel_requested = self._cancel_requested
+                state.responses[id(response)] = response
+            cancel_requested = state.cancel_requested
             if cancel_requested:
-                self._cancel_requested = False
+                state.cancel_requested = False
         try:
             if cancel_requested:
                 if response is not None:
@@ -549,11 +604,21 @@ class OpenRouterModel:
             yield
         finally:
             with self._active_lock:
-                if client is not None and self._active_client is client:
-                    self._active_client = None
-                    self._active_client_closeable = False
-                if response is not None and self._active_response is response:
-                    self._active_response = None
+                state = self._active_sessions.get(session_key)
+                if state is not None:
+                    if client is not None and state.clients.get(id(client)) is client:
+                        state.clients.pop(id(client), None)
+                    if (
+                        response is not None
+                        and state.responses.get(id(response)) is response
+                    ):
+                        state.responses.pop(id(response), None)
+                    if (
+                        not state.cancel_requested
+                        and not state.clients
+                        and not state.responses
+                    ):
+                        self._active_sessions.pop(session_key, None)
 
     @staticmethod
     def _merge_tool_deltas(accumulated: dict[int, dict[str, Any]], deltas: Any) -> None:
@@ -619,21 +684,21 @@ class OpenRouterModel:
     @staticmethod
     def _to_wire_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
         wired = dict(args)
-        for field in JSON_OBJECT_ARGUMENTS.get(name, {}):
-            value = wired.get(field)
+        for argument in JSON_OBJECT_ARGUMENTS.get(name, {}):
+            value = wired.get(argument)
             if isinstance(value, dict):
-                wired[field] = json.dumps(value, separators=(",", ":"))
+                wired[argument] = json.dumps(value, separators=(",", ":"))
         return wired
 
     @staticmethod
     def _from_wire_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
         decoded = dict(args)
-        for field in JSON_OBJECT_ARGUMENTS.get(name, {}):
-            value = decoded.get(field)
+        for argument in JSON_OBJECT_ARGUMENTS.get(name, {}):
+            value = decoded.get(argument)
             if not isinstance(value, str):
                 continue
             try:
-                decoded[field] = json.loads(value)
+                decoded[argument] = json.loads(value)
             except json.JSONDecodeError:
                 # Preserve malformed model output so the core operation can
                 # return a normal repairable tool observation.
@@ -745,3 +810,30 @@ class OpenRouterModel:
             message or f"OpenRouter returned HTTP {response.status_code}",
             status=response.status_code,
         )
+
+
+class _SessionOpenRouterModel:
+    """OpenRouter transport view bound to one root cancellation domain."""
+
+    def __init__(self, model: OpenRouterModel, session_key: str) -> None:
+        self._model = model
+        self._session_key = session_key
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        return self._model._respond(messages, tools, self._session_key)
+
+    def stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> Iterator[ModelStreamEvent]:
+        yield from self._model._stream(messages, tools, self._session_key)
+
+    def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
+        return self._model._complete(messages, self._session_key)
+
+    def cancel_current(self) -> None:
+        self._model._cancel_session(self._session_key)
+
+    def reset_cancellation(self) -> None:
+        self._model._reset_session(self._session_key)
