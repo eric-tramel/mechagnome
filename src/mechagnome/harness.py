@@ -229,6 +229,7 @@ class Conversation:
         token: _CancellationToken,
     ) -> ModelTurn:
         token.check()
+        self._emit_transient(sink, "model_started", {})
         completed: ModelTurn | None = None
         for event in self.model_session._stream_with_recorded_input(
             self.messages,
