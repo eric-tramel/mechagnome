@@ -13,17 +13,17 @@ from mechagnome.openrouter import DEFAULT_MODEL, OpenRouterModel
 from mechagnome.tui import run_tui
 
 ADD_SOURCE = """\
-def main(input, ctx):
+async def main(input, ctx):
     return {"sum": input["a"] + input["b"]}
 """
 
 DOUBLE_SOURCE = """\
-def main(input, ctx):
-    return ctx.call_tool("add", {"a": input["value"], "b": input["value"]})
+async def main(input, ctx):
+    return await ctx.call_tool("add", {"a": input["value"], "b": input["value"]})
 """
 
 RECALL_SOURCE = """\
-def main(input, ctx):
+async def main(input, ctx):
     current = ctx.sessions.current(limit=100)
     return {
         "session_id": ctx.sessions.id,
@@ -36,7 +36,7 @@ def main(input, ctx):
 """
 
 SEARCH_REPLACEMENT = """\
-def main(input, ctx):
+async def main(input, ctx):
     return {"replacement": True, "query": input["query"]}
 """
 

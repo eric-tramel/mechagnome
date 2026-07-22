@@ -283,6 +283,9 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert captured["body"]["parallel_tool_calls"] is True
     assert captured["body"]["stream"] is True
     assert captured["body"]["messages"][0]["role"] == "system"
+    system_prompt = captured["body"]["messages"][0]["content"]
+    assert "async def main(input, ctx)" in system_prompt
+    assert "Await ctx.call_tool" in " ".join(system_prompt.split())
     tools = {
         tool["function"]["name"]: tool["function"] for tool in captured["body"]["tools"]
     }
@@ -294,9 +297,12 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
         "call_tool",
     ]
     write_schema = tools["write_tool"]["parameters"]["properties"]["input_schema"]
+    source_schema = tools["write_tool"]["parameters"]["properties"]["source"]
     call_schema = tools["call_tool"]["parameters"]["properties"]["args"]
     assert write_schema["type"] == "string"
     assert "JSON-encoded JSON Schema object" in write_schema["description"]
+    assert "async def main(input, ctx)" in source_schema["description"]
+    assert "ctx.call_tool" in source_schema["description"]
     assert call_schema["type"] == "string"
     assert "JSON-encoded object" in call_schema["description"]
     assert turn.calls[0].name == "help"
@@ -400,6 +406,23 @@ def test_openrouter_completion_reuses_borrowed_client_after_cancellation() -> No
     model.reset_cancellation()
     assert model.complete([{"role": "user", "content": "second"}]) == "reused"
     assert client.is_closed is False
+
+
+def test_openrouter_cancellation_closes_every_active_response() -> None:
+    model = OpenRouterModel(api_key="test-key")
+    first = httpx.Response(200)
+    second = httpx.Response(200)
+
+    with (
+        model._active(openrouter_module._DEFAULT_SESSION, response=first),
+        model._active(openrouter_module._DEFAULT_SESSION, response=second),
+    ):
+        model.cancel_current()
+
+        assert first.is_closed is True
+        assert second.is_closed is True
+
+    model.reset_cancellation()
 
 
 def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
@@ -823,7 +846,7 @@ def test_openrouter_adapter_round_trips_objects_and_keeps_parallel_calls(
                         "name": "search",
                         "description": "Search for gnomes.",
                         "input_schema": input_schema,
-                        "source": "def main(input, ctx):\n    return input\n",
+                        "source": "async def main(input, ctx):\n    return input\n",
                     },
                 }
             ],
@@ -1558,7 +1581,7 @@ def test_authored_tools_do_not_inherit_provider_credentials(
             "input_schema": {"type": "object"},
             "source": (
                 "import os\n\n"
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 "    return {'key': os.environ.get('OPENROUTER_API_KEY')}\n"
             ),
         },
@@ -1601,7 +1624,7 @@ def test_authored_tools_inherit_git_and_ssh_environment(
             "input_schema": {"type": "object"},
             "source": (
                 "import os\n\n"
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 f"    names = {names!r}\n"
                 "    return {name: os.environ.get(name) for name in names}\n"
             ),
@@ -1646,8 +1669,8 @@ def test_isolated_model_provider_is_predictably_unavailable(tmp_path: Path) -> N
             "description": "Request a completion.",
             "input_schema": {"type": "object"},
             "source": (
-                "def main(input, ctx):\n"
-                "    return ctx.model_provider.complete([\n"
+                "async def main(input, ctx):\n"
+                "    return await ctx.model_provider.complete([\n"
                 "        {'role': 'user', 'content': 'hello'},\n"
                 "    ])\n"
             ),
@@ -1702,10 +1725,10 @@ def test_isolated_tool_uses_host_authenticated_model_provider(
                 "import os\n"
                 "import sys\n"
                 "from pathlib import Path\n\n"
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 "    request_text = Path(sys.argv[1]).read_text()\n"
                 "    return {\n"
-                "        'text': ctx.model_provider.complete([\n"
+                "        'text': await ctx.model_provider.complete([\n"
                 "            {'role': 'user', 'content': 'nested'},\n"
                 "        ]),\n"
                 "        'worker_pid': os.getpid(),\n"
@@ -1780,18 +1803,18 @@ def test_isolated_provider_budget_counts_invalid_attempts(tmp_path: Path) -> Non
             "description": "Exercise the model provider budget.",
             "input_schema": {"type": "object"},
             "source": (
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 "    codes = []\n"
                 "    try:\n"
-                "        ctx.model_provider.complete([])\n"
+                "        await ctx.model_provider.complete([])\n"
                 "    except Exception as error:\n"
                 "        codes.append(error.code)\n"
                 "    for _ in range(7):\n"
-                "        ctx.model_provider.complete([\n"
+                "        await ctx.model_provider.complete([\n"
                 "            {'role': 'user', 'content': 'valid'},\n"
                 "        ])\n"
                 "    try:\n"
-                "        ctx.model_provider.complete([\n"
+                "        await ctx.model_provider.complete([\n"
                 "            {'role': 'user', 'content': 'exhausted'},\n"
                 "        ])\n"
                 "    except Exception as error:\n"
@@ -1845,8 +1868,8 @@ def test_tool_timeout_cancels_and_resets_cooperative_model_provider(
             "description": "Wait for a model completion.",
             "input_schema": {"type": "object"},
             "source": (
-                "def main(input, ctx):\n"
-                "    return ctx.model_provider.complete([\n"
+                "async def main(input, ctx):\n"
+                "    return await ctx.model_provider.complete([\n"
                 "        {'role': 'user', 'content': 'wait'},\n"
                 "    ])\n"
             ),
@@ -1900,15 +1923,16 @@ def test_runner_cancels_broker_request_left_by_worker_daemon_thread(
             "description": "Leave a provider request active while returning.",
             "input_schema": {"type": "object"},
             "source": (
+                "import asyncio\n"
                 "import threading\n"
                 "import time\n\n"
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 "    started = threading.Event()\n"
                 "    def request():\n"
                 "        started.set()\n"
-                "        ctx.model_provider.complete([\n"
+                "        asyncio.run(ctx.model_provider.complete([\n"
                 "            {'role': 'user', 'content': 'background'},\n"
-                "        ])\n"
+                "        ]))\n"
                 "    threading.Thread(target=request, daemon=True).start()\n"
                 "    started.wait(timeout=1)\n"
                 "    time.sleep(0.1)\n"
@@ -1992,7 +2016,7 @@ def test_isolated_worker_uses_persisted_session_cwd(tmp_path: Path) -> None:
         name="where",
         description="Return the process working directory.",
         input_schema={"type": "object"},
-        source="import os\n\ndef main(input, ctx):\n    return os.getcwd()\n",
+        source="import os\n\nasync def main(input, ctx):\n    return os.getcwd()\n",
     )
     session_id = kernel.create_session()
 
@@ -2017,7 +2041,7 @@ def test_inflight_worker_keeps_its_toolbox_selection_snapshot(tmp_path: Path) ->
         name="same",
         description="Return alpha.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 'alpha'\n",
+        source="async def main(input, ctx):\n    return 'alpha'\n",
         session_id=session_id,
     )
     kernel.write_tool(
@@ -2027,11 +2051,11 @@ def test_inflight_worker_keeps_its_toolbox_selection_snapshot(tmp_path: Path) ->
         source=(
             "import time\n"
             "from pathlib import Path\n\n"
-            "def main(input, ctx):\n"
+            "async def main(input, ctx):\n"
             "    Path(input['ready']).write_text('ready')\n"
             "    while not Path(input['release']).exists():\n"
             "        time.sleep(0.01)\n"
-            "    return ctx.call_tool('same', {})\n"
+            "    return await ctx.call_tool('same', {})\n"
         ),
         session_id=session_id,
     )
@@ -2040,7 +2064,7 @@ def test_inflight_worker_keeps_its_toolbox_selection_snapshot(tmp_path: Path) ->
         name="same",
         description="Return beta.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 'beta'\n",
+        source="async def main(input, ctx):\n    return 'beta'\n",
         session_id=session_id,
     )
     kernel.select_toolboxes(session_id, ["alpha", "beta"], mode="use")
@@ -3342,7 +3366,7 @@ def test_tui_detached_tool_keeps_spinning_and_streams_tail_after_rollout(
             "source": (
                 "import time\n"
                 "from pathlib import Path\n\n"
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 "    print('stream started', flush=True)\n"
                 f"    Path({str(started)!r}).write_text('yes')\n"
                 f"    while not Path({str(release)!r}).exists():\n"
@@ -3414,7 +3438,7 @@ def test_tui_exit_cancels_active_detached_tool_without_callback_deadlock(
             "source": (
                 "import time\n"
                 "from pathlib import Path\n\n"
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 f"    Path({str(started)!r}).write_text('yes')\n"
                 "    while True:\n"
                 "        print('still running', flush=True)\n"
@@ -3472,7 +3496,7 @@ def test_escape_terminates_active_tool_subprocess(tmp_path: Path) -> None:
                 "import subprocess\n"
                 "import sys\n"
                 "import time\n\n"
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 f"    child_code = {child_code!r}\n"
                 "    child = subprocess.Popen(\n"
                 "        [sys.executable, '-c', child_code]\n"
@@ -3587,7 +3611,8 @@ class ToolWritingModel:
                             "description": "Return a greeting.",
                             "input_schema": {"type": "object"},
                             "source": (
-                                "def main(input, ctx):\n    return {'hello': 'world'}\n"
+                                "async def main(input, ctx):\n"
+                                "    return {'hello': 'world'}\n"
                             ),
                         },
                         "write-hello",
@@ -3743,7 +3768,7 @@ def test_tui_collapses_forwarded_tool_failure_without_duplicates(
         name="boom",
         description="Raise a test error.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    raise RuntimeError('broken')\n",
+        source="async def main(input, ctx):\n    raise RuntimeError('broken')\n",
     )
     app = ToolboxApp(kernel, SingleToolModel("boom"), model_name="test/model")
 
@@ -3787,11 +3812,13 @@ def test_tui_collapses_forwarded_tool_failure_without_duplicates(
     [
         (
             "boom",
-            "def main(input, ctx):\n    raise RuntimeError('child broke')\n",
+            "async def main(input, ctx):\n    raise RuntimeError('child broke')\n",
             (
-                "def main(input, ctx):\n"
+                "async def main(input, ctx):\n"
                 "    try:\n"
-                "        return ctx.kernel.execute(input['name'], input['args'])\n"
+                "        return await ctx.kernel.execute(\n"
+                "            input['name'], input['args']\n"
+                "        )\n"
                 "    except Exception:\n"
                 "        return {'recovered': True}\n"
             ),
@@ -3801,10 +3828,10 @@ def test_tui_collapses_forwarded_tool_failure_without_duplicates(
         ),
         (
             "okay",
-            "def main(input, ctx):\n    return {'child': 'success'}\n",
+            "async def main(input, ctx):\n    return {'child': 'success'}\n",
             (
-                "def main(input, ctx):\n"
-                "    ctx.kernel.execute(input['name'], input['args'])\n"
+                "async def main(input, ctx):\n"
+                "    await ctx.kernel.execute(input['name'], input['args'])\n"
                 "    raise RuntimeError('outer broke')\n"
             ),
             "error",
@@ -3813,8 +3840,8 @@ def test_tui_collapses_forwarded_tool_failure_without_duplicates(
         ),
         (
             "unused",
-            "def main(input, ctx):\n    return 'not called'\n",
-            "def main(input, ctx):\n    return {'intercepted': input['name']}\n",
+            "async def main(input, ctx):\n    return 'not called'\n",
+            "async def main(input, ctx):\n    return {'intercepted': input['name']}\n",
             "response",
             "call_tool",
             '"intercepted": "unused"',
@@ -3867,7 +3894,7 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
         name="identity",
         description="Return alpha.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 'alpha'\n",
+        source="async def main(input, ctx):\n    return 'alpha'\n",
         session_id=setup,
     )
     kernel.select_toolboxes(setup, ["beta"], mode="use")
@@ -3875,7 +3902,7 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
         name="identity",
         description="Return beta.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 'beta'\n",
+        source="async def main(input, ctx):\n    return 'beta'\n",
         session_id=setup,
     )
     app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
@@ -3892,7 +3919,9 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
             selected = kernel.active_toolboxes(app.conversation.session_id)
             assert [item["name"] for item in selected] == ["beta", "alpha"]
             assert (
-                kernel.call("identity", {}, session_id=app.conversation.session_id)
+                await kernel.call_async(
+                    "identity", {}, session_id=app.conversation.session_id
+                )
                 == "beta"
             )
             sidebar = "\n".join(
@@ -3917,7 +3946,7 @@ def test_tool_manager_switches_blanks_and_renames_namespaces(tmp_path: Path) -> 
         name="alpha_tool",
         description="Only in alpha.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 'alpha'\n",
+        source="async def main(input, ctx):\n    return 'alpha'\n",
         session_id=session_id,
     )
     kernel.select_toolboxes(session_id, ["beta"], mode="use")
@@ -3925,7 +3954,7 @@ def test_tool_manager_switches_blanks_and_renames_namespaces(tmp_path: Path) -> 
         name="beta_tool",
         description="Only in beta.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 'beta'\n",
+        source="async def main(input, ctx):\n    return 'beta'\n",
         session_id=session_id,
     )
     kernel.select_toolboxes(session_id, ["alpha"], mode="use")
@@ -4012,14 +4041,14 @@ def test_tool_manager_navigates_source_diff_stats_and_deletes(tmp_path: Path) ->
         name="number",
         description="Return the first number without parsing [bold]markup[/bold].",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 1",
+        source="async def main(input, ctx):\n    return 1",
         session_id=creator,
     )
     kernel.write_tool(
         name="number",
         description="A literal closing tag: [/bold]",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return 2",
+        source="async def main(input, ctx):\n    return 2",
         base_version=1,
         session_id=creator,
     )

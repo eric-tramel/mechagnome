@@ -76,6 +76,9 @@ For a long-running independent call_tool invocation, set detach=true, continue
 other work with the returned job_id, and inspect it later with call_tool.
 Tools may call other tools through ctx.call_tool, read current or historical
 sessions through ctx.sessions, and use the ordinary Linux/Python environment.
+Source passed to write_tool must define async def main(input, ctx). Await
+ctx.call_tool and async ctx.model_provider operations; the call_tool core slot
+must also await ctx.kernel.execute.
 Use help when you need the tool ABI or examples. Core operation source is also
 readable and editable, but keep changes deliberate. When the user's task is
 complete, return a concise final answer instead of making another tool call.
@@ -648,8 +651,6 @@ class OpenRouterModel:
             if response is not None:
                 state.responses[id(response)] = response
             cancel_requested = state.cancel_requested
-            if cancel_requested:
-                state.cancel_requested = False
         try:
             if cancel_requested:
                 if response is not None:

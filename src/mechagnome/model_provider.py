@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import struct
@@ -158,13 +159,13 @@ class ToolModelProvider:
     def __init__(self, capability: _BoundedModelProvider) -> None:
         self._capability = capability
 
-    def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
+    async def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Run a one-shot completion in a durable child session."""
-        return self._capability.complete(messages)
+        return await asyncio.to_thread(self._capability.complete, messages)
 
-    def run_agent(self, prompt: str) -> str:
+    async def run_agent(self, prompt: str) -> str:
         """Run a tool-capable agent in a durable child session."""
-        return self._capability.run_agent(prompt)
+        return await asyncio.to_thread(self._capability.run_agent, prompt)
 
 
 _USE_ROOT_TRANSPORT = object()

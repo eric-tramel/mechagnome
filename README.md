@@ -168,23 +168,25 @@ compose executable code—they do not isolate it or restrict its access.
 
 ## Tool ABI
 
-Every authored source program is a module containing one synchronous entry
+Every authored source program is a module containing one asynchronous entry
 point:
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     return {"result": input["value"] * 2}
 ```
 
 `input` is a dictionary and the return value must be JSON-serializable. The
 schema stored beside a user tool is descriptive metadata in this prototype; it
 is not a complete JSON Schema enforcement engine.
+Previously persisted synchronous tools remain executable through a compatibility
+context, while new and replacement definitions must use the async entry point.
 
 Tools can compose through the active dispatcher:
 
 ```python
-def main(input, ctx):
-    return ctx.call_tool(
+async def main(input, ctx):
+    return await ctx.call_tool(
         "add",
         {"a": input["value"], "b": input["value"]},
     )
@@ -197,7 +199,7 @@ retry policy for the whole toolbox.
 Tools can read durable sessions:
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     caller_session_id = ctx.caller_session_id
     lineage = ctx.sessions.metadata()
     current = ctx.sessions.current(after=0, limit=50)
@@ -221,8 +223,8 @@ Tools can request text from a host-configured model without receiving its
 credentials:
 
 ```python
-def main(input, ctx):
-    text = ctx.model_provider.complete([
+async def main(input, ctx):
+    text = await ctx.model_provider.complete([
         {"role": "system", "content": "Answer in one short sentence."},
         {"role": "user", "content": input["question"]},
     ])
@@ -235,10 +237,11 @@ eight attempts; requests and responses are size-bounded. Every accepted call
 implicitly creates a logged `completion` session whose parent is the tool's
 current session and whose origin is the actual nested tool call ID.
 
-For tool-capable delegation, `ctx.model_provider.run_agent(prompt)` runs a full
-child agent and returns its final text. The provider implicitly creates a
-logged `conversation` child first. That agent receives the same capability, so
-further delegation produces a correctly parented session chain.
+For tool-capable delegation,
+`await ctx.model_provider.run_agent(prompt)` runs a full child agent and returns
+its final text. The provider implicitly creates a logged `conversation` child
+first. That agent receives the same capability, so further delegation produces
+a correctly parented session chain.
 
 ## Model adapter boundary
 
@@ -305,8 +308,8 @@ cancelling its jobs; ending the final tab exits the app and triggers shutdown.
 Captured output can contain sensitive tool data, and inspecting it copies the
 tail into the model transcript. The host handles detach start/inspection; the
 background job itself still executes one ordinary call through the active,
-editable `call_tool` dispatcher. Authored `ctx.call_tool` calls remain
-synchronous.
+editable `call_tool` dispatcher. Authored `ctx.call_tool` calls are awaited
+foreground calls and cannot request host detachment.
 
 ## Metacircular core
 

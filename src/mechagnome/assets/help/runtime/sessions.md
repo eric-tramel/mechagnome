@@ -5,7 +5,7 @@ Every tool receives bounded, read-only access to durable session history through
 started the current call tree:
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     return {
         "caller_session_id": ctx.caller_session_id,
         "session_access_id": ctx.sessions.id,
@@ -19,9 +19,9 @@ under that child can create grandchildren in the same way.
 
 Sessions have immutable `kind`, `parent_session_id`, and `origin_call_id`
 metadata. Kinds are `generic` for host/tool-only history, `conversation` for a
-multi-turn agent execution (including `ctx.model_provider.run_agent(...)`
+multi-turn agent execution (including `await ctx.model_provider.run_agent(...)`
 children), and `completion` for one accepted text-only
-`ctx.model_provider.complete(...)` call. `root_session_id` is derived by
+`await ctx.model_provider.complete(...)` call. `root_session_id` is derived by
 walking the parent chain rather than stored separately.
 
 ## Session API
@@ -96,7 +96,7 @@ def read_current_events(session_access):
             return events
 
 
-def main(input, ctx):
+async def main(input, ctx):
     events = read_current_events(ctx.sessions)
     recent_tools = [
         event["tool_name"]
@@ -124,7 +124,7 @@ def read_all(session_access, session_id):
             return events
 
 
-def main(input, ctx):
+async def main(input, ctx):
     return {
         "events": read_all(ctx.sessions, input["session_id"]),
     }

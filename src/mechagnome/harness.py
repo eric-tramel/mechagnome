@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event, Lock
@@ -111,6 +112,28 @@ class _CancellationToken:
     def check(self) -> None:
         if self.cancelled:
             raise RunCancelled
+
+
+class _OrderedEventSink:
+    """Deduplicate and serialize session records relayed by parallel runners."""
+
+    def __init__(self, sink: EventSink, next_sequence: int) -> None:
+        self._sink = sink
+        self._next_sequence = next_sequence
+        self._pending: dict[int, AgentEvent] = {}
+        self._lock = Lock()
+
+    def __call__(self, event: AgentEvent) -> None:
+        with self._lock:
+            if event.seq is None:
+                self._sink(event)
+                return
+            if event.seq < self._next_sequence:
+                return
+            self._pending[event.seq] = event
+            while self._next_sequence in self._pending:
+                self._sink(self._pending.pop(self._next_sequence))
+                self._next_sequence += 1
 
 
 class Conversation:
@@ -225,10 +248,9 @@ class Conversation:
                 answer = turn.text or ""
                 return RunResult(self.session_id, answer, turn_number)
 
-            oversized_batch = len(turn.calls) > self.max_calls_per_turn
-            for call in turn.calls:
-                if oversized_batch:
-                    observation: JsonValue = {
+            if len(turn.calls) > self.max_calls_per_turn:
+                observations: list[JsonValue] = [
+                    {
                         "error": {
                             "code": "too_many_tool_calls",
                             "message": (
@@ -238,8 +260,13 @@ class Conversation:
                             ),
                         }
                     }
-                else:
-                    observation = self._execute(call, on_event, token)
+                    for _ in turn.calls
+                ]
+            else:
+                observations = asyncio.run(
+                    self._execute_all(tuple(turn.calls), on_event, token)
+                )
+            for call, observation in zip(turn.calls, observations, strict=True):
                 token.check()
                 self._append(
                     on_event,
@@ -260,6 +287,29 @@ class Conversation:
         )
         self._append(on_event, "harness_failed", error.to_dict())
         raise error
+
+    async def _execute_all(
+        self,
+        calls: tuple[ToolCall, ...],
+        sink: EventSink | None,
+        token: _CancellationToken,
+    ) -> list[JsonValue]:
+        """Run one model-requested tool batch concurrently."""
+        ordered_sink = (
+            _OrderedEventSink(
+                sink, self.kernel.latest_event_sequence(self.session_id) + 1
+            )
+            if sink is not None and len(calls) > 1
+            else sink
+        )
+        return list(
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(self._execute, call, ordered_sink, token)
+                    for call in calls
+                )
+            )
+        )
 
     def _respond(
         self,

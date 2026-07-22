@@ -418,7 +418,7 @@ class IsolatedToolRunner:
         self._validate_model_provider(model_provider)
         if cancelled is not None and cancelled():
             raise ToolboxError("cancelled", "rollout stopped")
-        after = self._latest_sequence(session_id)
+        after = self.kernel.latest_event_sequence(session_id)
         scope = scope or self.kernel.snapshot_scope(session_id)
         if scope.session_id != session_id:
             raise ToolboxError("invalid_session", "tool scope session does not match")
@@ -709,17 +709,6 @@ class IsolatedToolRunner:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 pass
-
-    def _latest_sequence(self, session_id: str) -> int:
-        page = self.kernel.read_session(session_id, after=0, limit=100)
-        latest = page["events"][-1]["seq"] if page["events"] else 0
-        while page["next_after"] is not None:
-            page = self.kernel.read_session(
-                session_id, after=page["next_after"], limit=100
-            )
-            if page["events"]:
-                latest = page["events"][-1]["seq"]
-        return latest
 
     def _relay(
         self,

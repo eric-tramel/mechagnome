@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -10,6 +11,7 @@ import stat
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -107,7 +109,7 @@ def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
 def test_reopen_refreshes_code_shipped_core_version_one(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     kernel.create_toolbox("secondary")
-    stale_source = "def main(input, ctx):\n    return 'stale default'\n"
+    stale_source = "async def main(input, ctx):\n    return 'stale default'\n"
     with closing(kernel._connect()) as connection, connection:
         connection.execute(
             """
@@ -137,7 +139,7 @@ def test_reopen_refreshes_code_shipped_core_version_one(tmp_path: Path) -> None:
 
 def test_reopen_preserves_active_core_version_two_override(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    replacement_source = "def main(input, ctx):\n    return 'custom help'\n"
+    replacement_source = "async def main(input, ctx):\n    return 'custom help'\n"
     write(
         kernel,
         "help",
@@ -199,17 +201,17 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
     assert "```python" in authoring
     assert "## The `ctx` context object" in authoring
     for public_api in (
-        "ctx.call_tool(name, args, version=None)",
+        "await ctx.call_tool(name, args, version=None)",
         "ctx.caller_session_id",
         "ctx.sessions.current(after=0, limit=50)",
         "ctx.sessions.read(session_id, after=0, limit=50)",
         "ctx.sessions.list(limit=20, cursor=0)",
-        "ctx.model_provider.complete([",
-        "ctx.model_provider.run_agent(",
+        "await ctx.model_provider.complete([",
+        "await ctx.model_provider.run_agent(",
         "ctx.kernel.catalog(include_core=True)",
         "ctx.kernel.view_tool(name, version=None)",
         "ctx.kernel.write_tool(...)",
-        "ctx.kernel.execute(name, args, version=None)",
+        "await ctx.kernel.execute(name, args, version=None)",
     ):
         assert public_api in authoring
 
@@ -217,6 +219,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
     assert "Each nested invocation receives its own context object" in composition
     assert "base_version" in composition
     assert "eight delegated-model attempts per top-level call tree" in composition
+    assert "remains an awaited foreground call" in composition
 
     assert "model_provider_unavailable" in authoring
     assert "model_provider_limit" in authoring
@@ -247,7 +250,7 @@ def test_help_lists_topics_for_an_unknown_document(tmp_path: Path) -> None:
 
 def test_write_immediately_search_view_and_call(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    source = "def main(input, ctx):\n    return {'echo': input['value']}\n"
+    source = "async def main(input, ctx):\n    return {'echo': input['value']}\n"
 
     result = write(
         kernel,
@@ -275,7 +278,7 @@ def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None
     write(
         kernel,
         "send_email",
-        "def main(input, ctx):\n    return input['recipient_address']\n",
+        "async def main(input, ctx):\n    return input['recipient_address']\n",
         description="Deliver an electronic message.",
         input_schema={
             "type": "object",
@@ -288,25 +291,25 @@ def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None
     write(
         kernel,
         "weatherForecast",
-        "def main(input, ctx):\n    return 'sunny'\n",
+        "async def main(input, ctx):\n    return 'sunny'\n",
         description="Look up atmospheric conditions.",
     )
     write(
         kernel,
         "archive",
-        "def main(input, ctx):\n    return 'delivery_manifest'\n",
+        "async def main(input, ctx):\n    return 'delivery_manifest'\n",
         description="Store a record for later.",
     )
     write(
         kernel,
         "HTTPClient",
-        "def main(input, ctx):\n    return None\n",
+        "async def main(input, ctx):\n    return None\n",
         description="Make a remote request.",
     )
     write(
         kernel,
         "notify_user",
-        "def main(input, ctx):\n    return None\n",
+        "async def main(input, ctx):\n    return None\n",
         description="Отправить сообщение получателю.",
     )
 
@@ -333,17 +336,19 @@ def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None
 
 def test_search_weights_names_above_other_fields(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    write(kernel, "rankingmarker_tool", "def main(input, ctx):\n    return None\n")
+    write(
+        kernel, "rankingmarker_tool", "async def main(input, ctx):\n    return None\n"
+    )
     write(
         kernel,
         "description_candidate",
-        "def main(input, ctx):\n    return None\n",
+        "async def main(input, ctx):\n    return None\n",
         description="rankingmarker",
     )
     write(
         kernel,
         "schema_candidate",
-        "def main(input, ctx):\n    return None\n",
+        "async def main(input, ctx):\n    return None\n",
         input_schema={
             "type": "object",
             "properties": {"rankingmarker": {"type": "string"}},
@@ -352,7 +357,7 @@ def test_search_weights_names_above_other_fields(tmp_path: Path) -> None:
     write(
         kernel,
         "source_candidate",
-        "def main(input, ctx):\n    return 'rankingmarker'\n",
+        "async def main(input, ctx):\n    return 'rankingmarker'\n",
     )
 
     result = kernel.call(
@@ -369,8 +374,8 @@ def test_search_weights_names_above_other_fields(tmp_path: Path) -> None:
 
 def test_search_exact_name_priority_filtering_and_pagination(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    common_source = "def main(input, ctx):\n    return 'needle needle needle'\n"
-    write(kernel, "needle", "def main(input, ctx):\n    return None\n")
+    common_source = "async def main(input, ctx):\n    return 'needle needle needle'\n"
+    write(kernel, "needle", "async def main(input, ctx):\n    return None\n")
     write(kernel, "haystack", common_source)
 
     exact = kernel.call(
@@ -405,7 +410,7 @@ def test_search_exact_name_priority_filtering_and_pagination(tmp_path: Path) -> 
 
 def test_active_feedback_surface_is_absent(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    write(kernel, "observed", "def main(input, ctx):\n    return True\n")
+    write(kernel, "observed", "async def main(input, ctx):\n    return True\n")
     call_tool(kernel, "observed", {})
 
     search_schema = CORE_SCHEMAS["search_tools"]
@@ -522,7 +527,7 @@ def test_schema_three_database_migrates_real_pre_lineage_sessions(
 
 def test_schema_four_database_renames_view_core_slot(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    replacement_source = "def main(input, ctx):\n    return {'custom': True}\n"
+    replacement_source = "async def main(input, ctx):\n    return {'custom': True}\n"
     write(
         kernel,
         "view_tool",
@@ -554,8 +559,8 @@ def test_schema_four_database_renames_view_core_slot(tmp_path: Path) -> None:
 
 def test_versions_exact_calls_and_stale_base(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    version_one = "def main(input, ctx):\n    return 1\n"
-    version_two = "def main(input, ctx):\n    return 2\n"
+    version_one = "async def main(input, ctx):\n    return 1\n"
+    version_two = "async def main(input, ctx):\n    return 2\n"
 
     first = write(kernel, "number", version_one)
     assert first["active"] is True
@@ -582,14 +587,14 @@ def test_tool_management_history_usage_provenance_and_deletion(
     write(
         kernel,
         "number",
-        "def main(input, ctx):\n    return 1\n",
+        "async def main(input, ctx):\n    return 1\n",
         session_id=creator_one,
     )
     call_tool(kernel, "number", {}, session_id=caller)
     write(
         kernel,
         "number",
-        "def main(input, ctx):\n    return 2\n",
+        "async def main(input, ctx):\n    return 2\n",
         session_id=creator_two,
         base_version=1,
     )
@@ -652,7 +657,7 @@ def test_terminal_timings_are_persisted_and_aggregated_by_version(
     write(
         kernel,
         "timed",
-        "def main(input, ctx):\n    return 'v1'\n",
+        "async def main(input, ctx):\n    return 'v1'\n",
     )
 
     with monkeypatch.context() as patch:
@@ -663,7 +668,7 @@ def test_terminal_timings_are_persisted_and_aggregated_by_version(
     write(
         kernel,
         "timed",
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    if input.get('fail'):\n"
         "        raise RuntimeError('broken')\n"
         "    return 'v2'\n",
@@ -733,7 +738,7 @@ def test_result_validation_failures_record_duration(
 ) -> None:
     kernel = kernel_at(tmp_path)
     session_id = kernel.create_session()
-    write(kernel, "not_json", "def main(input, ctx):\n    return {1}\n")
+    write(kernel, "not_json", "async def main(input, ctx):\n    return {1}\n")
 
     with monkeypatch.context() as patch:
         ticks = iter((5_000_000_000, 5_003_000_000))
@@ -752,17 +757,21 @@ def test_tools_compose_and_read_the_live_session(tmp_path: Path) -> None:
     session_id = kernel.create_session()
     session_help = kernel.call("help", {"topic": "sessions"})
     assert "ctx.caller_session_id" in session_help
-    write(kernel, "add", "def main(input, ctx):\n    return input['a'] + input['b']\n")
+    write(
+        kernel,
+        "add",
+        "async def main(input, ctx):\n    return input['a'] + input['b']\n",
+    )
     write(
         kernel,
         "double",
-        "def main(input, ctx):\n"
-        "    return ctx.call_tool('add', {'a': input['x'], 'b': input['x']})\n",
+        "async def main(input, ctx):\n"
+        "    return await ctx.call_tool('add', {'a': input['x'], 'b': input['x']})\n",
     )
     write(
         kernel,
         "recall",
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    events = ctx.sessions.current(limit=100)['events']\n"
         "    return {\n"
         "        'session_id': ctx.caller_session_id,\n"
@@ -795,15 +804,15 @@ def test_model_provider_propagates_through_nested_tool_calls(tmp_path: Path) -> 
     write(
         kernel,
         "ask",
-        "def main(input, ctx):\n"
-        "    return ctx.model_provider.complete(input['messages'])\n",
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.complete(input['messages'])\n",
     )
     write(
         kernel,
         "ask_many",
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    return [\n"
-        "        ctx.call_tool('ask', {'messages': input['messages']})\n"
+        "        await ctx.call_tool('ask', {'messages': input['messages']})\n"
         "        for _ in range(input['count'])\n"
         "    ]\n",
     )
@@ -884,16 +893,16 @@ def test_nested_tool_completion_records_inner_origin_and_child_log(
     write(
         kernel,
         "ask",
-        "def main(input, ctx):\n"
-        "    return ctx.model_provider.complete([\n"
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.complete([\n"
         "        {'role': 'user', 'content': input['prompt']},\n"
         "    ])\n",
     )
     write(
         kernel,
         "delegate",
-        "def main(input, ctx):\n"
-        "    return ctx.call_tool('ask', {'prompt': input['prompt']})\n",
+        "async def main(input, ctx):\n"
+        "    return await ctx.call_tool('ask', {'prompt': input['prompt']})\n",
     )
     root = kernel.create_session(kind="conversation")
     provider = ProviderUsingModel()
@@ -972,16 +981,17 @@ def test_isolated_tools_can_run_recursive_first_class_agents(tmp_path: Path) -> 
     write(
         kernel,
         "delegate",
-        "def main(input, ctx):\n    return ctx.model_provider.run_agent('child')\n",
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.run_agent('child')\n",
     )
     write(
         kernel,
         "child_delegate",
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    return {\n"
         "        'session_id': ctx.sessions.id,\n"
         "        'parent_id': ctx.sessions.metadata()['parent_session_id'],\n"
-        "        'answer': ctx.model_provider.run_agent('grandchild'),\n"
+        "        'answer': await ctx.model_provider.run_agent('grandchild'),\n"
         "    }\n",
     )
 
@@ -1075,12 +1085,12 @@ def test_child_agent_tools_see_child_identity_and_create_grandchildren(
     write(
         kernel,
         "child_probe",
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    return {\n"
         "        'id': ctx.sessions.id,\n"
         "        'caller': ctx.caller_session_id,\n"
         "        'metadata': ctx.sessions.metadata(),\n"
-        "        'answer': ctx.model_provider.complete([\n"
+        "        'answer': await ctx.model_provider.complete([\n"
         "            {'role': 'user', 'content': 'nested'},\n"
         "        ]),\n"
         "    }\n",
@@ -1144,8 +1154,8 @@ def test_model_provider_is_predictably_unavailable_for_direct_calls(
     write(
         kernel,
         "ask",
-        "def main(input, ctx):\n"
-        "    return ctx.model_provider.complete([\n"
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.complete([\n"
         "        {'role': 'user', 'content': 'hello'},\n"
         "    ])\n",
     )
@@ -1168,7 +1178,7 @@ def test_all_core_details_are_viewable_and_schema_is_pinned(tmp_path: Path) -> N
         write(
             kernel,
             "search_tools",
-            "def main(input, ctx):\n    return {}\n",
+            "async def main(input, ctx):\n    return {}\n",
             input_schema={"type": "object"},
             base_version=1,
         )
@@ -1181,7 +1191,7 @@ def test_core_replacement_gets_slot_capability_and_host_rollback(
 ) -> None:
     kernel = kernel_at(tmp_path)
     catalog_source = (
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    return {'names': [item['name'] for item in ctx.kernel.catalog()]}\n"
     )
 
@@ -1214,10 +1224,10 @@ def test_nested_calls_route_through_replaced_call_tool(tmp_path: Path) -> None:
     write(
         kernel,
         "delegator",
-        "def main(input, ctx):\n    return ctx.call_tool('missing', {})\n",
+        "async def main(input, ctx):\n    return await ctx.call_tool('missing', {})\n",
     )
     replacement_source = (
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    return {'intercepted': input['name'], 'args': input['args']}\n"
     )
     write(
@@ -1245,7 +1255,7 @@ def test_source_and_sessions_survive_restart(tmp_path: Path) -> None:
     write(
         kernel,
         "constant",
-        "def main(input, ctx):\n    return {'value': 42}\n",
+        "async def main(input, ctx):\n    return {'value': 42}\n",
         session_id=session_id,
     )
     assert call_tool(kernel, "constant", {}, session_id=session_id) == {"value": 42}
@@ -1272,7 +1282,7 @@ def test_recursive_composition_is_bounded_and_recorded(tmp_path: Path) -> None:
     write(
         kernel,
         "forever",
-        "def main(input, ctx):\n    return ctx.call_tool('forever', {})\n",
+        "async def main(input, ctx):\n    return await ctx.call_tool('forever', {})\n",
     )
 
     with pytest.raises(ToolboxError) as error:
@@ -1284,13 +1294,13 @@ def test_recursive_composition_is_bounded_and_recorded(tmp_path: Path) -> None:
 
 def test_invalid_source_never_moves_the_binding(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    write(kernel, "stable", "def main(input, ctx):\n    return 'old'\n")
+    write(kernel, "stable", "async def main(input, ctx):\n    return 'old'\n")
 
     with pytest.raises(ToolboxError) as error:
         write(
             kernel,
             "stable",
-            "def main(input, ctx)\n    return 'broken'\n",
+            "async def main(input, ctx)\n    return 'broken'\n",
             base_version=1,
         )
     assert error.value.code == "invalid_source"
@@ -1300,17 +1310,143 @@ def test_invalid_source_never_moves_the_binding(tmp_path: Path) -> None:
     ] == [1]
 
 
+def test_tool_main_must_be_async_and_supports_async_host_calls(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+
+    with pytest.raises(ToolboxError) as error:
+        write(kernel, "sync_tool", "def main(input, ctx):\n    return input\n")
+    assert error.value.code == "sync_main"
+
+    write(
+        kernel,
+        "async_tool",
+        "import asyncio\n\n"
+        "async def main(input, ctx):\n"
+        "    await asyncio.sleep(0)\n"
+        "    return input['value']\n",
+    )
+
+    result = asyncio.run(kernel.call_async("async_tool", {"value": 42}))
+
+    assert result == 42
+
+
+def test_persisted_sync_tool_keeps_legacy_context_compatibility(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "legacy_nested",
+        "async def main(input, ctx):\n    return 'placeholder'\n",
+    )
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute(
+            "UPDATE tool_versions SET source = ? WHERE id = ("
+            "SELECT tool_version_id FROM bindings WHERE name = 'legacy_nested'"
+            ")",
+            (
+                "def main(input, ctx):\n"
+                "    page = ctx.call_tool('help', {'topic': 'quickstart'})\n"
+                "    return page.splitlines()[0]\n",
+            ),
+        )
+
+    assert kernel.call("legacy_nested", {}) == "# Quickstart"
+
+
+def test_nested_legacy_tools_do_not_depend_on_default_executor_capacity(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    for name in ("legacy_outer", "legacy_inner"):
+        write(
+            kernel,
+            name,
+            "async def main(input, ctx):\n    return 'placeholder'\n",
+        )
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute(
+            "UPDATE tool_versions SET source = ? WHERE id = ("
+            "SELECT tool_version_id FROM bindings WHERE name = 'legacy_inner'"
+            ")",
+            ("def main(input, ctx):\n    return 'nested result'\n",),
+        )
+        connection.execute(
+            "UPDATE tool_versions SET source = ? WHERE id = ("
+            "SELECT tool_version_id FROM bindings WHERE name = 'legacy_outer'"
+            ")",
+            ("def main(input, ctx):\n    return ctx.call_tool('legacy_inner', {})\n",),
+        )
+
+    async def invoke_with_one_default_worker() -> Any:
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(1))
+        return await asyncio.wait_for(kernel.call_async("legacy_outer", {}), timeout=2)
+
+    assert asyncio.run(invoke_with_one_default_worker()) == "nested result"
+
+
+def test_cancelling_legacy_tool_does_not_block_event_loop(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    started = tmp_path / "legacy-started"
+    release = tmp_path / "legacy-release"
+    finished = tmp_path / "legacy-finished"
+    write(
+        kernel,
+        "legacy_blocking",
+        "async def main(input, ctx):\n    return 'placeholder'\n",
+    )
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute(
+            "UPDATE tool_versions SET source = ? WHERE id = ("
+            "SELECT tool_version_id FROM bindings WHERE name = 'legacy_blocking'"
+            ")",
+            (
+                "import time\n"
+                "from pathlib import Path\n\n"
+                "def main(input, ctx):\n"
+                f"    Path({str(started)!r}).write_text('yes')\n"
+                f"    while not Path({str(release)!r}).exists():\n"
+                "        time.sleep(0.01)\n"
+                f"    Path({str(finished)!r}).write_text('yes')\n"
+                "    return 'done'\n",
+            ),
+        )
+
+    async def cancel_after_start() -> float:
+        task = asyncio.create_task(kernel.call_async("legacy_blocking", {}))
+        deadline = asyncio.get_running_loop().time() + 2
+        while not started.exists():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        began = asyncio.get_running_loop().time()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        elapsed = asyncio.get_running_loop().time() - began
+        release.write_text("go")
+        deadline = asyncio.get_running_loop().time() + 2
+        while not finished.exists():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        return elapsed
+
+    assert asyncio.run(cancel_after_start()) < 0.25
+
+
 def test_a_tool_can_write_and_call_a_new_tool_before_returning(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     builder_source = """\
-def main(input, ctx):
-    written = ctx.call_tool("write_tool", {
+async def main(input, ctx):
+    written = await ctx.call_tool("write_tool", {
         "name": "born_now",
         "description": "Created during another tool's invocation.",
         "input_schema": {"type": "object"},
-        "source": "def main(input, ctx):\\n    return {'ready': True}\\n",
+        "source": "async def main(input, ctx):\\n    return {'ready': True}\\n",
     })
-    called = ctx.call_tool("born_now", {})
+    called = await ctx.call_tool("born_now", {})
     return {"written": written, "called": called}
 """
     write(kernel, "builder", builder_source)
@@ -1367,7 +1503,7 @@ def test_toolbox_rename_preserves_identity_tools_and_cwd_default(
     write(
         kernel,
         "kept",
-        "def main(input, ctx):\n    return 'still here'\n",
+        "async def main(input, ctx):\n    return 'still here'\n",
         session_id=session_id,
     )
 
@@ -1403,7 +1539,7 @@ def test_sessionless_host_operations_do_not_create_saved_sessions(
         name="host_tool",
         description="Written without a conversation.",
         input_schema={"type": "object"},
-        source="def main(input, ctx):\n    return True\n",
+        source="async def main(input, ctx):\n    return True\n",
     )
 
     assert kernel.list_sessions()["sessions"] == []
@@ -1451,13 +1587,13 @@ def test_toolbox_union_collisions_versions_mutations_and_core_order(
     write(
         kernel,
         "same",
-        "def main(input, ctx):\n    return 'alpha'\n",
+        "async def main(input, ctx):\n    return 'alpha'\n",
         session_id=session_id,
     )
     write(
         kernel,
         "search_tools",
-        "def main(input, ctx):\n    return {'origin': 'alpha'}\n",
+        "async def main(input, ctx):\n    return {'origin': 'alpha'}\n",
         session_id=session_id,
         input_schema=CORE_SCHEMAS["search_tools"],
         base_version=1,
@@ -1467,13 +1603,13 @@ def test_toolbox_union_collisions_versions_mutations_and_core_order(
     write(
         kernel,
         "same",
-        "def main(input, ctx):\n    return 'beta-v1'\n",
+        "async def main(input, ctx):\n    return 'beta-v1'\n",
         session_id=session_id,
     )
     write(
         kernel,
         "same",
-        "def main(input, ctx):\n    return 'beta-v2'\n",
+        "async def main(input, ctx):\n    return 'beta-v2'\n",
         session_id=session_id,
         base_version=1,
     )
@@ -1665,7 +1801,7 @@ class ScriptedModel:
                             "description": "Say hello.",
                             "input_schema": {"type": "object"},
                             "source": (
-                                "def main(input, ctx):\n"
+                                "async def main(input, ctx):\n"
                                 "    return {'message': 'hello'}\n"
                             ),
                         },
@@ -1703,7 +1839,8 @@ class ReprogrammingModel:
                             "description": "Live rewritten search.",
                             "input_schema": CORE_SCHEMAS["search_tools"],
                             "source": (
-                                "def main(input, ctx):\n    return {'items': []}\n"
+                                "async def main(input, ctx):\n"
+                                "    return {'items': []}\n"
                             ),
                             "base_version": 1,
                         },
@@ -1804,6 +1941,64 @@ class DetachedContinuationModel:
         return ModelTurn(text="Detached work finished.")
 
 
+class BatchedDetachedModel:
+    """Detach work beside another operation and retain its transient updates."""
+
+    def __init__(self) -> None:
+        self.job_id: str | None = None
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        observations = [message for message in messages if message["role"] == "tool"]
+        if not observations:
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "call_tool",
+                        {"name": "quick_detached", "args": {}, "detach": True},
+                        "detach",
+                    ),
+                    ToolCall("help", {"topic": "toc"}, "help"),
+                )
+            )
+        assert len(observations) == 2
+        handle = observations[0]["content"]
+        assert handle["status"] == "running"
+        self.job_id = handle["job_id"]
+        assert str(observations[1]["content"]).startswith("# Mechagnome")
+        return ModelTurn(text="Batch completed.")
+
+
+def test_parallel_batch_preserves_transient_detached_updates(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "quick_detached",
+        "async def main(input, ctx):\n"
+        "    print('detached output', flush=True)\n"
+        "    return {'ok': True}\n",
+    )
+    runner = IsolatedToolRunner(kernel)
+    harness = Harness(kernel, tool_runner=runner)
+    model = BatchedDetachedModel()
+    events: list[Any] = []
+    conversation = harness.start(model)
+
+    result = conversation.send("run both", on_event=events.append)
+
+    assert result.answer == "Batch completed."
+    assert model.job_id is not None
+    wait_for_detached(runner, model.job_id, conversation.session_id, status="succeeded")
+    detached_events = [event for event in events if event.kind.startswith("detached_")]
+    assert {event.kind for event in detached_events} >= {
+        "detached_started",
+        "detached_finished",
+    }
+    assert all(event.seq is None for event in detached_events)
+    harness.close()
+
+
 def test_detached_call_continues_foreground_and_is_inspectable_later(
     tmp_path: Path,
 ) -> None:
@@ -1815,7 +2010,7 @@ def test_detached_call_continues_foreground_and_is_inspectable_later(
         "gated",
         "import time\n"
         "from pathlib import Path\n\n"
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    print('started', flush=True)\n"
         f"    Path({str(started)!r}).write_text('yes')\n"
         f"    while not Path({str(release)!r}).exists():\n"
@@ -1878,13 +2073,15 @@ def test_detached_output_is_sanitized_bounded_and_providerless(tmp_path: Path) -
         kernel,
         "noisy",
         "import os\n\n"
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    print('before\\x1b[31mred\\x1b[0m')\n"
         "    print('x' * 300000)\n"
         "    print('after\\x1b[32mgreen\\x1b[0m')\n"
         "    os.write(1, b'bad-utf8-\\xff\\n')\n"
         "    try:\n"
-        "        ctx.model_provider.complete([{'role': 'user', 'content': 'x'}])\n"
+        "        await ctx.model_provider.complete(\n"
+        "            [{'role': 'user', 'content': 'x'}]\n"
+        "        )\n"
         "    except Exception as error:\n"
         "        return {'provider_error': error.code}\n",
     )
@@ -1914,7 +2111,7 @@ def test_detached_output_reader_does_not_wait_for_escaped_writer(
         "escaped_writer",
         "import subprocess\n"
         "import sys\n\n"
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    child = subprocess.Popen(\n"
         "        [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
         "        start_new_session=True,\n"
@@ -1955,7 +2152,7 @@ def test_detached_output_shutdown_is_bounded_for_continuous_escaped_writer(
         "continuous_escaped_writer",
         "import subprocess\n"
         "import sys\n\n"
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    code = (\n"
         "        'import os\\n'\n"
         "        'chunk = b\\\"x\\\" * 4096\\n'\n"
@@ -2002,7 +2199,7 @@ def test_detached_cleanup_stops_owned_descendants_and_joins_job_thread(
         "owned_descendant",
         "import subprocess\n"
         "import sys\n\n"
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    child = subprocess.Popen(\n"
         "        [sys.executable, '-c', 'import time; time.sleep(30)']\n"
         "    )\n"
@@ -2040,7 +2237,7 @@ def test_detached_job_limit_timeout_and_shutdown_are_structured(tmp_path: Path) 
         "waiter",
         "import time\n"
         "from pathlib import Path\n\n"
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         f"    while not Path({str(release)!r}).exists():\n"
         "        time.sleep(0.01)\n"
         "    return input.get('value')\n",
@@ -2088,7 +2285,7 @@ def test_detached_job_limit_is_atomic_and_releases_completed_slots(
         "concurrent_waiter",
         "import time\n"
         "from pathlib import Path\n\n"
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         f"    while not Path({str(release)!r}).exists():\n"
         "        time.sleep(0.01)\n"
         "    return input['value']\n",
@@ -2136,7 +2333,9 @@ def test_detached_job_retention_evicts_oldest_completed_handle(
 ) -> None:
     monkeypatch.setattr(isolation_module, "_MAX_RETAINED_DETACHED_JOBS", 2)
     kernel = kernel_at(tmp_path)
-    write(kernel, "retained", "def main(input, ctx):\n    return input['value']\n")
+    write(
+        kernel, "retained", "async def main(input, ctx):\n    return input['value']\n"
+    )
     runner = IsolatedToolRunner(kernel)
     session_id = kernel.create_session(kind="conversation")
     handles: list[dict[str, Any]] = []
@@ -2167,7 +2366,7 @@ def test_detached_result_size_is_bounded(
 ) -> None:
     monkeypatch.setattr(isolation_module, "_MAX_DETACHED_RESULT_BYTES", 32)
     kernel = kernel_at(tmp_path)
-    write(kernel, "large_result", "def main(input, ctx):\n    return 'x' * 100\n")
+    write(kernel, "large_result", "async def main(input, ctx):\n    return 'x' * 100\n")
     runner = IsolatedToolRunner(kernel)
     session_id = kernel.create_session(kind="conversation")
 
@@ -2189,7 +2388,7 @@ def test_detached_job_uses_custom_dispatcher_and_is_parent_scoped(
     write(
         kernel,
         "call_tool",
-        "def main(input, ctx):\n"
+        "async def main(input, ctx):\n"
         "    return {'custom_name': input['name'], 'args': input['args']}\n",
         input_schema=CORE_SCHEMAS["call_tool"],
         base_version=1,
@@ -2212,7 +2411,7 @@ def test_call_tool_control_validation_and_detach_false_compatibility(
     tmp_path: Path,
 ) -> None:
     kernel = kernel_at(tmp_path)
-    write(kernel, "echo", "def main(input, ctx):\n    return input\n")
+    write(kernel, "echo", "async def main(input, ctx):\n    return input\n")
 
     class ControlModel:
         def __init__(self) -> None:
@@ -2263,6 +2462,46 @@ def test_call_tool_control_validation_and_detach_false_compatibility(
     )
 
 
+class ParallelBatchModel:
+    """Request two independent operations and inspect both observations."""
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        observations = [message for message in messages if message["role"] == "tool"]
+        if not observations:
+            return ModelTurn(
+                calls=(
+                    ToolCall("help", {}, "help-call"),
+                    ToolCall("search_tools", {"query": "help"}, "search-call"),
+                )
+            )
+        assert [message["content"] for message in observations] == [
+            {"name": "help"},
+            {"name": "search_tools"},
+        ]
+        return ModelTurn(text="Both completed.")
+
+
+class RealParallelBatchModel:
+    """Exercise concurrent isolated workers and their shared event stream."""
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        observations = [message for message in messages if message["role"] == "tool"]
+        if not observations:
+            return ModelTurn(
+                calls=tuple(
+                    ToolCall("help", {"topic": "toc"}, f"help-{index}")
+                    for index in range(4)
+                )
+            )
+        assert len(observations) == 4
+        assert all(isinstance(message["content"], str) for message in observations)
+        return ModelTurn(text="All completed.")
+
+
 def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
     model = ReprogrammingModel()
 
@@ -2281,8 +2520,8 @@ def test_harness_routes_root_and_tool_traffic_through_one_provider(
     write(
         kernel,
         "ask",
-        "def main(input, ctx):\n"
-        "    return ctx.model_provider.complete([\n"
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.complete([\n"
         "        {'role': 'user', 'content': 'nested'},\n"
         "    ])\n",
     )
@@ -2311,8 +2550,8 @@ def test_raw_root_transport_does_not_implicitly_grant_tool_model_spend(
     write(
         kernel,
         "ask",
-        "def main(input, ctx):\n"
-        "    return ctx.model_provider.complete([\n"
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.complete([\n"
         "        {'role': 'user', 'content': 'nested'},\n"
         "    ])\n",
     )
@@ -2357,6 +2596,55 @@ def test_harness_preserves_providerless_legacy_tool_runner_signature(
         model_provider=ProviderUsingModel(),
     )
     assert conversation.model_session.provider is not None
+
+
+def test_harness_processes_independent_tool_calls_concurrently(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+
+    class BarrierRunner:
+        def __init__(self) -> None:
+            self.barrier = threading.Barrier(2)
+
+        def call(
+            self,
+            name: str,
+            args: dict[str, Any],
+            *,
+            session_id: str,
+            on_event: Any = None,
+            cancelled: Any = None,
+        ) -> Any:
+            self.barrier.wait(timeout=1)
+            return {"name": name}
+
+    result = Harness(kernel, tool_runner=BarrierRunner()).run(
+        ParallelBatchModel(), "Run both."
+    )
+
+    assert result.answer == "Both completed."
+
+
+def test_parallel_isolated_tools_emit_each_durable_event_once(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    events: list[Any] = []
+
+    result = (
+        Harness(kernel)
+        .start(RealParallelBatchModel())
+        .send("Run several.", on_event=events.append)
+    )
+
+    sequences = [event.seq for event in events if event.seq is not None]
+    tool_events = [
+        event
+        for event in events
+        if event.kind in {"call_started", "call_succeeded", "call_failed"}
+    ]
+    assert result.answer == "All completed."
+    assert sequences == sorted(set(sequences))
+    assert len([event for event in tool_events if event.kind == "call_started"]) == 4
+    assert len([event for event in tool_events if event.kind == "call_succeeded"]) == 4
+    assert not any(event.kind == "call_failed" for event in tool_events)
 
 
 def test_harness_exposes_only_five_operations_and_saves_everything(

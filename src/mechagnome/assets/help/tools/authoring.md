@@ -1,11 +1,11 @@
 # Authoring tools
 
 An authored tool is a Python module stored with a name, description, input
-schema, and immutable version. Its source must define a synchronous `main`
+schema, and immutable version. Its source must define an asynchronous `main`
 entry point with exactly two positional parameters:
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     return {"result": input["value"] * 2}
 ```
 
@@ -19,7 +19,7 @@ module globals do not persist between invocations.
 type, range, or combination matters to the implementation:
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     values = input.get("values")
     if not isinstance(values, list) or not values:
         return {"error": "values must be a nonempty array"}
@@ -61,15 +61,20 @@ number, boolean, or `None`. Do not return Python-only values such as `Path`,
 exception becomes a failed tool-call event; use a JSON error object when a
 domain-level failure is an expected result callers should inspect.
 
-`main` must be synchronous. Returning a coroutine or other awaitable fails the
-call. Use synchronous libraries and APIs inside authored source.
+`main` must use `async def`. Await every async context operation before using or
+returning its result; an un-awaited coroutine is not JSON-serializable. Ordinary
+synchronous Python is still valid inside `main`, but blocking I/O prevents that
+tool from doing other async work while it waits. Prefer async libraries for I/O.
+Tools persisted by older Mechagnome versions with a synchronous `main` continue
+to run through a compatibility context, but `write_tool` rejects new synchronous
+definitions. Do not copy that legacy form into new or replacement tools.
 
 ## The `ctx` context object
 
 Every invocation receives its own `ctx` (`ToolContext`). It is a runtime handle,
 not data to save or return. Its public interface is:
 
-- `ctx.call_tool(name, args, version=None)` — invoke another tool.
+- `await ctx.call_tool(name, args, version=None)` — invoke another tool.
 - `ctx.caller_session_id` — the durable session ID for this call tree.
 - `ctx.sessions` — a bounded, read-only `SessionAccess` object.
 - `ctx.model_provider` — a bounded text-completion capability supplied by the
@@ -86,8 +91,8 @@ identity and nesting depth.
 Pass a JSON object as the nested tool's arguments:
 
 ```python
-def main(input, ctx):
-    doubled = ctx.call_tool(
+async def main(input, ctx):
+    doubled = await ctx.call_tool(
         "add",
         {"a": input["value"], "b": input["value"]},
     )
@@ -98,8 +103,8 @@ Omitting `version` resolves the active binding in the current toolbox scope.
 Pass an integer to require one immutable version:
 
 ```python
-def main(input, ctx):
-    return ctx.call_tool("normalize", input, version=3)
+async def main(input, ctx):
+    return await ctx.call_tool("normalize", input, version=3)
 ```
 
 Calls route through the currently active `call_tool` implementation. This lets
@@ -116,8 +121,8 @@ request; the outer conversation, agent system prompt, and model-facing tools are
 not added automatically.
 
 ```python
-def main(input, ctx):
-    answer = ctx.model_provider.complete([
+async def main(input, ctx):
+    answer = await ctx.model_provider.complete([
         {
             "role": "system",
             "content": "Answer accurately in one short sentence.",
@@ -130,8 +135,9 @@ def main(input, ctx):
     return {"answer": answer}
 ```
 
-`complete(messages)` is synchronous and returns a string. It accepts between 1
-and 64 messages. Every message must contain exactly two string fields:
+`complete(messages)` is asynchronous and returns a string when awaited. It
+accepts between 1 and 64 messages. Every message must contain exactly two
+string fields:
 
 - `role`, which must be `system`, `user`, or `assistant`.
 - `content`, which contains the text for that message.
@@ -147,10 +153,10 @@ tool call tree may make at most eight model-provider attempts. Nested tools get
 the same provider capability and share that call-count limit:
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     drafts = []
     for audience in input["audiences"]:
-        drafts.append(ctx.model_provider.complete([
+        drafts.append(await ctx.model_provider.complete([
             {
                 "role": "user",
                 "content": (
@@ -189,19 +195,19 @@ Use `run_agent(prompt)` when the delegated work may need tools or further
 delegation:
 
 ```python
-def main(input, ctx):
-    answer = ctx.model_provider.run_agent(
+async def main(input, ctx):
+    answer = await ctx.model_provider.run_agent(
         f"Investigate this task and return a concise answer: {input['task']}"
     )
     return {"answer": answer}
 ```
 
-The call is synchronous and returns the child agent's final text. Before any
-model traffic, the provider creates a durable `conversation` session parented
-to the caller's session and attributed to the current tool call. Child agents
-receive the same bounded capability, so a child calling `run_agent()` creates a
-grandchild with the child session as its direct parent. All model and tool
-events are recorded under the session in which they actually occur.
+The call is asynchronous and returns the child agent's final text when awaited.
+Before any model traffic, the provider creates a durable `conversation` session
+parented to the caller's session and attributed to the current tool call. Child
+agents receive the same bounded capability, so a child calling `run_agent()`
+creates a grandchild with the child session as its direct parent. All model and
+tool events are recorded under the session in which they actually occur.
 
 These failures raise `mechagnome.ToolboxError`; inspect its stable `code` only
 when the tool has a meaningful fallback, and re-raise everything else:
@@ -210,9 +216,9 @@ when the tool has a meaningful fallback, and re-raise everything else:
 from mechagnome import ToolboxError
 
 
-def main(input, ctx):
+async def main(input, ctx):
     try:
-        answer = ctx.model_provider.complete([
+        answer = await ctx.model_provider.complete([
             {"role": "user", "content": input["question"]},
         ])
     except ToolboxError as error:
@@ -250,7 +256,7 @@ root, origin call, cwd, and creation time. Pass another saved ID to inspect its
 lineage.
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     page = ctx.sessions.current(after=0, limit=100)
     failures = [
         {
@@ -298,7 +304,7 @@ def read_all_events(session_access, session_id):
             return events
 
 
-def main(input, ctx):
+async def main(input, ctx):
     sessions = ctx.sessions.list(limit=10, cursor=0)["sessions"]
     if not sessions:
         return {"events": []}
@@ -318,8 +324,8 @@ Instead, call a core operation through `ctx.call_tool`, just as the following
 ordinary tool does:
 
 ```python
-def main(input, ctx):
-    return ctx.call_tool("search_tools", {
+async def main(input, ctx):
+    return await ctx.call_tool("search_tools", {
         "query": input["query"],
         "include_core": False,
     })
@@ -334,13 +340,13 @@ logical slot in which they run:
 | `search_tools` | `ctx.kernel.catalog(include_core=True)` |
 | `view_tool` | `ctx.kernel.view_tool(name, version=None)` |
 | `write_tool` | `ctx.kernel.write_tool(...)` |
-| `call_tool` | `ctx.kernel.execute(name, args, version=None)` |
+| `call_tool` | `await ctx.kernel.execute(name, args, version=None)` |
 
 For example, a replacement `search_tools` implementation can inspect the
 effective catalog:
 
 ```python
-def main(input, ctx):
+async def main(input, ctx):
     query = input["query"].lower()
     matches = []
     for tool in ctx.kernel.catalog(
@@ -382,7 +388,8 @@ Before writing or replacing a tool:
 1. Search for an existing reusable tool with `search_tools`.
 2. Give the tool a specific name and a description that states when to use it.
 3. Provide an accurate object-shaped input schema.
-4. Keep `main(input, ctx)` synchronous and return only JSON data.
+4. Define `async def main(input, ctx)`, await async context calls, and return
+   only JSON data.
 5. Use the public context APIs; never depend on private `ctx._...` attributes.
 6. Prefer small composed tools and pin nested versions only when reproducibility
    matters more than following the active binding.

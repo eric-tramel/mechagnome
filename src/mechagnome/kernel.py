@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import inspect
 import json
@@ -12,6 +13,7 @@ import re
 import sqlite3
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -65,6 +67,7 @@ class _InvocationState:
     max_depth: int
     max_calls: int
     model_provider: _BoundedModelProvider
+    legacy_executor: ThreadPoolExecutor
     calls: int = 0
 
     @property
@@ -162,20 +165,80 @@ class ToolContext:
             )
         return _KernelCapability(self)
 
-    def call_tool(
+    async def call_tool(
         self, name: str, args: dict[str, Any], version: int | None = None
     ) -> JsonValue:
         """Invoke a tool through the snapshotted editable dispatcher."""
         envelope: dict[str, Any] = {"name": name, "args": args}
         if version is not None:
             envelope["version"] = version
-        return self._kernel._invoke(
+        return await self._kernel._invoke_async(
             "call_tool",
             envelope,
             state=self._state,
             parent_call_id=self._call_id,
             depth=self._depth + 1,
         )
+
+
+class _LegacyToolModelProvider:
+    """Synchronous facade for tools persisted before the async ABI."""
+
+    def __init__(self, provider: Any, loop: asyncio.AbstractEventLoop) -> None:
+        self._provider = provider
+        self._loop = loop
+
+    def complete(self, messages: Any) -> str:
+        return asyncio.run_coroutine_threadsafe(
+            self._provider.complete(messages), self._loop
+        ).result()
+
+    def run_agent(self, prompt: str) -> str:
+        return asyncio.run_coroutine_threadsafe(
+            self._provider.run_agent(prompt), self._loop
+        ).result()
+
+
+class _LegacyKernelCapability:
+    """Preserve the pre-async core capability contract for stored sources."""
+
+    def __init__(
+        self, capability: _KernelCapability, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        self._capability = capability
+        self._loop = loop
+
+    def execute(
+        self, name: str, args: dict[str, Any], version: int | None = None
+    ) -> JsonValue:
+        return asyncio.run_coroutine_threadsafe(
+            self._capability.execute(name, args, version), self._loop
+        ).result()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._capability, name)
+
+
+class _LegacyToolContext:
+    """Compatibility context for synchronous tools already stored on disk."""
+
+    def __init__(self, context: ToolContext, loop: asyncio.AbstractEventLoop) -> None:
+        self._context = context
+        self._loop = loop
+        self.caller_session_id = context.caller_session_id
+        self.sessions = context.sessions
+        self.model_provider = _LegacyToolModelProvider(context.model_provider, loop)
+
+    @property
+    def kernel(self) -> _LegacyKernelCapability:
+        return _LegacyKernelCapability(self._context.kernel, self._loop)
+
+    def call_tool(
+        self, name: str, args: dict[str, Any], version: int | None = None
+    ) -> JsonValue:
+        return asyncio.run_coroutine_threadsafe(
+            self._context.call_tool(name, args, version), self._loop
+        ).result()
 
 
 class _KernelCapability:
@@ -227,12 +290,12 @@ class _KernelCapability:
             scope=self._context._state.scope,
         )
 
-    def execute(
+    async def execute(
         self, name: str, args: dict[str, Any], version: int | None = None
     ) -> JsonValue:
         """Bottom out recursive dispatch through the call capability."""
         self._require("call_tool")
-        return self._context._kernel._invoke(
+        return await self._context._kernel._invoke_async(
             name,
             args,
             state=self._context._state,
@@ -1148,19 +1211,26 @@ class Kernel:
         tool_version_id: int | None = None,
     ) -> int:
         """Append one committed event and return its session-local sequence."""
-        with closing(self._connect()) as connection, connection:
-            return self._append_event_connection(
-                connection,
-                session_id,
-                kind,
-                payload,
-                call_id=call_id,
-                parent_call_id=parent_call_id,
-                toolbox_id=toolbox_id,
-                tool_name=tool_name,
-                tool_version=tool_version,
-                tool_version_id=tool_version_id,
-            )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                sequence = self._append_event_connection(
+                    connection,
+                    session_id,
+                    kind,
+                    payload,
+                    call_id=call_id,
+                    parent_call_id=parent_call_id,
+                    toolbox_id=toolbox_id,
+                    tool_name=tool_name,
+                    tool_version=tool_version,
+                    tool_version_id=tool_version_id,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return sequence
 
     def _append_event_connection(
         self,
@@ -1314,6 +1384,23 @@ class Kernel:
             "events": events,
             "next_after": events[-1]["seq"] if has_more and events else None,
         }
+
+    def latest_event_sequence(self, session_id: str) -> int:
+        """Return the latest committed sequence for one existing session."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT sessions.id, COALESCE(MAX(events.seq), 0) AS latest_seq
+                FROM sessions
+                LEFT JOIN events ON events.session_id = sessions.id
+                WHERE sessions.id = ?
+                GROUP BY sessions.id
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolboxError("unknown_session", f"unknown session: {session_id}")
+        return int(row["latest_seq"])
 
     def _scope(
         self,
@@ -1683,12 +1770,12 @@ class Kernel:
         ]
         if not mains:
             raise ToolboxError(
-                "missing_main", "source must define def main(input, ctx)"
+                "missing_main", "source must define async def main(input, ctx)"
             )
         main = mains[-1]
-        if isinstance(main, ast.AsyncFunctionDef):
+        if not isinstance(main, ast.AsyncFunctionDef):
             raise ToolboxError(
-                "async_main", "main must be synchronous in this prototype"
+                "sync_main", "main must be async; define async def main(input, ctx)"
             )
         positional = len(main.args.posonlyargs) + len(main.args.args)
         if positional != 2 or main.args.vararg is not None:
@@ -1706,7 +1793,29 @@ class Kernel:
         scope: InvocationScope | None = None,
         model_provider: Any | None = None,
     ) -> JsonValue:
-        """Start a top-level invocation in a durable session."""
+        """Synchronously run an async top-level invocation in a durable session."""
+        return asyncio.run(
+            self.call_async(
+                name,
+                args,
+                session_id=session_id,
+                version=version,
+                scope=scope,
+                model_provider=model_provider,
+            )
+        )
+
+    async def call_async(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        session_id: str | None = None,
+        version: int | None = None,
+        scope: InvocationScope | None = None,
+        model_provider: Any | None = None,
+    ) -> JsonValue:
+        """Start an async top-level invocation in a durable session."""
         from mechagnome.model_provider import (
             ModelProvider,
             ModelSession,
@@ -1727,20 +1836,27 @@ class Kernel:
             ).completion_provider(active_scope)
         bound_provider = _bind_model_provider(provider)
         bound_provider = bound_provider.for_scope(active_scope)
-        state = _InvocationState(
-            scope=active_scope,
-            max_depth=self.max_depth,
-            max_calls=self.max_calls,
-            model_provider=bound_provider,
-        )
-        self.append_event(
-            active_scope.session_id,
-            "invocation_scope",
-            {"toolbox_ids": active_scope.toolbox_ids, "cwd": active_scope.cwd},
-        )
-        return self._invoke(name, args, state=state, depth=0, version=version)
+        legacy_executor = ThreadPoolExecutor(max_workers=max(1, self.max_calls))
+        try:
+            state = _InvocationState(
+                scope=active_scope,
+                max_depth=self.max_depth,
+                max_calls=self.max_calls,
+                model_provider=bound_provider,
+                legacy_executor=legacy_executor,
+            )
+            self.append_event(
+                active_scope.session_id,
+                "invocation_scope",
+                {"toolbox_ids": active_scope.toolbox_ids, "cwd": active_scope.cwd},
+            )
+            return await self._invoke_async(
+                name, args, state=state, depth=0, version=version
+            )
+        finally:
+            legacy_executor.shutdown(wait=False, cancel_futures=True)
 
-    def _invoke(
+    async def _invoke_async(
         self,
         name: str,
         args: dict[str, Any],
@@ -1794,10 +1910,12 @@ class Kernel:
                 raise ToolboxError(
                     "missing_main", "executed source has no callable main"
                 )
-            result = main(args, context)
-            if inspect.isawaitable(result):
-                raise ToolboxError(
-                    "async_result", "tool returned an awaitable; use synchronous main"
+            if inspect.iscoroutinefunction(main):
+                result = await main(args, context)
+            else:
+                legacy_context = _LegacyToolContext(context, asyncio.get_running_loop())
+                result = await asyncio.get_running_loop().run_in_executor(
+                    state.legacy_executor, main, args, legacy_context
                 )
             _json(result)
         except Exception as error:

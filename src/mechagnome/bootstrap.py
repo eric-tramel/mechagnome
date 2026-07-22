@@ -53,7 +53,13 @@ WRITE_SCHEMA = {
         "name": {"type": "string"},
         "description": {"type": "string"},
         "input_schema": {"type": "object"},
-        "source": {"type": "string"},
+        "source": {
+            "type": "string",
+            "description": (
+                "Python source defining async def main(input, ctx); await async "
+                "context operations such as ctx.call_tool."
+            ),
+        },
         "base_version": {"type": "integer", "minimum": 1},
     },
     "required": ["name", "description", "input_schema", "source"],
@@ -90,7 +96,7 @@ HELP_SOURCE = dedent(
         "core": "runtime/core.md",
     }
 
-    def main(input, ctx):
+    async def main(input, ctx):
         topic = input.get("topic") or "toc"
         if topic not in DOCUMENTS:
             return {
@@ -165,7 +171,7 @@ SEARCH_SOURCE = dedent(
                 )
         return scores
 
-    def main(input, ctx):
+    async def main(input, ctx):
         query = input["query"].strip()
         include_core = input.get("include_core", True)
         cursor = max(0, input.get("cursor", 0))
@@ -214,7 +220,7 @@ VIEW_SOURCE = dedent(
     '''\
     """View the exact stored source and metadata for a tool version."""
 
-    def main(input, ctx):
+    async def main(input, ctx):
         return ctx.kernel.view_tool(
             input["name"], version=input.get("version")
         )
@@ -225,7 +231,7 @@ WRITE_SOURCE = dedent(
     '''\
     """Compile, store, and activate an immutable tool version."""
 
-    def main(input, ctx):
+    async def main(input, ctx):
         return ctx.kernel.write_tool(
             name=input["name"],
             description=input["description"],
@@ -240,8 +246,8 @@ CALL_SOURCE = dedent(
     '''\
     """Resolve and execute an active or exact tool version."""
 
-    def main(input, ctx):
-        return ctx.kernel.execute(
+    async def main(input, ctx):
+        return await ctx.kernel.execute(
             input["name"], input["args"], version=input.get("version")
         )
     '''
@@ -269,7 +275,7 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "write_tool",
-        "Create and activate an immutable tool version.",
+        "Create and activate an immutable async Python tool version.",
         WRITE_SCHEMA,
         WRITE_SOURCE,
     ),

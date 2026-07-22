@@ -1,12 +1,12 @@
 # Composing tools
 
-Authored tools compose through `ctx.call_tool(name, args, version=None)`. The
-arguments must be a JSON object and the nested result is returned directly to
-the caller.
+Authored tools compose through
+`await ctx.call_tool(name, args, version=None)`. The arguments must be a JSON
+object and the nested result is returned directly to the caller.
 
 ```python
-def main(input, ctx):
-    total = ctx.call_tool("add", {
+async def main(input, ctx):
+    total = await ctx.call_tool("add", {
         "a": input["value"],
         "b": input["value"],
     })
@@ -30,16 +30,16 @@ Omitting `version` resolves the current active binding within the snapshotted
 toolbox scope:
 
 ```python
-def main(input, ctx):
-    return ctx.call_tool("normalize", input)
+async def main(input, ctx):
+    return await ctx.call_tool("normalize", input)
 ```
 
 Supplying `version` selects that immutable version from the winning tool
 lineage:
 
 ```python
-def main(input, ctx):
-    return ctx.call_tool("normalize", input, version=3)
+async def main(input, ctx):
+    return await ctx.call_tool("normalize", input, version=3)
 ```
 
 Prefer active calls when a composed workflow should pick up fixes and upgrades.
@@ -52,15 +52,15 @@ precedence first chooses the lineage, and the version is resolved within it.
 `ctx.call_tool` intentionally routes through the active editable `call_tool`
 source. Replacing that core implementation can change nested routing, tracing,
 caching, retries, or policy across the toolbox. The low-level
-`ctx.kernel.execute(...)` method belongs only to the logical `call_tool` core
-slot and is what bottoms out dispatch without recursively calling itself.
+`await ctx.kernel.execute(...)` method belongs only to the logical `call_tool`
+core slot and is what bottoms out dispatch without recursively calling itself.
 
 A tool can call `write_tool` and then invoke the newly active version before it
 returns:
 
 ```python
-def main(input, ctx):
-    written = ctx.call_tool("write_tool", {
+async def main(input, ctx):
+    written = await ctx.call_tool("write_tool", {
         "name": "constant_value",
         "description": "Return the configured constant value.",
         "input_schema": {
@@ -68,11 +68,11 @@ def main(input, ctx):
             "additionalProperties": False,
         },
         "source": (
-            "def main(input, ctx):\n"
+            "async def main(input, ctx):\n"
             f"    return {input['value']!r}\n"
         ),
     })
-    result = ctx.call_tool("constant_value", {})
+    result = await ctx.call_tool("constant_value", {})
     return {"written": written, "result": result}
 ```
 
@@ -86,11 +86,26 @@ Avoid cycles, unbounded recursion, and large fan-out loops. Keep tools small,
 give them discoverable descriptions and accurate schemas, and return structured
 JSON so other tools can compose results without parsing prose.
 
+Use `asyncio.gather` when nested calls are independent and can safely run at the
+same time; await dependent calls in order:
+
+```python
+import asyncio
+
+
+async def main(input, ctx):
+    left, right = await asyncio.gather(
+        ctx.call_tool("lookup", {"id": input["left_id"]}),
+        ctx.call_tool("lookup", {"id": input["right_id"]}),
+    )
+    return {"left": left, "right": right}
+```
+
 Nested failures propagate to the caller unless authored source catches the
 exception. Catch only failures the tool can handle meaningfully; otherwise let
 the failed call and its trace remain visible.
 
 Long-running work requested directly by the model may use the host's detached
 `call_tool` mode described in `help({"topic": "core"})`. Authored
-`ctx.call_tool` composition remains synchronous: a tool cannot detach one of
-its own nested calls.
+`ctx.call_tool` composition remains an awaited foreground call: a tool cannot
+detach one of its own nested calls.
