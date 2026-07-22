@@ -51,6 +51,45 @@ EventSink = Callable[[AgentEvent], None]
 DEFAULT_MAX_CALLS_PER_TURN = 16
 
 
+def _parse_call_tool_request(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Classify and validate the flat sync/start/inspect call-tool union."""
+    keys = set(args)
+    if "job_id" in keys:
+        job_id = args.get("job_id")
+        if keys == {"job_id"} and isinstance(job_id, str) and job_id:
+            return "inspect", {"job_id": job_id}
+        raise ToolboxError(
+            "invalid_call_tool_request",
+            "job inspection requires only a non-empty job_id",
+        )
+
+    allowed = {"name", "args", "version", "detach"}
+    name = args.get("name")
+    tool_args = args.get("args")
+    version = args.get("version")
+    detach = args.get("detach", False)
+    valid_version = version is None or (
+        not isinstance(version, bool) and isinstance(version, int) and version >= 1
+    )
+    if (
+        not keys <= allowed
+        or not isinstance(name, str)
+        or not name
+        or not isinstance(tool_args, dict)
+        or not valid_version
+        or not isinstance(detach, bool)
+    ):
+        raise ToolboxError(
+            "invalid_call_tool_request",
+            "call_tool requires name, object args, optional positive version, and "
+            "optional boolean detach",
+        )
+    normalized: dict[str, Any] = {"name": name, "args": tool_args}
+    if version is not None:
+        normalized["version"] = version
+    return ("start" if detach else "sync"), normalized
+
+
 class RunCancelled(ToolboxError):
     """Raised when the user stops the active rollout."""
 
@@ -275,6 +314,34 @@ class Conversation:
                 }
             }
         try:
+            effective_args = call.args
+            if call.name == "call_tool":
+                mode, effective_args = _parse_call_tool_request(call.args)
+                if mode == "inspect":
+                    inspect = getattr(self.tool_runner, "inspect_detached", None)
+                    if not callable(inspect):
+                        raise ToolboxError(
+                            "detached_jobs_unavailable",
+                            "this tool runner does not support detached jobs",
+                        )
+                    return inspect(effective_args["job_id"], session_id=self.session_id)
+                if mode == "start":
+                    start = getattr(self.tool_runner, "start_detached", None)
+                    if not callable(start):
+                        raise ToolboxError(
+                            "detached_jobs_unavailable",
+                            "this tool runner does not support detached jobs",
+                        )
+                    return start(
+                        effective_args["name"],
+                        effective_args["args"],
+                        version=effective_args.get("version"),
+                        session_id=self.session_id,
+                        on_update=lambda kind, payload: self._emit_transient(
+                            sink, kind, payload
+                        ),
+                    )
+
             call_with_provider = getattr(
                 self.tool_runner,
                 "call_with_model_provider",
@@ -288,13 +355,13 @@ class Conversation:
             if callable(call_with_provider):
                 return call_with_provider(
                     call.name,
-                    call.args,
+                    effective_args,
                     model_provider=self.model_session.completion_provider(
                         agent_runner=self._run_child_agent
                     ),
                     **call_kwargs,
                 )
-            return self.tool_runner.call(call.name, call.args, **call_kwargs)
+            return self.tool_runner.call(call.name, effective_args, **call_kwargs)
         except ToolboxError as error:
             if token.cancelled or error.code == "cancelled":
                 raise RunCancelled from error
@@ -365,6 +432,12 @@ class Harness:
         self.max_turns = max_turns
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner or IsolatedToolRunner(kernel)
+
+    def close(self) -> None:
+        """Release background work owned by the shared tool runner."""
+        close = getattr(self.tool_runner, "close", None)
+        if callable(close):
+            close()
 
     def start(
         self,

@@ -66,8 +66,9 @@ CALL_SCHEMA = {
         "name": {"type": "string"},
         "args": {"type": "object"},
         "version": {"type": "integer", "minimum": 1},
+        "detach": {"type": "boolean"},
+        "job_id": {"type": "string"},
     },
-    "required": ["name", "args"],
     "additionalProperties": False,
 }
 
@@ -274,7 +275,7 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "call_tool",
-        "Invoke an active or exact tool version with a JSON object.",
+        "Invoke a tool, detach it for later inspection, or inspect a detached job.",
         CALL_SCHEMA,
         CALL_SOURCE,
     ),

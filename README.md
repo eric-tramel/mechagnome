@@ -289,6 +289,25 @@ The harness rejects model calls outside the five-operation surface. Dynamic
 tools never need to be registered with the inference provider; they are reached
 through the stable `call_tool(name, args, version=None)` envelope.
 
+Long-running top-level calls can be detached with
+`{"name": "tool", "args": {}, "detach": true}`. The immediate response is a
+process-lifetime `job_id`; `{"job_id": "..."}` later returns `running`, the
+bounded merged stdout/stderr tail, or the typed terminal result/error. The TUI
+keeps the original expandable tool row animated and updates its tail while the
+model continues. A runner allows four concurrent detached jobs, does not expose
+`ctx.model_provider` to them, retains only the latest 64 completed handles, and
+retains at most 1 MiB per result. Oversized results become a structured
+`detached_result_too_large` failure. The runner stops unfinished jobs on
+application shutdown. Handles have no per-job cancel
+operation and do not survive a restart; `Harness` owners must call `close()`.
+Clearing or ending a TUI tab while the app remains open hides its rows without
+cancelling its jobs; ending the final tab exits the app and triggers shutdown.
+Captured output can contain sensitive tool data, and inspecting it copies the
+tail into the model transcript. The host handles detach start/inspection; the
+background job itself still executes one ordinary call through the active,
+editable `call_tool` dispatcher. Authored `ctx.call_tool` calls remain
+synchronous.
+
 ## Metacircular core
 
 The outer names and schemas of the five operations are pinned so a provider can
