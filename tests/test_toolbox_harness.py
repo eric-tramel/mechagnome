@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
 import stat
 import sys
+import threading
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -14,8 +18,10 @@ import pytest
 
 from mechagnome import Harness, Kernel, ModelProvider, ModelTurn, ToolboxError, ToolCall
 from mechagnome import __main__ as cli
+from mechagnome import isolation as isolation_module
 from mechagnome import kernel as kernel_module
 from mechagnome.bootstrap import CORE_NAMES, CORE_SCHEMAS, HELP_SOURCE
+from mechagnome.isolation import IsolatedToolRunner
 
 
 def kernel_at(tmp_path: Path, **kwargs: Any) -> Kernel:
@@ -60,6 +66,30 @@ def call_tool(
     if version is not None:
         envelope["version"] = version
     return kernel.call("call_tool", envelope, session_id=session_id)
+
+
+def wait_for_detached(
+    runner: IsolatedToolRunner,
+    job_id: str,
+    session_id: str,
+    *,
+    status: str | None = None,
+    output: str | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Wait for deterministic detached state without assuming a fixed duration."""
+    deadline = time.monotonic() + timeout
+    while True:
+        snapshot = runner.inspect_detached(job_id, session_id=session_id)
+        if (status is None or snapshot["status"] == status) and (
+            output is None or output in snapshot["output_tail"]
+        ):
+            return snapshot
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"detached job did not reach expected state: {snapshot}"
+            )
+        time.sleep(0.01)
 
 
 def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
@@ -1731,6 +1761,506 @@ class OversizedBatchModel:
             observation["content"]["error"]["code"] for observation in observations
         } == {"too_many_tool_calls"}
         return ModelTurn(text="I will use a smaller batch next time.")
+
+
+class DetachedContinuationModel:
+    """Detach a gated tool, do foreground work, then inspect it next prompt."""
+
+    def __init__(self) -> None:
+        self.turn = 0
+        self.job_id: str | None = None
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.turn += 1
+        if self.turn == 1:
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "call_tool",
+                        {"name": "gated", "args": {}, "detach": True},
+                        "detach",
+                    ),
+                )
+            )
+        if self.turn == 2:
+            handle = messages[-1]["content"]
+            assert handle["status"] == "running"
+            self.job_id = handle["job_id"]
+            return ModelTurn(calls=(ToolCall("help", {"topic": "toc"}, "help"),))
+        if self.turn == 3:
+            assert str(messages[-1]["content"]).startswith("# Mechagnome")
+            return ModelTurn(text="Foreground work finished.")
+        if self.turn == 4:
+            assert self.job_id is not None
+            return ModelTurn(
+                calls=(ToolCall("call_tool", {"job_id": self.job_id}, "inspect"),)
+            )
+        inspected = messages[-1]["content"]
+        assert inspected["status"] == "succeeded"
+        assert "result" in inspected and inspected["result"] is None
+        assert "finished" in inspected["output_tail"]
+        return ModelTurn(text="Detached work finished.")
+
+
+def test_detached_call_continues_foreground_and_is_inspectable_later(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    started = tmp_path / "detached-started"
+    release = tmp_path / "detached-release"
+    write(
+        kernel,
+        "gated",
+        "import time\n"
+        "from pathlib import Path\n\n"
+        "def main(input, ctx):\n"
+        "    print('started', flush=True)\n"
+        f"    Path({str(started)!r}).write_text('yes')\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+        "    print('finished', flush=True)\n"
+        "    return None\n",
+    )
+    runner = IsolatedToolRunner(kernel)
+    harness = Harness(kernel, tool_runner=runner)
+    model = DetachedContinuationModel()
+    conversation = harness.start(model)
+
+    first = conversation.send("start background work")
+
+    assert first.answer == "Foreground work finished."
+    assert model.job_id is not None
+    assert started.exists()
+    running = wait_for_detached(
+        runner,
+        model.job_id,
+        conversation.session_id,
+        status="running",
+        output="started",
+    )
+    assert running == {
+        "job_id": model.job_id,
+        "status": "running",
+        "output_tail": "started\n",
+        "truncated": False,
+    }
+    assert [message["role"] for message in conversation.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    parent_events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    observations = [
+        event for event in parent_events if event["kind"] == "tool_observation"
+    ]
+    assert len(observations) == 2
+    assert observations[0]["payload"]["observation"] == {
+        "job_id": model.job_id,
+        "status": "running",
+    }
+
+    release.write_text("go")
+    wait_for_detached(runner, model.job_id, conversation.session_id, status="succeeded")
+    second = conversation.send("check the background work")
+
+    assert second.answer == "Detached work finished."
+    harness.close()
+
+
+def test_detached_output_is_sanitized_bounded_and_providerless(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "noisy",
+        "import os\n\n"
+        "def main(input, ctx):\n"
+        "    print('before\\x1b[31mred\\x1b[0m')\n"
+        "    print('x' * 300000)\n"
+        "    print('after\\x1b[32mgreen\\x1b[0m')\n"
+        "    os.write(1, b'bad-utf8-\\xff\\n')\n"
+        "    try:\n"
+        "        ctx.model_provider.complete([{'role': 'user', 'content': 'x'}])\n"
+        "    except Exception as error:\n"
+        "        return {'provider_error': error.code}\n",
+    )
+    runner = IsolatedToolRunner(kernel)
+    session_id = kernel.create_session(kind="conversation")
+
+    handle = runner.start_detached("noisy", {}, session_id=session_id)
+    completed = wait_for_detached(
+        runner, handle["job_id"], session_id, status="succeeded"
+    )
+
+    assert completed["result"] == {"provider_error": "model_provider_unavailable"}
+    assert completed["truncated"] is True
+    assert len(completed["output_tail"].encode("utf-8")) <= 256 * 1024
+    assert "\x1b" not in completed["output_tail"]
+    assert "aftergreen" in completed["output_tail"]
+    assert "bad-utf8-�" in completed["output_tail"]
+    runner.close()
+
+
+def test_detached_output_reader_does_not_wait_for_escaped_writer(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "escaped_writer",
+        "import subprocess\n"
+        "import sys\n\n"
+        "def main(input, ctx):\n"
+        "    child = subprocess.Popen(\n"
+        "        [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "        start_new_session=True,\n"
+        "    )\n"
+        "    print(f'escaped child {child.pid}', flush=True)\n"
+        "    return child.pid\n",
+    )
+    runner = IsolatedToolRunner(kernel, timeout=2)
+    session_id = kernel.create_session(kind="conversation")
+    child_pid: int | None = None
+
+    try:
+        handle = runner.start_detached("escaped_writer", {}, session_id=session_id)
+        completed = wait_for_detached(
+            runner,
+            handle["job_id"],
+            session_id,
+            status="succeeded",
+            timeout=3,
+        )
+        child_pid = completed["result"]
+        assert f"escaped child {child_pid}" in completed["output_tail"]
+    finally:
+        runner.close()
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_detached_output_shutdown_is_bounded_for_continuous_escaped_writer(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "continuous_escaped_writer",
+        "import subprocess\n"
+        "import sys\n\n"
+        "def main(input, ctx):\n"
+        "    code = (\n"
+        "        'import os\\n'\n"
+        "        'chunk = b\\\"x\\\" * 4096\\n'\n"
+        "        'while True:\\n'\n"
+        "        '    os.write(1, chunk)\\n'\n"
+        "    )\n"
+        "    child = subprocess.Popen(\n"
+        "        [sys.executable, '-c', code], start_new_session=True\n"
+        "    )\n"
+        "    return child.pid\n",
+    )
+    runner = IsolatedToolRunner(kernel, timeout=2)
+    session_id = kernel.create_session(kind="conversation")
+    child_pid: int | None = None
+
+    try:
+        handle = runner.start_detached(
+            "continuous_escaped_writer", {}, session_id=session_id
+        )
+        completed = wait_for_detached(
+            runner,
+            handle["job_id"],
+            session_id,
+            status="succeeded",
+            timeout=3,
+        )
+        child_pid = completed["result"]
+        assert completed["output_tail"]
+    finally:
+        runner.close()
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_detached_cleanup_stops_owned_descendants_and_joins_job_thread(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "owned_descendant",
+        "import subprocess\n"
+        "import sys\n\n"
+        "def main(input, ctx):\n"
+        "    child = subprocess.Popen(\n"
+        "        [sys.executable, '-c', 'import time; time.sleep(30)']\n"
+        "    )\n"
+        "    return child.pid\n",
+    )
+    runner = IsolatedToolRunner(kernel, timeout=2)
+    session_id = kernel.create_session(kind="conversation")
+
+    handle = runner.start_detached("owned_descendant", {}, session_id=session_id)
+    completed = wait_for_detached(
+        runner, handle["job_id"], session_id, status="succeeded", timeout=3
+    )
+    child_pid = completed["result"]
+    runner.close()
+
+    assert runner._jobs[handle["job_id"]].thread is not None
+    assert not runner._jobs[handle["job_id"]].thread.is_alive()
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        if time.monotonic() >= deadline:
+            os.kill(child_pid, signal.SIGKILL)
+            raise AssertionError("owned descendant survived worker-group cleanup")
+        time.sleep(0.01)
+
+
+def test_detached_job_limit_timeout_and_shutdown_are_structured(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    release = tmp_path / "release-all"
+    write(
+        kernel,
+        "waiter",
+        "import time\n"
+        "from pathlib import Path\n\n"
+        "def main(input, ctx):\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+        "    return input.get('value')\n",
+    )
+    runner = IsolatedToolRunner(kernel, timeout=5)
+    session_id = kernel.create_session(kind="conversation")
+    handles = [
+        runner.start_detached("waiter", {"value": index}, session_id=session_id)
+        for index in range(4)
+    ]
+
+    with pytest.raises(ToolboxError) as limit_error:
+        runner.start_detached("waiter", {}, session_id=session_id)
+    assert limit_error.value.code == "detached_job_limit"
+
+    runner.close()
+    runner.close()
+    for handle in handles:
+        inspected = runner.inspect_detached(handle["job_id"], session_id=session_id)
+        assert inspected["status"] == "failed"
+        assert inspected["error"]["code"] == "detached_shutdown"
+    with pytest.raises(ToolboxError) as closed_error:
+        runner.start_detached("waiter", {}, session_id=session_id)
+    assert closed_error.value.code == "detached_runner_closed"
+
+    timeout_runner = IsolatedToolRunner(kernel, timeout=0.1)
+    timeout_handle = timeout_runner.start_detached("waiter", {}, session_id=session_id)
+    timed_out = wait_for_detached(
+        timeout_runner,
+        timeout_handle["job_id"],
+        session_id,
+        status="failed",
+    )
+    assert timed_out["error"]["code"] == "tool_timeout"
+    timeout_runner.close()
+
+
+def test_detached_job_limit_is_atomic_and_releases_completed_slots(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    release = tmp_path / "release-concurrent"
+    write(
+        kernel,
+        "concurrent_waiter",
+        "import time\n"
+        "from pathlib import Path\n\n"
+        "def main(input, ctx):\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+        "    return input['value']\n",
+    )
+    runner = IsolatedToolRunner(kernel, timeout=5)
+    session_id = kernel.create_session(kind="conversation")
+    barrier = threading.Barrier(5)
+    outcomes: list[dict[str, Any] | ToolboxError] = []
+    outcomes_lock = threading.Lock()
+
+    def start(index: int) -> None:
+        barrier.wait()
+        try:
+            outcome: dict[str, Any] | ToolboxError = runner.start_detached(
+                "concurrent_waiter", {"value": index}, session_id=session_id
+            )
+        except ToolboxError as error:
+            outcome = error
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=start, args=(index,)) for index in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    handles = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+    errors = [outcome for outcome in outcomes if isinstance(outcome, ToolboxError)]
+    assert len(handles) == 4
+    assert [error.code for error in errors] == ["detached_job_limit"]
+
+    release.write_text("go")
+    for handle in handles:
+        wait_for_detached(runner, handle["job_id"], session_id, status="succeeded")
+    replacement = runner.start_detached(
+        "concurrent_waiter", {"value": 5}, session_id=session_id
+    )
+    wait_for_detached(runner, replacement["job_id"], session_id, status="succeeded")
+    runner.close()
+
+
+def test_detached_job_retention_evicts_oldest_completed_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(isolation_module, "_MAX_RETAINED_DETACHED_JOBS", 2)
+    kernel = kernel_at(tmp_path)
+    write(kernel, "retained", "def main(input, ctx):\n    return input['value']\n")
+    runner = IsolatedToolRunner(kernel)
+    session_id = kernel.create_session(kind="conversation")
+    handles: list[dict[str, Any]] = []
+
+    for value in range(3):
+        handle = runner.start_detached(
+            "retained", {"value": value}, session_id=session_id
+        )
+        wait_for_detached(runner, handle["job_id"], session_id, status="succeeded")
+        handles.append(handle)
+
+    with pytest.raises(ToolboxError) as evicted:
+        runner.inspect_detached(handles[0]["job_id"], session_id=session_id)
+    assert evicted.value.code == "unknown_detached_job"
+    assert (
+        runner.inspect_detached(handles[1]["job_id"], session_id=session_id)["result"]
+        == 1
+    )
+    assert (
+        runner.inspect_detached(handles[2]["job_id"], session_id=session_id)["result"]
+        == 2
+    )
+    runner.close()
+
+
+def test_detached_result_size_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(isolation_module, "_MAX_DETACHED_RESULT_BYTES", 32)
+    kernel = kernel_at(tmp_path)
+    write(kernel, "large_result", "def main(input, ctx):\n    return 'x' * 100\n")
+    runner = IsolatedToolRunner(kernel)
+    session_id = kernel.create_session(kind="conversation")
+
+    handle = runner.start_detached("large_result", {}, session_id=session_id)
+    completed = wait_for_detached(runner, handle["job_id"], session_id, status="failed")
+
+    assert completed["error"] == {
+        "code": "detached_result_too_large",
+        "message": "detached result exceeds the retained byte limit",
+        "details": {"limit_bytes": 32},
+    }
+    runner.close()
+
+
+def test_detached_job_uses_custom_dispatcher_and_is_parent_scoped(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "call_tool",
+        "def main(input, ctx):\n"
+        "    return {'custom_name': input['name'], 'args': input['args']}\n",
+        input_schema=CORE_SCHEMAS["call_tool"],
+        base_version=1,
+    )
+    runner = IsolatedToolRunner(kernel)
+    owner = kernel.create_session(kind="conversation")
+    foreign = kernel.create_session(kind="conversation")
+
+    handle = runner.start_detached("not_a_real_tool", {"x": 1}, session_id=owner)
+    completed = wait_for_detached(runner, handle["job_id"], owner, status="succeeded")
+
+    assert completed["result"] == {"custom_name": "not_a_real_tool", "args": {"x": 1}}
+    with pytest.raises(ToolboxError) as error:
+        runner.inspect_detached(handle["job_id"], session_id=foreign)
+    assert error.value.code == "unknown_detached_job"
+    runner.close()
+
+
+def test_call_tool_control_validation_and_detach_false_compatibility(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(kernel, "echo", "def main(input, ctx):\n    return input\n")
+
+    class ControlModel:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def respond(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        ) -> ModelTurn:
+            self.turn += 1
+            if self.turn == 1:
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "call_tool",
+                            {
+                                "name": "echo",
+                                "args": {"ok": True},
+                                "detach": False,
+                            },
+                            "sync",
+                        ),
+                    )
+                )
+            if self.turn == 2:
+                assert messages[-1]["content"] == {"ok": True}
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "call_tool",
+                            {"job_id": "missing", "name": "mixed"},
+                            "mixed",
+                        ),
+                    )
+                )
+            assert messages[-1]["content"]["error"]["code"] == (
+                "invalid_call_tool_request"
+            )
+            if self.turn == 3:
+                return ModelTurn(calls=(ToolCall("call_tool", {}, "empty"),))
+            if self.turn == 4:
+                return ModelTurn(
+                    calls=(ToolCall("call_tool", {"detach": False}, "partial"),)
+                )
+            return ModelTurn(text="validated")
+
+    assert (
+        Harness(kernel).run(ControlModel(), "exercise controls").answer == "validated"
+    )
 
 
 def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:

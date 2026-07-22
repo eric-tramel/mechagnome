@@ -89,3 +89,8 @@ JSON so other tools can compose results without parsing prose.
 Nested failures propagate to the caller unless authored source catches the
 exception. Catch only failures the tool can handle meaningfully; otherwise let
 the failed call and its trace remain visible.
+
+Long-running work requested directly by the model may use the host's detached
+`call_tool` mode described in `help({"topic": "core"})`. Authored
+`ctx.call_tool` composition remains synchronous: a tool cannot detach one of
+its own nested calls.

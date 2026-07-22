@@ -3247,6 +3247,208 @@ class ToolThenFinalModel:
         return ModelTurn(text="Tool completed.")
 
 
+class DetachedToolModel:
+    """Detach one gated tool and finish the foreground rollout immediately."""
+
+    def __init__(self) -> None:
+        self.turn = 0
+        self.job_id: str | None = None
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.turn += 1
+        if self.turn == 1:
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "call_tool",
+                        {"name": "detached_slow", "args": {}, "detach": True},
+                        "detach",
+                    ),
+                )
+            )
+        handle = messages[-1]["content"]
+        self.job_id = handle["job_id"]
+        return ModelTurn(text="Foreground is free.")
+
+
+def test_detached_terminal_snapshot_marks_local_tail_truncation(
+    tmp_path: Path,
+) -> None:
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"), FinalModel(), model_name="test/model"
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            row = app.chat.write_tool("call", "verbose", "{}")
+            await pilot.pause()
+            row.attach_detached("job-1")
+            row.finish_detached(
+                {
+                    "status": "succeeded",
+                    "output_tail": "x" * (ToolEvent.MAX_DETACHED_TAIL_BYTES + 1),
+                    "truncated": False,
+                    "result": None,
+                }
+            )
+
+            assert row.detached_output_truncated is True
+            assert len(row.detached_output_tail.encode("utf-8")) == (
+                ToolEvent.MAX_DETACHED_TAIL_BYTES
+            )
+            assert "output truncated to latest tail" in row.detail
+
+            staged_row = app.chat.write_tool("call", "fast", "{}")
+            await pilot.pause()
+            staged_row.attach_detached("job-2")
+            state = app.active_session
+            state.detached_tool_events["job-2"] = staged_row
+            app._stage_detached_event(
+                state,
+                AgentEvent(
+                    "detached_finished",
+                    {
+                        "job_id": "job-2",
+                        "name": "fast",
+                        "args": {},
+                        "status": "succeeded",
+                        "output_tail": "",
+                        "truncated": False,
+                        "result": None,
+                    },
+                    None,
+                ),
+            )
+            app._reset_session_ui(state)
+            assert "job-2" not in state.ignored_detached_jobs
+
+    asyncio.run(exercise())
+
+
+def test_tui_detached_tool_keeps_spinning_and_streams_tail_after_rollout(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    started = tmp_path / "detached-started"
+    release = tmp_path / "detached-release"
+    kernel.call(
+        "write_tool",
+        {
+            "name": "detached_slow",
+            "description": "Stream output while waiting for a release file.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import time\n"
+                "from pathlib import Path\n\n"
+                "def main(input, ctx):\n"
+                "    print('stream started', flush=True)\n"
+                f"    Path({str(started)!r}).write_text('yes')\n"
+                f"    while not Path({str(release)!r}).exists():\n"
+                "        time.sleep(0.01)\n"
+                "    print('stream finished', flush=True)\n"
+                "    return {'ok': True}\n"
+            ),
+        },
+    )
+    model = DetachedToolModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "detach the slow tool"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            for _ in range(200):
+                await pilot.pause()
+                rows = [row for row in app.query(ToolEvent) if row.detached_job_id]
+                if rows and "stream started" in rows[0].detail:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("detached row never received streaming output")
+
+            row = rows[0]
+            assert started.exists()
+            assert model.job_id == row.detached_job_id
+            assert app.busy is False
+            assert prompt.disabled is False
+            assert row.processing is True
+            assert row._spinner_timer is not None
+            assert row.kind == "call"
+            await pilot.click(row)
+            assert row.collapsed is False
+            assert "stream started" in row.detail
+
+            release.write_text("go")
+            for _ in range(200):
+                await pilot.pause()
+                if row.kind == "response":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("detached row never completed")
+
+            assert row.processing is False
+            assert row._spinner_timer is None
+            assert "stream finished" in row.detail
+            assert '"ok": true' in row.detail
+            assert tool_title_text(row).startswith("✓ detached_slow")
+
+    asyncio.run(exercise())
+
+
+def test_tui_exit_cancels_active_detached_tool_without_callback_deadlock(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    started = tmp_path / "exit-detached-started"
+    kernel.call(
+        "write_tool",
+        {
+            "name": "detached_slow",
+            "description": "Keep streaming until the application exits.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import time\n"
+                "from pathlib import Path\n\n"
+                "def main(input, ctx):\n"
+                f"    Path({str(started)!r}).write_text('yes')\n"
+                "    while True:\n"
+                "        print('still running', flush=True)\n"
+                "        time.sleep(0.01)\n"
+            ),
+        },
+    )
+    model = DetachedToolModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+    runner = app.harness.tool_runner
+    assert isinstance(runner, IsolatedToolRunner)
+    session_id = app.conversation.session_id
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "detach the slow tool"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            for _ in range(200):
+                await pilot.pause()
+                if started.exists() and model.job_id is not None:
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("detached tool did not start before exit")
+
+    asyncio.run(exercise())
+
+    assert model.job_id is not None
+    stopped = runner.inspect_detached(model.job_id, session_id=session_id)
+    assert stopped["status"] == "failed"
+    assert stopped["error"]["code"] == "detached_shutdown"
+
+
 def test_escape_terminates_active_tool_subprocess(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     pid_path = tmp_path / "slow-tool-pids"

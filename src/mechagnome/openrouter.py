@@ -72,6 +72,8 @@ creating duplicates; build small reusable Python tools when they improve the
 task; call and repair them immediately; and reuse them across later requests.
 Request independent operations together in modest batches. Keep an operation
 in a later turn when it depends on the output of an earlier operation.
+For a long-running independent call_tool invocation, set detach=true, continue
+other work with the returned job_id, and inspect it later with call_tool.
 Tools may call other tools through ctx.call_tool, read current or historical
 sessions through ctx.sessions, and use the ordinary Linux/Python environment.
 Use help when you need the tool ABI or examples. Core operation source is also

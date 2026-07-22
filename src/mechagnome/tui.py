@@ -7,6 +7,7 @@ import json
 import math
 import shlex
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 
 from rich.cells import split_graphemes
@@ -65,11 +66,20 @@ def _format_duration(value: Any) -> str:
     return f"{value / 1000:.2f} s"
 
 
+def _compact_json(value: Any, limit: int = 1600) -> str:
+    try:
+        rendered = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        rendered = repr(value)
+    return rendered if len(rendered) <= limit else f"{rendered[:limit]}\n…"
+
+
 class ToolEvent(Collapsible):
     """One quiet, expandable tool invocation or observation."""
 
     SYMBOLS = {"call": "→", "response": "✓", "error": "✕"}
     SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    MAX_DETACHED_TAIL_BYTES = 16 * 1024
 
     def __init__(
         self,
@@ -82,8 +92,12 @@ class ToolEvent(Collapsible):
         self.kind = kind
         self.tool_name = tool_name
         self.detail = detail
+        self.call_detail = detail
         self.argument_summary = argument_summary
         self.outcome_summary = outcome_summary
+        self.detached_job_id: str | None = None
+        self.detached_output_tail = ""
+        self.detached_output_truncated = False
         self.processing = kind == "call"
         self.detail_widget = Static(
             Text(detail, style="dim"), classes="tool-event-detail"
@@ -101,6 +115,10 @@ class ToolEvent(Collapsible):
         """Start the spinner animation for in-progress calls."""
         if self.processing:
             self._start_spinner()
+
+    def on_unmount(self) -> None:
+        """Release the widget-owned animation timer."""
+        self.stop_spinner()
 
     def _start_spinner(self) -> None:
         self._spinner_timer = self.set_interval(0.08, self._spin)
@@ -127,6 +145,7 @@ class ToolEvent(Collapsible):
         """Replace a pending dispatcher row with its confirmed target call."""
         self.tool_name = tool_name
         self.detail = detail
+        self.call_detail = detail
         self.argument_summary = argument_summary
         self.detail_widget.update(Text(detail, style="dim"))
         if self._spinner_timer is None:
@@ -146,6 +165,50 @@ class ToolEvent(Collapsible):
         self.detail = f"arguments\n{call_detail}\n\n{outcome}\n{detail}"
         self.detail_widget.update(Text(self.detail, style="dim"))
         self.stop_spinner()
+
+    def attach_detached(self, job_id: str) -> None:
+        """Keep this call active under one process-lifetime detached handle."""
+        self.detached_job_id = job_id
+        self.detail = self._detached_detail()
+        self.detail_widget.update(Text(self.detail, style="dim"))
+
+    def set_detached_output(self, text: str, *, truncated: bool = False) -> None:
+        """Replace the displayed output with the supervisor's latest tail."""
+        encoded = text.encode("utf-8")
+        if len(encoded) > self.MAX_DETACHED_TAIL_BYTES:
+            encoded = encoded[-self.MAX_DETACHED_TAIL_BYTES :]
+            while encoded and encoded[0] & 0xC0 == 0x80:
+                encoded = encoded[1:]
+            truncated = True
+        self.detached_output_truncated = truncated
+        self.detached_output_tail = encoded.decode("utf-8", errors="replace")
+        self.detail = self._detached_detail()
+        self.detail_widget.update(Text(self.detail, style="dim"))
+
+    def finish_detached(self, payload: dict[str, Any]) -> None:
+        """Finalize one detached row with its final tail and typed outcome."""
+        self.set_detached_output(
+            str(payload.get("output_tail") or ""),
+            truncated=bool(payload.get("truncated")),
+        )
+        succeeded = payload.get("status") == "succeeded"
+        self.kind = "response" if succeeded else "error"
+        self.remove_class("tool-call")
+        self.add_class(f"tool-{self.kind}")
+        label = "response" if succeeded else "error"
+        value = payload.get("result") if succeeded else payload.get("error")
+        self.detail = f"{self._detached_detail()}\n\n{label}\n{_compact_json(value)}"
+        self.detail_widget.update(Text(self.detail, style="dim"))
+        self.stop_spinner()
+
+    def _detached_detail(self) -> str:
+        output = self.detached_output_tail or "(waiting for output)"
+        if self.detached_output_truncated:
+            output = f"… output truncated to latest tail …\n{output}"
+        return (
+            f"arguments\n{self.call_detail}\n\n"
+            f"job\n{self.detached_job_id or 'starting'}\n\noutput\n{output}"
+        )
 
     def _render_title(self, symbol: str) -> str:
         return escape(
@@ -321,6 +384,8 @@ class SessionTab:
     forwarded_events: dict[str, ToolEvent] = field(default_factory=dict)
     forwarded_children: dict[str, str] = field(default_factory=dict)
     active_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
+    detached_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
+    ignored_detached_jobs: set[str] = field(default_factory=set)
 
 
 class DeleteToolScreen(ModalScreen[bool]):
@@ -1402,6 +1467,12 @@ class ToolboxApp(App[None]):
         model_provider: CompletionTransport | None = None,
     ) -> None:
         super().__init__()
+        self._accept_background_events = True
+        self._detached_event_lock = Lock()
+        self._staged_detached_events: dict[
+            tuple[str, str], tuple[SessionTab, AgentEvent]
+        ] = {}
+        self._detached_event_timer: Timer | None = None
         self.kernel = kernel
         self.model = model.transport if isinstance(model, ModelProvider) else model
         self.model_name = model_name
@@ -1492,6 +1563,9 @@ class ToolboxApp(App[None]):
 
     def on_mount(self) -> None:
         """Populate the initial panes and focus the prompt."""
+        self._detached_event_timer = self.set_interval(
+            0.05, self._flush_staged_detached_events
+        )
         self._show_welcome()
         self._refresh_sidebar()
         self._refresh_model_controls()
@@ -1501,9 +1575,16 @@ class ToolboxApp(App[None]):
 
     def on_unmount(self, event: Unmount) -> None:
         """Release a synchronous rollout before asyncio joins worker threads."""
+        with self._detached_event_lock:
+            self._accept_background_events = False
+            self._staged_detached_events.clear()
+        if self._detached_event_timer is not None:
+            self._detached_event_timer.stop()
+            self._detached_event_timer = None
         for state in self.session_tabs:
             self._reset_stream_state(state)
             state.conversation.close()
+        self.harness.close()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Leave TAB available for focus traversal on pushed screens."""
@@ -1636,6 +1717,9 @@ class ToolboxApp(App[None]):
 
         def relay(event: AgentEvent) -> None:
             nonlocal error_reported
+            if event.kind.startswith("detached_"):
+                self._stage_detached_event(state, event)
+                return
             if event.kind == "model_delta":
                 self.call_from_thread(
                     self._queue_stream_delta,
@@ -1764,6 +1848,52 @@ class ToolboxApp(App[None]):
             content = partial or str(event.payload.get("message") or "Rollout stopped.")
             self._finish_stream(state, content, stopped=True)
             self._set_status("stopped", state)
+
+    def _display_detached_event(self, state: SessionTab, event: AgentEvent) -> None:
+        job_id = event.payload.get("job_id")
+        if not isinstance(job_id, str):
+            return
+        terminal = event.payload.get("status") in {"succeeded", "failed"}
+        if job_id in state.ignored_detached_jobs:
+            if terminal:
+                state.ignored_detached_jobs.discard(job_id)
+            return
+        displayed = state.detached_tool_events.get(job_id)
+        if displayed is None:
+            name = str(event.payload.get("name") or "tool")
+            args = event.payload.get("args")
+            displayed = state.chat.write_tool(
+                "call",
+                name,
+                self._compact(args),
+                self._argument_summary(args),
+            )
+            displayed.attach_detached(job_id)
+            state.detached_tool_events[job_id] = displayed
+        if terminal:
+            displayed.finish_detached(event.payload)
+            state.detached_tool_events.pop(job_id, None)
+        else:
+            displayed.set_detached_output(
+                str(event.payload.get("output_tail") or ""),
+                truncated=bool(event.payload.get("truncated")),
+            )
+
+    def _stage_detached_event(self, state: SessionTab, event: AgentEvent) -> None:
+        """Coalesce worker-thread updates without waiting for the UI loop."""
+        job_id = event.payload.get("job_id")
+        if not isinstance(job_id, str):
+            return
+        with self._detached_event_lock:
+            if self._accept_background_events:
+                self._staged_detached_events[(state.pane_id, job_id)] = (state, event)
+
+    def _flush_staged_detached_events(self) -> None:
+        with self._detached_event_lock:
+            staged = list(self._staged_detached_events.values())
+            self._staged_detached_events.clear()
+        for state, event in staged:
+            self._display_detached_event(state, event)
 
     def _queue_stream_delta(self, state: SessionTab, text: str) -> None:
         if not text:
@@ -2299,6 +2429,18 @@ class ToolboxApp(App[None]):
         state.forwarded_targets.clear()
         state.forwarded_events.clear()
         state.forwarded_children.clear()
+        state.ignored_detached_jobs.update(state.detached_tool_events)
+        state.detached_tool_events.clear()
+        with self._detached_event_lock:
+            for key in [
+                key for key in self._staged_detached_events if key[0] == state.pane_id
+            ]:
+                _, staged = self._staged_detached_events[key]
+                if staged.payload.get("status") in {"succeeded", "failed"}:
+                    state.ignored_detached_jobs.discard(key[1])
+                else:
+                    state.ignored_detached_jobs.add(key[1])
+                del self._staged_detached_events[key]
         state.draft = ""
         state.user_history.clear()
         state.history_index = None
@@ -2360,11 +2502,7 @@ class ToolboxApp(App[None]):
 
     @staticmethod
     def _compact(value: Any, limit: int = 1600) -> str:
-        try:
-            rendered = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
-        except (TypeError, ValueError):
-            rendered = repr(value)
-        return rendered if len(rendered) <= limit else f"{rendered[:limit]}\n…"
+        return _compact_json(value, limit)
 
     @staticmethod
     def _argument_summary(value: Any, limit: int = 96) -> str:

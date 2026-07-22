@@ -904,7 +904,7 @@ class Kernel:
         origin_call_id: str | None = None,
     ) -> str:
         """Create a host-identified child inheriting one frozen invocation scope."""
-        if kind not in _SESSION_KINDS or kind == "generic":
+        if kind not in _SESSION_KINDS:
             raise ToolboxError("invalid_session_kind", f"invalid child kind: {kind}")
         identifier = uuid.uuid4().hex
         with closing(self._connect()) as connection:
