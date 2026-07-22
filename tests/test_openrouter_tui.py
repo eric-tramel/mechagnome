@@ -1781,6 +1781,62 @@ def test_tui_sends_a_prompt_without_blocking_and_saves_the_session(
     assert [event["kind"] for event in events] == ["user", "model", "final"]
 
 
+def test_tui_arrow_keys_scrub_session_prompt_history(tmp_path: Path) -> None:
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"), FinalModel(), model_name="test/model"
+    )
+
+    async def submit(pilot: Any, value: str) -> None:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = value
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "unsent draft"
+            await pilot.press("up")
+            assert prompt.value == "unsent draft"
+
+            await submit(pilot, "first prompt")
+            await submit(pilot, "second prompt")
+
+            prompt.value = "new draft"
+            await pilot.press("up")
+            assert prompt.value == "second prompt"
+            assert prompt.cursor_position == len("second prompt")
+            await pilot.press("up")
+            assert prompt.value == "first prompt"
+            await pilot.press("up")
+            assert prompt.value == "first prompt"
+
+            await pilot.press("down")
+            assert prompt.value == "second prompt"
+            await pilot.press("down")
+            assert prompt.value == "new draft"
+            await pilot.press("down")
+            assert prompt.value == "new draft"
+
+            first = app.active_session
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            assert app.active_session is not first
+            assert prompt.value == ""
+            await pilot.press("up")
+            assert prompt.value == ""
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is first
+            assert prompt.value == "new draft"
+            await pilot.press("up")
+            assert prompt.value == "second prompt"
+
+    asyncio.run(exercise())
+
+
 def test_tui_preserves_model_provider_when_starting_a_new_session(
     tmp_path: Path,
 ) -> None:

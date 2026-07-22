@@ -199,6 +199,9 @@ class SessionTab:
     label: str
     chat: ChatFeed
     draft: str = ""
+    user_history: list[str] = field(default_factory=list)
+    history_index: int | None = None
+    history_draft: str = ""
     status: str = "ready"
     streamed_text: str = ""
     pending_stream_text: list[str] = field(default_factory=list)
@@ -1110,6 +1113,8 @@ class ToolboxApp(App[None]):
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+n", "new_session", "New session"),
         Binding("tab", "next_session", "Next session", show=False, priority=True),
+        Binding("up", "previous_prompt", "Previous prompt", show=False),
+        Binding("down", "next_prompt", "Next prompt", show=False),
         ("ctrl+t", "manage_tools", "Manage tools"),
         ("f1", "show_help", "Help"),
     ]
@@ -1404,6 +1409,10 @@ class ToolboxApp(App[None]):
         """Leave TAB available for focus traversal on pushed screens."""
         if action == "next_session" and len(self.screen_stack) != 1:
             return False
+        if action in {"previous_prompt", "next_prompt"}:
+            return len(self.screen_stack) == 1 and self.focused is self.query_one(
+                "#prompt", Input
+            )
         return super().check_action(action, parameters)
 
     @on(TabbedContent.TabActivated, "#session-tabs")
@@ -1507,6 +1516,9 @@ class ToolboxApp(App[None]):
         if not prompt or self.busy:
             return
         state = self.active_session
+        state.user_history.append(prompt)
+        state.history_index = None
+        state.history_draft = ""
         state.draft = ""
         with self.prevent(Input.Changed):
             event.input.value = ""
@@ -1808,6 +1820,45 @@ class ToolboxApp(App[None]):
         self._show_welcome(state)
         self._set_status("new session", state)
 
+    def action_previous_prompt(self) -> None:
+        """Replace the active draft with the previous submitted prompt."""
+        state = self.active_session
+        if not state.user_history:
+            return
+        prompt = self.query_one("#prompt", Input)
+        if state.history_index is None:
+            state.history_draft = prompt.value
+            state.history_index = len(state.user_history) - 1
+        elif state.history_index > 0:
+            state.history_index -= 1
+        self._show_history_prompt(state)
+
+    def action_next_prompt(self) -> None:
+        """Replace the active draft with the next submitted prompt."""
+        state = self.active_session
+        if state.history_index is None:
+            return
+        if state.history_index < len(state.user_history) - 1:
+            state.history_index += 1
+            self._show_history_prompt(state)
+            return
+        state.history_index = None
+        self._set_prompt_value(state, state.history_draft)
+        state.history_draft = ""
+
+    def _show_history_prompt(self, state: SessionTab) -> None:
+        """Display the history entry selected for a session."""
+        assert state.history_index is not None
+        self._set_prompt_value(state, state.user_history[state.history_index])
+
+    def _set_prompt_value(self, state: SessionTab, value: str) -> None:
+        """Update the prompt without treating history navigation as an edit."""
+        prompt = self.query_one("#prompt", Input)
+        state.draft = value
+        with self.prevent(Input.Changed):
+            prompt.value = value
+            prompt.cursor_position = len(value)
+
     def action_next_session(self) -> None:
         """Activate the next open session tab, wrapping at the end."""
         if len(self.session_tabs) < 2:
@@ -2105,6 +2156,9 @@ class ToolboxApp(App[None]):
         state.forwarded_events.clear()
         state.forwarded_children.clear()
         state.draft = ""
+        state.user_history.clear()
+        state.history_index = None
+        state.history_draft = ""
         state.status = "ready"
 
     def _forwarded_child(
