@@ -75,6 +75,14 @@ class OpenRouterModelOption:
     input_modalities: tuple[str, ...] = ()
     reasoning_efforts: tuple[str, ...] = ()
     reasoning_mandatory: bool = False
+    context_length: int | None = None
+
+
+def _positive_int(value: Any) -> int | None:
+    """Return provider metadata only when it is a positive plain integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 @dataclass
@@ -228,6 +236,7 @@ class OpenRouterModel:
                     input_modalities=input_modalities,
                     reasoning_efforts=efforts,
                     reasoning_mandatory=mandatory,
+                    context_length=_positive_int(item.get("context_length")),
                 )
             )
         return options
@@ -348,6 +357,7 @@ class OpenRouterModel:
         reasoning_details: list[dict[str, Any]] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
+        total_tokens: int | None = None
         saw_done = False
         stream_bytes = 0
         line_buffer = bytearray()
@@ -405,6 +415,11 @@ class OpenRouterModel:
                             raise TypeError("stream event is not an object")
                         if payload.get("error") is not None:
                             raise self._stream_error(payload["error"])
+                        usage = payload.get("usage")
+                        if isinstance(usage, Mapping):
+                            reported_total = _positive_int(usage.get("total_tokens"))
+                            if reported_total is not None:
+                                total_tokens = reported_total
                         choices = payload.get("choices")
                         if choices == []:
                             continue
@@ -517,6 +532,7 @@ class OpenRouterModel:
                 calls=calls,
                 reasoning="".join(reasoning_parts) or None,
                 reasoning_details=tuple(reasoning_details),
+                total_tokens=total_tokens,
             )
         )
 

@@ -280,6 +280,11 @@ Adapters may additionally implement `stream(messages, tools)` and yield
 then saves the canonical completed model turn; adapters with only `respond()`
 continue to work unchanged.
 
+Adapters may set `ModelTurn.total_tokens` to the latest completed request's
+provider-reported native-tokenizer total. For OpenRouter models, the TUI compares
+that snapshot with the catalog's `context_length` and shows the percentage of
+context remaining; the indicator stays hidden when either value is unavailable.
+
 The harness rejects model calls outside the five-operation surface. Dynamic
 tools never need to be registered with the inference provider; they are reached
 through the stable `call_tool(name, args, version=None)` envelope.

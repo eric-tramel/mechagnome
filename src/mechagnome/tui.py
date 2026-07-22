@@ -206,6 +206,8 @@ class SessionTab:
     history_draft: str = ""
     running: bool = False
     status: str = "ready"
+    total_tokens: int | None = None
+    context_model: str | None = None
     streamed_text: str = ""
     pending_stream_text: list[str] = field(default_factory=list)
     stream_timer: Timer | None = None
@@ -1231,7 +1233,7 @@ class ToolboxApp(App[None]):
         color: #8fa5ba;
     }
 
-    #status-message, #status-session, .status-separator {
+    #status-message, #status-context, #status-session, .status-separator {
         width: auto;
         height: 1;
     }
@@ -1365,6 +1367,8 @@ class ToolboxApp(App[None]):
                 id="reasoning-selector",
                 classes="status-control",
             )
+            yield Static("·", id="context-separator", classes="status-separator")
+            yield Static(id="status-context")
             yield Static("·", classes="status-separator")
             yield Static(id="status-session")
         yield Input(
@@ -1436,6 +1440,7 @@ class ToolboxApp(App[None]):
         ):
             self.model.reasoning_effort = None
         self._refresh_model_controls()
+        self._refresh_active_status()
 
     @on(Button.Pressed, "#model-selector")
     def choose_model(self) -> None:
@@ -1550,6 +1555,17 @@ class ToolboxApp(App[None]):
             self._render_stream(state)
             self._set_status("streaming…", state)
         elif event.kind == "model":
+            total_tokens = event.payload.get("total_tokens")
+            if (
+                isinstance(total_tokens, bool)
+                or not isinstance(total_tokens, int)
+                or total_tokens <= 0
+            ):
+                state.total_tokens = None
+                state.context_model = None
+            else:
+                state.total_tokens = total_tokens
+                state.context_model = self._active_model_name
             content = str(event.payload.get("text") or "")
             if content:
                 self._finish_stream(state, content)
@@ -2110,6 +2126,30 @@ class ToolboxApp(App[None]):
     def _refresh_active_status(self) -> None:
         state = self.active_session
         self.query_one("#status-message", Static).update(state.status)
+        context = self.query_one("#status-context", Static)
+        context_separator = self.query_one("#context-separator", Static)
+        option = self._current_model_option()
+        show_context = (
+            state.total_tokens is not None
+            and state.context_model == self._active_model_name
+            and option is not None
+            and option.context_length is not None
+        )
+        if show_context:
+            assert state.total_tokens is not None
+            assert option is not None and option.context_length is not None
+            remaining = max(
+                0,
+                min(
+                    100,
+                    (option.context_length - state.total_tokens)
+                    * 100
+                    // option.context_length,
+                ),
+            )
+            context.update(f"context: {remaining}% left")
+        context.display = show_context
+        context_separator.display = show_context
         self.query_one("#status-session", Static).update(
             state.conversation.session_id[:10]
         )
@@ -2139,6 +2179,8 @@ class ToolboxApp(App[None]):
         state.history_draft = ""
         state.running = False
         state.status = "ready"
+        state.total_tokens = None
+        state.context_model = None
 
     def _forwarded_child(
         self, state: SessionTab, event: AgentEvent, name: str, args: Any

@@ -41,6 +41,7 @@ from mechagnome import (
 )
 from mechagnome import __main__ as cli
 from mechagnome import openrouter as openrouter_module
+from mechagnome.harness import AgentEvent
 from mechagnome.isolation import IsolatedToolRunner
 from mechagnome.openrouter import (
     DEFAULT_BASE_URL,
@@ -384,6 +385,7 @@ def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
                         "architecture": {
                             "input_modalities": ["text", "image", "audio"]
                         },
+                        "context_length": 65536,
                         "supported_parameters": ["tools", "reasoning"],
                         "reasoning": {
                             "supported_efforts": ["high", "low", "none"],
@@ -425,6 +427,7 @@ def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
             option.input_modalities,
             option.reasoning_efforts,
             option.reasoning_mandatory,
+            option.context_length,
         )
         for option in options
     ] == [
@@ -434,16 +437,48 @@ def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
             ("text", "image", "audio"),
             ("high", "low", "none"),
             False,
+            65536,
         ),
-        ("example/standard", "Example Standard", (), (), False),
+        ("example/standard", "Example Standard", (), (), False, None),
         (
             "example/mandatory-reasoner",
             "Mandatory Reasoner",
             (),
             ("minimal", "low", "medium", "high", "xhigh", "max"),
             True,
+            None,
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    "context_length",
+    [None, 0, -1, True, 1.5, "65536"],
+)
+def test_openrouter_catalog_ignores_invalid_context_lengths(
+    context_length: Any,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "example/model",
+                            "name": "Example",
+                            "context_length": context_length,
+                            "supported_parameters": ["tools"],
+                        }
+                    ]
+                },
+            )
+        )
+    )
+
+    [option] = OpenRouterModel(api_key="test-key", client=client).available_models()
+
+    assert option.context_length is None
 
 
 def test_openrouter_adapter_sends_configured_reasoning_effort(
@@ -782,6 +817,54 @@ def test_openrouter_adapter_allows_usage_metadata_after_finish(tmp_path: Path) -
     )
 
     assert turn.text == "Ready."
+    assert turn.total_tokens == 12
+
+    conversation = Harness(kernel).start(model)
+    conversation.send("hello")
+    model_event = next(
+        event
+        for event in kernel.read_session(conversation.session_id, limit=100)["events"]
+        if event["kind"] == "model"
+    )
+    assert model_event["payload"]["total_tokens"] == 12
+    assert "total_tokens" not in conversation.messages[-1]
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {},
+        {"total_tokens": 0},
+        {"total_tokens": -1},
+        {"total_tokens": True},
+        {"total_tokens": 1.5},
+        {"total_tokens": "12"},
+        "invalid",
+    ],
+)
+def test_openrouter_adapter_ignores_invalid_usage_metadata(
+    tmp_path: Path, usage: Any
+) -> None:
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: sse_response(
+                    {"choices": [{"delta": {"content": "Ready."}}]},
+                    post_terminal=({"choices": [], "usage": usage},),
+                )
+            )
+        ),
+    )
+
+    turn = model.respond(
+        [{"role": "user", "content": "hello"}],
+        Kernel(tmp_path / "toolbox.db").tool_definitions(),
+    )
+
+    assert turn.text == "Ready."
+    assert turn.total_tokens is None
 
 
 def test_openrouter_adapter_rejects_model_data_after_finish(tmp_path: Path) -> None:
@@ -1853,6 +1936,123 @@ def test_tui_hides_reasoning_when_model_catalog_fails(tmp_path: Path) -> None:
             await pilot.pause()
             assert isinstance(app.screen, ModelSelectionScreen)
             assert app.screen.query_one("#model-name", Input).value == DEFAULT_MODEL
+
+    asyncio.run(exercise())
+
+
+def test_tui_shows_session_local_context_remaining(tmp_path: Path) -> None:
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"), FinalModel(), model_name="test/model"
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(92, 32)) as pilot:
+            context = app.query_one("#status-context", Static)
+            separator = app.query_one("#context-separator", Static)
+            first = app.active_session
+
+            assert context.display is False
+            assert separator.display is False
+
+            app._display_event(
+                first,
+                AgentEvent(
+                    "model",
+                    {"text": "", "calls": [], "total_tokens": 1},
+                    1,
+                ),
+            )
+            assert context.display is False
+
+            app.model_options = [
+                OpenRouterModelOption(
+                    id="test/model", name="Test Model", context_length=100
+                )
+            ]
+            app._refresh_active_status()
+            await pilot.pause()
+            assert str(context.render()) == "context: 99% left"
+            assert context.display is True
+            assert separator.display is True
+            assert context.region.right <= app.size.width
+
+            app._display_event(
+                first,
+                AgentEvent(
+                    "model",
+                    {"text": "", "calls": [], "total_tokens": 100},
+                    2,
+                ),
+            )
+            assert str(context.render()) == "context: 0% left"
+            app._display_event(
+                first,
+                AgentEvent(
+                    "model",
+                    {"text": "", "calls": [], "total_tokens": 120},
+                    3,
+                ),
+            )
+            assert str(context.render()) == "context: 0% left"
+
+            app._display_event(
+                first,
+                AgentEvent(
+                    "model",
+                    {"text": "", "calls": [], "total_tokens": 25},
+                    4,
+                ),
+            )
+            assert str(context.render()) == "context: 75% left"
+
+            await app.action_new_session()
+            await pilot.pause()
+            second = app.active_session
+            assert second is not first
+            assert context.display is False
+            assert separator.display is False
+
+            app._display_event(
+                second,
+                AgentEvent(
+                    "model",
+                    {"text": "", "calls": [], "total_tokens": 60},
+                    1,
+                ),
+            )
+            assert str(context.render()) == "context: 40% left"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is first
+            assert str(context.render()) == "context: 75% left"
+
+            app.model_name = "other/model"
+            app._refresh_active_status()
+            assert context.display is False
+            assert separator.display is False
+            app.model_name = "test/model"
+            app._refresh_active_status()
+            assert str(context.render()) == "context: 75% left"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is second
+            await app.action_clear_session()
+            assert context.display is False
+            assert separator.display is False
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_session is first
+            assert str(context.render()) == "context: 75% left"
+
+            app._display_event(
+                first,
+                AgentEvent("model", {"text": "", "calls": []}, 5),
+            )
+            assert context.display is False
+            assert separator.display is False
 
     asyncio.run(exercise())
 
