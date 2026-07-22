@@ -7,6 +7,23 @@
 > process, and network access. Do not run it directly on a workstation that
 > contains credentials, sensitive files, or access to systems you care about.
 
+## In action
+
+<p align="center">
+  <img src="docs/images/mechagnome-agent-session.png" alt="Mechagnome building a Python import graph tool, running it, and summarizing the repository architecture" width="100%">
+</p>
+<p align="center"><sub><strong>Build and use tools in one conversation.</strong> The agent authors a Python import mapper, runs it immediately, and keeps it in the live toolbox.</sub></p>
+
+<p align="center">
+  <img src="docs/images/mechagnome-tool-inspector.png" alt="Mechagnome tool manager showing the persisted Python import graph tool and its syntax-highlighted source" width="100%">
+</p>
+<p align="center"><sub><strong>Inspect what the agent created.</strong> Every immutable version retains its source, diff, provenance, usage, and calling sessions.</sub></p>
+
+<p align="center">
+  <img src="docs/images/mechagnome-persistent-tools.png" alt="A second Mechagnome session reusing the Python import graph tool created in the first session" width="100%">
+</p>
+<p align="center"><sub><strong>Reuse tools across sessions.</strong> A fresh conversation calls the persisted tool directly—no regeneration or provider-side magic.</sub></p>
+
 A small proof of a metaprogrammable agent toolbox. The model sees only five
 operations:
 
