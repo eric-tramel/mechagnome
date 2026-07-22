@@ -9,6 +9,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
+from rich.cells import split_graphemes
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
@@ -150,6 +151,108 @@ class ToolEvent(Collapsible):
         )
 
 
+class ModelActivity(Static):
+    """One animated line showing the latest model output while it runs."""
+
+    SPINNER_FRAMES = ToolEvent.SPINNER_FRAMES
+    MAX_PREVIEW_CHARS = 512
+
+    def __init__(self) -> None:
+        self._spinner_index = 0
+        self._animation_timer: Timer | None = None
+        self._active = True
+        self._current_line = ""
+        self._latest_line = ""
+        super().__init__(
+            self._render_line(width=80),
+            classes="chat-entry streaming-response",
+        )
+
+    def on_mount(self) -> None:
+        """Start animating unless a fast completion already finalized the row."""
+        if not self._active:
+            return
+        self._animation_timer = self.set_interval(0.08, self._spin)
+        self._refresh_line()
+
+    def on_unmount(self) -> None:
+        """Stop the widget-owned timer when its chat pane is removed."""
+        self.stop_animation()
+
+    def append_text(self, text: str) -> None:
+        """Incrementally retain the newest non-empty logical output line."""
+        if not text:
+            return
+        parts = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        self._current_line = self._bounded(self._current_line + parts[0])
+        if self._current_line.strip():
+            self._latest_line = self._current_line
+        for part in parts[1:]:
+            self._current_line = self._bounded(part)
+            if self._current_line.strip():
+                self._latest_line = self._current_line
+        self._refresh_line()
+
+    def finish(self, renderable: Any) -> None:
+        """Turn this transient row into the normal completed response entry."""
+        self.stop_animation()
+        self.remove_class("streaming-response")
+        self.update(renderable)
+
+    def stop_animation(self) -> None:
+        """Idempotently stop future animation updates."""
+        self._active = False
+        if self._animation_timer is not None:
+            self._animation_timer.stop()
+            self._animation_timer = None
+
+    def _spin(self) -> None:
+        if not self._active:
+            self.stop_animation()
+            return
+        self._spinner_index = (self._spinner_index + 1) % len(self.SPINNER_FRAMES)
+        self._refresh_line()
+
+    def _refresh_line(self) -> None:
+        if self._active:
+            self.update(self._render_line(), layout=False)
+
+    def _render_line(self, *, width: int | None = None) -> Text:
+        frame = self.SPINNER_FRAMES[self._spinner_index]
+        message = self._latest_line or "thinking…"
+        if width is None:
+            width = self.content_size.width or self.size.width or 80
+        message = self._cell_suffix(message, max(1, width - 2))
+        return Text(
+            f"{frame} {message}",
+            style="italic bright_magenta",
+            no_wrap=True,
+            overflow="crop",
+        )
+
+    @classmethod
+    def _bounded(cls, text: str) -> str:
+        if len(text) <= cls.MAX_PREVIEW_CHARS:
+            return text
+        return text[-cls.MAX_PREVIEW_CHARS :]
+
+    @staticmethod
+    def _cell_suffix(text: str, width: int) -> str:
+        spans, cell_width = split_graphemes(text)
+        if cell_width <= width:
+            return text
+        if width == 1:
+            return "…"
+        remaining = width - 1
+        start = len(text)
+        for span_start, _span_end, span_width in reversed(spans):
+            if span_width > remaining:
+                break
+            start = span_start
+            remaining -= span_width
+        return f"…{text[start:]}"
+
+
 class ChatFeed(VerticalScroll):
     """Scrollable chat entries with interactive tool events."""
 
@@ -162,10 +265,12 @@ class ChatFeed(VerticalScroll):
         self.call_after_refresh(self.scroll_end, animate=False)
         return entry
 
-    def update_entry(self, entry: Static, renderable: Any) -> None:
-        """Update a mounted chat entry and keep its latest content visible."""
-        entry.update(renderable)
+    def write_activity(self) -> ModelActivity:
+        """Mount one animated model-activity row at the end of the feed."""
+        entry = ModelActivity()
+        self.mount(entry)
         self.call_after_refresh(self.scroll_end, animate=False)
+        return entry
 
     def write_tool(
         self,
@@ -207,7 +312,7 @@ class SessionTab:
     streamed_text: str = ""
     pending_stream_text: list[str] = field(default_factory=list)
     stream_timer: Timer | None = None
-    stream_entry: Static | None = None
+    stream_entry: ModelActivity | None = None
     forwarded_targets: dict[str, str] = field(default_factory=dict)
     forwarded_events: dict[str, ToolEvent] = field(default_factory=dict)
     forwarded_children: dict[str, str] = field(default_factory=dict)
@@ -1166,6 +1271,14 @@ class ToolboxApp(App[None]):
         margin-bottom: 1;
     }
 
+    .streaming-response {
+        height: 1;
+        min-height: 1;
+        margin-bottom: 0;
+        text-wrap: nowrap;
+        text-overflow: clip;
+    }
+
     .tool-event {
         width: 1fr;
         height: auto;
@@ -1403,6 +1516,7 @@ class ToolboxApp(App[None]):
     def on_unmount(self, event: Unmount) -> None:
         """Release a synchronous rollout before asyncio joins worker threads."""
         for state in self.session_tabs:
+            self._reset_stream_state(state)
             state.conversation.close()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -1563,9 +1677,13 @@ class ToolboxApp(App[None]):
     def _display_event(self, state: SessionTab, event: AgentEvent) -> None:
         if event.kind == "user":
             return
-        if event.kind == "model_delta":
-            state.streamed_text += str(event.payload.get("text") or "")
-            self._render_stream(state)
+        if event.kind == "model_started":
+            self._show_model_activity(state)
+            self._set_status("thinking…", state)
+        elif event.kind == "model_delta":
+            text = str(event.payload.get("text") or "")
+            state.streamed_text += text
+            self._render_stream(state, text)
             self._set_status("streaming…", state)
         elif event.kind == "model":
             content = str(event.payload.get("text") or "")
@@ -1662,17 +1780,20 @@ class ToolboxApp(App[None]):
         state.stream_timer = None
         if not state.pending_stream_text:
             return
-        state.streamed_text += "".join(state.pending_stream_text)
+        text = "".join(state.pending_stream_text)
+        state.streamed_text += text
         state.pending_stream_text.clear()
-        self._render_stream(state)
+        self._render_stream(state, text)
         self._set_status("streaming…", state)
 
-    def _render_stream(self, state: SessionTab) -> None:
-        panel = self._model_panel(state.streamed_text)
+    def _show_model_activity(self, state: SessionTab) -> ModelActivity:
         if state.stream_entry is None:
-            state.stream_entry = state.chat.write(panel, classes="streaming-response")
-        else:
-            state.chat.update_entry(state.stream_entry, panel)
+            state.stream_entry = state.chat.write_activity()
+        return state.stream_entry
+
+    def _render_stream(self, state: SessionTab, text: str) -> None:
+        self._show_model_activity(state).append_text(text)
+        state.chat.call_after_refresh(state.chat.scroll_end, animate=False)
 
     def _finish_stream(
         self, state: SessionTab, content: str, *, stopped: bool = False
@@ -1687,8 +1808,8 @@ class ToolboxApp(App[None]):
         if state.stream_entry is None:
             state.chat.write(panel)
         else:
-            state.chat.update_entry(state.stream_entry, panel)
-            state.stream_entry.remove_class("streaming-response")
+            state.stream_entry.finish(panel)
+            state.chat.call_after_refresh(state.chat.scroll_end, animate=False)
             state.stream_entry = None
 
     def _clear_stream(self, state: SessionTab) -> None:
@@ -1701,6 +1822,8 @@ class ToolboxApp(App[None]):
         if state.stream_timer is not None:
             state.stream_timer.stop()
             state.stream_timer = None
+        if state.stream_entry is not None:
+            state.stream_entry.stop_animation()
         state.pending_stream_text.clear()
         state.streamed_text = ""
 
@@ -2095,6 +2218,7 @@ class ToolboxApp(App[None]):
     def _start_rollout(self, state: SessionTab) -> None:
         state.running = True
         state.status = "thinking…"
+        self._show_model_activity(state)
         prompt = self.query_one("#prompt", Input)
         prompt.disabled = self.active_session.running
         self._refresh_model_controls()
@@ -2102,6 +2226,8 @@ class ToolboxApp(App[None]):
 
     def _finish_rollout(self, state: SessionTab) -> None:
         self._stop_active_tool_events(state)
+        if state.stream_entry is not None:
+            self._clear_stream(state)
         state.running = False
         if state.status not in {"error", "stopped"}:
             state.status = "ready"

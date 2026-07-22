@@ -53,6 +53,7 @@ from mechagnome.openrouter import (
 from mechagnome.tui import (
     ChatFeed,
     DeleteToolScreen,
+    ModelActivity,
     ModelSelectionScreen,
     NamespaceNameScreen,
     ReasoningEffortScreen,
@@ -169,6 +170,37 @@ def test_conversation_keeps_model_context_and_one_durable_session(
         for event in kernel.read_session(conversation.session_id, limit=100)["events"]
     ]
     assert kinds == ["user", "model", "final", "user", "model", "final"]
+
+
+def test_conversation_emits_transient_start_for_each_model_request(
+    tmp_path: Path,
+) -> None:
+    seen: list[Any] = []
+
+    class ToolThenAnswerModel:
+        calls = 0
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            assert seen[-1].kind == "model_started"
+            self.calls += 1
+            if self.calls == 1:
+                return ModelTurn(calls=(ToolCall("help", {}, "help-1"),))
+            return ModelTurn(text="done")
+
+    kernel = Kernel(tmp_path / "toolbox.db")
+    conversation = Harness(kernel).start(ToolThenAnswerModel())
+
+    conversation.send("use a tool", on_event=seen.append)
+
+    starts = [event for event in seen if event.kind == "model_started"]
+    assert len(starts) == 2
+    assert all(event.seq is None and event.payload == {} for event in starts)
+    durable_kinds = [
+        event["kind"]
+        for event in kernel.read_session(conversation.session_id, limit=100)["events"]
+    ]
+    assert "model_started" not in durable_kinds
+    assert durable_kinds.count("model") == 2
 
 
 def test_conversation_rehydrates_an_existing_saved_session(tmp_path: Path) -> None:
@@ -2074,6 +2106,74 @@ class PausingStreamingModel:
         self.release.set()
 
 
+class PausingResponseModel:
+    """Block a nonstreaming response so the waiting indicator is observable."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        self.started.set()
+        self.release.wait(timeout=3)
+        return ModelTurn(text="Finished waiting.")
+
+    def cancel_current(self) -> None:
+        self.release.set()
+
+
+class PausingFailureModel(PausingResponseModel):
+    """Wait long enough to expose the activity row, then fail."""
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        self.started.set()
+        self.release.wait(timeout=3)
+        raise RuntimeError("provider exploded")
+
+
+class PausingTailModel:
+    """Stream a long multiline preview and pause before the final turn."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.content = (
+            "discard this line\n" + "prefix-" * 20 + "[bold]literal[/bold]界END\n"
+        )
+
+    def stream(self, messages: Any, tools: Any) -> Any:
+        yield ModelStreamEvent(text_delta=self.content)
+        self.started.set()
+        self.release.wait(timeout=3)
+        yield ModelStreamEvent(turn=ModelTurn(text=self.content))
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        raise AssertionError("streaming interface should be preferred")
+
+    def cancel_current(self) -> None:
+        self.release.set()
+
+
+class PausingPostToolModel:
+    """Pause the second provider request after one quick core tool call."""
+
+    def __init__(self) -> None:
+        self.request_count = 0
+        self.second_started = threading.Event()
+        self.release = threading.Event()
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        self.request_count += 1
+        if self.request_count == 1:
+            return ModelTurn(calls=(ToolCall("help", {}, "help-1"),))
+        self.second_started.set()
+        self.release.wait(timeout=3)
+        return ModelTurn(text="Finished after the tool.")
+
+    def cancel_current(self) -> None:
+        self.release.set()
+
+
 class ConcurrentPausingModel:
     """Pause independent root sessions so overlap and cancellation are observable."""
 
@@ -2124,6 +2224,152 @@ class BoundConcurrentPausingModel:
         pass
 
 
+def test_tui_animates_while_waiting_for_nonstreaming_response(tmp_path: Path) -> None:
+    model = PausingResponseModel()
+    app = ToolboxApp(Kernel(tmp_path / "toolbox.db"), model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "wait for it"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set():
+                    break
+            activity = app.query_one(".streaming-response", ModelActivity)
+            assert "thinking…" in activity.content.plain
+            assert activity.size.height == 1
+            assert activity._animation_timer is not None
+            first_frame = activity.content.plain[0]
+            for _ in range(10):
+                await asyncio.sleep(0.03)
+                await pilot.pause()
+                if activity.content.plain[0] != first_frame:
+                    break
+            assert activity.content.plain[0] != first_frame
+            model.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert activity._animation_timer is None
+            assert not app.query(".streaming-response")
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+
+def test_tui_stops_waiting_animation_after_provider_failure(tmp_path: Path) -> None:
+    model = PausingFailureModel()
+    app = ToolboxApp(Kernel(tmp_path / "toolbox.db"), model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "fail after waiting"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set():
+                    break
+            activity = app.query_one(".streaming-response", ModelActivity)
+            assert activity._animation_timer is not None
+            model.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert activity._animation_timer is None
+            assert not app.query(".streaming-response")
+            assert app.active_session.status == "error"
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+
+def test_tui_stream_preview_is_a_literal_one_line_tail(tmp_path: Path) -> None:
+    model = PausingTailModel()
+    app = ToolboxApp(Kernel(tmp_path / "toolbox.db"), model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(80, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "show the tail"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if model.started.is_set() and app.streamed_text:
+                    break
+            activity = app.query_one(".streaming-response", ModelActivity)
+            preview = activity.content.plain
+            assert activity.size.height == 1
+            assert "END" in preview
+            assert "discard this line" not in preview
+            assert "[/bold]" in preview
+            assert activity._latest_line.endswith("[/bold]界END")
+            first_frame = preview[0]
+            for _ in range(10):
+                await asyncio.sleep(0.03)
+                await pilot.pause()
+                if activity.content.plain[0] != first_frame:
+                    break
+            assert activity.content.plain[0] != first_frame
+            model.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert activity._animation_timer is None
+            assert not app.query(".streaming-response")
+            assert "discard this line" in chat_text(app)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+
+def test_tui_restores_waiting_indicator_after_tool_call(tmp_path: Path) -> None:
+    model = PausingPostToolModel()
+    kernel = Kernel(tmp_path / "toolbox.db")
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "use help first"
+            await pilot.press("enter")
+            for _ in range(60):
+                await pilot.pause()
+                if model.second_started.is_set():
+                    break
+            assert model.second_started.is_set()
+            activities = list(app.query(".streaming-response"))
+            assert len(activities) == 1
+            activity = activities[0]
+            assert isinstance(activity, ModelActivity)
+            assert "thinking…" in activity.content.plain
+            assert activity._animation_timer is not None
+            model.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert activity._animation_timer is None
+            assert not app.query(".streaming-response")
+            assert "Finished after the tool." in chat_text(app)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+    kinds = [
+        event["kind"]
+        for event in kernel.read_session(app.conversation.session_id, limit=100)[
+            "events"
+        ]
+    ]
+    assert "model_started" not in kinds
+
+
 def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     model = PausingStreamingModel()
@@ -2139,13 +2385,14 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
                 if model.started.is_set() and app.streamed_text:
                     break
             assert app.streamed_text == "Partial"
-            stream = app.query_one(".streaming-response", Static)
+            stream = app.query_one(".streaming-response", ModelActivity)
             assert stream.parent is app.chat
             assert "Partial" in chat_text(app)
             model.release.set()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.streamed_text == ""
+            assert stream._animation_timer is None
             assert not app.query(".streaming-response")
             chat = chat_text(app)
             assert "Partial response" in chat
@@ -2162,6 +2409,43 @@ def test_tui_renders_model_text_before_stream_completion(tmp_path: Path) -> None
         ]
     ]
     assert kinds == ["user", "model", "final"]
+
+
+def test_tui_cancellation_salvages_an_unflushed_stream_delta(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingStreamingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)):
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "cancel before flush"
+            await app.submit_prompt(Input.Submitted(prompt, prompt.value))
+            for _ in range(30):
+                if model.started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert model.started.is_set()
+            state = app.active_session
+            assert state.pending_stream_text == ["Partial"]
+            activity = app.query_one(".streaming-response", ModelActivity)
+            app.action_stop_rollout()
+            await app.workers.wait_for_complete()
+            await asyncio.sleep(0)
+            assert activity._animation_timer is None
+            assert state.stream_timer is None
+            assert not app.query(".streaming-response")
+            chat = chat_text(app)
+            assert "Partial" in chat
+            assert "stopped" in chat
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        model.release.set()
+
+    events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "cancelled"]
 
 
 def test_tabs_can_run_concurrently_without_misrouting_output(
@@ -2197,6 +2481,13 @@ def test_tabs_can_run_concurrently_without_misrouting_output(
             assert first.running is True
             assert second.running is True
             assert app.busy is True
+            first_activity = first.stream_entry
+            second_activity = second.stream_entry
+            assert first_activity is not None
+            assert second_activity is not None
+            assert first_activity is not second_activity
+            assert "Partial first tab" in first_activity.content.plain
+            assert "Partial second tab" in second_activity.content.plain
             assert "Partial first tab" in chat_text(app, first.chat)
             assert "Partial second tab" in chat_text(app, second.chat)
 
@@ -2207,6 +2498,7 @@ def test_tabs_can_run_concurrently_without_misrouting_output(
                     break
             assert first.running is True
             assert second.running is False
+            assert second_activity._animation_timer is None
             assert prompt.disabled is False
             assert "Finished second tab" in chat_text(app, second.chat)
             assert "Finished second tab" not in chat_text(app, first.chat)
@@ -2215,6 +2507,7 @@ def test_tabs_can_run_concurrently_without_misrouting_output(
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert first.running is False
+            assert first_activity._animation_timer is None
             assert app.busy is False
             assert prompt.disabled is False
             assert "Finished first tab" in chat_text(app, first.chat)
@@ -2412,8 +2705,10 @@ def test_unmount_stops_active_rollout_before_programmatic_exit(
     kernel = Kernel(tmp_path / "toolbox.db")
     model = PausingStreamingModel()
     app = ToolboxApp(kernel, model, model_name="test/model")
+    activity: ModelActivity | None = None
 
     async def exercise() -> None:
+        nonlocal activity
         async with app.run_test(size=(120, 40)) as pilot:
             prompt = app.query_one("#prompt", Input)
             prompt.value = "exit during this stream"
@@ -2423,11 +2718,14 @@ def test_unmount_stops_active_rollout_before_programmatic_exit(
                 if model.started.is_set():
                     break
             assert model.started.is_set()
+            activity = app.query_one(".streaming-response", ModelActivity)
             app.exit()
 
     try:
         asyncio.run(exercise())
         assert model.cancelled.is_set()
+        assert activity is not None
+        assert activity._animation_timer is None
     finally:
         model.release.set()
 
