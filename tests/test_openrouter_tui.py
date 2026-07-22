@@ -382,6 +382,9 @@ def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
                     {
                         "id": "example/reasoner",
                         "name": "Example Reasoner",
+                        "architecture": {
+                            "input_modalities": ["text", "image", "audio"]
+                        },
                         "supported_parameters": ["tools", "reasoning"],
                         "reasoning": {
                             "supported_efforts": ["high", "low", "none"],
@@ -420,6 +423,7 @@ def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
         (
             option.id,
             option.name,
+            option.input_modalities,
             option.reasoning_efforts,
             option.reasoning_mandatory,
         )
@@ -428,13 +432,15 @@ def test_openrouter_adapter_lists_tool_models_and_reasoning_support() -> None:
         (
             "example/reasoner",
             "Example Reasoner",
+            ("text", "image", "audio"),
             ("high", "low", "none"),
             False,
         ),
-        ("example/standard", "Example Standard", (), False),
+        ("example/standard", "Example Standard", (), (), False),
         (
             "example/mandatory-reasoner",
             "Mandatory Reasoner",
+            (),
             ("minimal", "low", "medium", "high", "xhigh", "max"),
             True,
         ),
@@ -1773,9 +1779,17 @@ def test_tui_clicks_to_change_model_and_reasoning_effort(tmp_path: Path) -> None
 
 def test_model_selector_sorts_and_filters_catalog_options(tmp_path: Path) -> None:
     options = [
-        OpenRouterModelOption(id="zeta/first", name="Zeta"),
-        OpenRouterModelOption(id="alpha/second", name="Alpha Two"),
-        OpenRouterModelOption(id="alpha/first", name="Alpha One"),
+        OpenRouterModelOption(
+            id="zeta/first", name="Zeta", input_modalities=("text", "audio")
+        ),
+        OpenRouterModelOption(
+            id="alpha/second", name="Alpha Two", input_modalities=("image",)
+        ),
+        OpenRouterModelOption(
+            id="alpha/first",
+            name="Alpha One",
+            input_modalities=("AUDIO", "IMAGE", "text"),
+        ),
     ]
     app = ToolboxApp(
         kernel=Kernel(tmp_path / "toolbox.db"),
@@ -1795,9 +1809,9 @@ def test_model_selector_sorts_and_filters_catalog_options(tmp_path: Path) -> Non
                 for option in option_list.options
                 if "  ·  " in str(option.prompt)
             ] == [
-                "Alpha One  ·  alpha/first",
-                "Alpha Two  ·  alpha/second",
-                "Zeta  ·  zeta/first",
+                "🖼️ 🎧  Alpha One  ·  alpha/first",
+                "🖼️  Alpha Two  ·  alpha/second",
+                "🎧  Zeta  ·  zeta/first",
             ]
 
             app.screen.query_one("#model-name", Input).value = "TWO"
@@ -1806,7 +1820,7 @@ def test_model_selector_sorts_and_filters_catalog_options(tmp_path: Path) -> Non
                 str(option.prompt)
                 for option in option_list.options
                 if "  ·  " in str(option.prompt)
-            ] == ["Alpha Two  ·  alpha/second"]
+            ] == ["🖼️  Alpha Two  ·  alpha/second"]
 
             app.screen.query_one("#model-name", Input).value = "alpha/"
             await pilot.pause()
@@ -1815,8 +1829,8 @@ def test_model_selector_sorts_and_filters_catalog_options(tmp_path: Path) -> Non
                 for option in option_list.options
                 if "  ·  " in str(option.prompt)
             ] == [
-                "Alpha One  ·  alpha/first",
-                "Alpha Two  ·  alpha/second",
+                "🖼️ 🎧  Alpha One  ·  alpha/first",
+                "🖼️  Alpha Two  ·  alpha/second",
             ]
 
     asyncio.run(exercise())

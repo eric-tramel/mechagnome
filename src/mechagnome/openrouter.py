@@ -72,6 +72,7 @@ class OpenRouterModelOption:
 
     id: str
     name: str
+    input_modalities: tuple[str, ...] = ()
     reasoning_efforts: tuple[str, ...] = ()
     reasoning_mandatory: bool = False
 
@@ -191,6 +192,16 @@ class OpenRouterModel:
             supported = parameters if isinstance(parameters, list) else []
             if "tools" not in supported:
                 continue
+            architecture = item.get("architecture")
+            input_modalities: tuple[str, ...] = ()
+            if isinstance(architecture, Mapping):
+                raw_modalities = architecture.get("input_modalities")
+                if isinstance(raw_modalities, list):
+                    input_modalities = tuple(
+                        modality
+                        for modality in raw_modalities
+                        if isinstance(modality, str)
+                    )
             reasoning = item.get("reasoning")
             efforts: tuple[str, ...] = ()
             mandatory = False
@@ -214,6 +225,7 @@ class OpenRouterModel:
                         if isinstance(item.get("name"), str)
                         else item["id"]
                     ),
+                    input_modalities=input_modalities,
                     reasoning_efforts=efforts,
                     reasoning_mandatory=mandatory,
                 )

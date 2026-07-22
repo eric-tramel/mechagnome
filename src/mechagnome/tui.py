@@ -44,6 +44,8 @@ from mechagnome.openrouter import (
     OpenRouterModelOption,
 )
 
+MODEL_INPUT_EMOJIS = (("image", "🖼️"), ("audio", "🎧"))
+
 
 def _format_duration(value: Any) -> str:
     if (
@@ -492,13 +494,23 @@ class ModelSelectionScreen(ModalScreen[str | None]):
 
     def _picker_options(self, query: str = "") -> list[tuple[str, str]]:
         normalized_query = query.casefold()
-        return [
-            (f"{option.name}  ·  {option.id}", option.id)
-            for option in self.options
-            if not normalized_query
-            or normalized_query in option.name.casefold()
-            or normalized_query in option.id.casefold()
-        ]
+        picker_options: list[tuple[str, str]] = []
+        for option in self.options:
+            if (
+                normalized_query
+                and normalized_query not in option.name.casefold()
+                and normalized_query not in option.id.casefold()
+            ):
+                continue
+            modalities = {modality.casefold() for modality in option.input_modalities}
+            badges = " ".join(
+                emoji
+                for modality, emoji in MODEL_INPUT_EMOJIS
+                if modality in modalities
+            )
+            prefix = f"{badges}  " if badges else ""
+            picker_options.append((f"{prefix}{option.name}  ·  {option.id}", option.id))
+        return picker_options
 
 
 class ReasoningEffortScreen(ModalScreen[str | None]):
