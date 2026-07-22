@@ -28,43 +28,12 @@ HELP_SCHEMA = {
 SEARCH_SCHEMA = {
     "type": "object",
     "properties": {
-        "query": {
-            "type": "string",
-            "description": "Search query; omit when only recording feedback.",
-        },
+        "query": {"type": "string"},
         "include_core": {"type": "boolean"},
         "cursor": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-        "feedback": {
-            "type": "object",
-            "description": (
-                "Create or replace this session's feedback for a tool version."
-            ),
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Tool receiving feedback.",
-                },
-                "version": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Exact version; defaults to the active version.",
-                },
-                "rating": {
-                    "type": "integer",
-                    "enum": [-1, 0, 1],
-                    "description": "-1 downvote, 0 comment-only, or 1 upvote.",
-                },
-                "comment": {
-                    "type": "string",
-                    "maxLength": 4000,
-                    "description": "Optional qualitative feedback.",
-                },
-            },
-            "required": ["name"],
-            "additionalProperties": False,
-        },
     },
+    "required": ["query"],
     "additionalProperties": False,
 }
 
@@ -195,34 +164,7 @@ SEARCH_SOURCE = dedent(
                 )
         return scores
 
-    def _feedback_multiplier(tool):
-        feedback = tool.get("feedback") or {}
-        upvotes = int(feedback.get("upvotes", 0))
-        downvotes = int(feedback.get("downvotes", 0))
-        ratings = upvotes + downvotes
-        if not ratings:
-            return 1.0
-        # Bayesian smoothing keeps one vote useful without letting sparse
-        # feedback completely overwhelm lexical relevance.
-        quality = (upvotes - downvotes) / (ratings + 2)
-        return max(0.5, min(1.5, 1.0 + 0.5 * quality))
-
-
     def main(input, ctx):
-        feedback_result = None
-        feedback = input.get("feedback")
-        if feedback is not None:
-            feedback_result = ctx.kernel.submit_tool_feedback(
-                feedback["name"],
-                rating=feedback.get("rating", 0),
-                comment=feedback.get("comment"),
-                version=feedback.get("version"),
-            )
-        if "query" not in input:
-            if feedback_result is None:
-                return {"error": "query or feedback is required"}
-            return {"feedback": feedback_result}
-
         query = input["query"].strip()
         include_core = input.get("include_core", True)
         cursor = max(0, input.get("cursor", 0))
@@ -233,7 +175,7 @@ SEARCH_SOURCE = dedent(
         if not query_tokens:
             items = sorted(tools, key=lambda tool: tool["name"])
             next_cursor = cursor + limit if cursor + limit < len(items) else None
-            result = {
+            return {
                 "items": [
                     {"name": tool["name"], "description": tool["description"]}
                     for tool in items[cursor:cursor + limit]
@@ -241,18 +183,12 @@ SEARCH_SOURCE = dedent(
                 "next_cursor": next_cursor,
                 "total": len(items),
             }
-            if feedback_result is not None:
-                result["feedback"] = feedback_result
-            return result
 
         scores = [0.0] * len(tools)
         for field, weight in FIELD_WEIGHTS:
             field_scores = _field_scores(tools, query_tokens, field)
             for index, score in enumerate(field_scores):
                 scores[index] += weight * float(score)
-        for index, tool in enumerate(tools):
-            scores[index] *= _feedback_multiplier(tool)
-
         lowered_query = query.lower()
         ranked = []
         for score, tool in zip(scores, tools):
@@ -262,7 +198,7 @@ SEARCH_SOURCE = dedent(
         ranked.sort(key=lambda item: item[:3])
         items = [tool for *_, tool in ranked]
         next_cursor = cursor + limit if cursor + limit < len(items) else None
-        result = {
+        return {
             "items": [
                 {"name": tool["name"], "description": tool["description"]}
                 for tool in items[cursor:cursor + limit]
@@ -270,9 +206,6 @@ SEARCH_SOURCE = dedent(
             "next_cursor": next_cursor,
             "total": len(items),
         }
-        if feedback_result is not None:
-            result["feedback"] = feedback_result
-        return result
     '''
 )
 
@@ -323,13 +256,13 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "search_tools",
-        "Search active tools, returning names and descriptions, and record feedback.",
+        "Search active tools, returning names and descriptions.",
         SEARCH_SCHEMA,
         SEARCH_SOURCE,
     ),
     BootstrapTool(
         "view_tool",
-        "View source, metadata, schema, and feedback for a tool version.",
+        "View source, metadata, and schema for a tool version.",
         VIEW_SCHEMA,
         VIEW_SOURCE,
     ),

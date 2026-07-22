@@ -177,7 +177,6 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "ctx.model_provider.complete([",
         "ctx.model_provider.run_agent(",
         "ctx.kernel.catalog(include_core=True)",
-        "ctx.kernel.submit_tool_feedback(...)",
         "ctx.kernel.view_tool(name, version=None)",
         "ctx.kernel.write_tool(...)",
         "ctx.kernel.execute(name, args, version=None)",
@@ -374,119 +373,25 @@ def test_search_exact_name_priority_filtering_and_pagination(tmp_path: Path) -> 
     assert empty["next_cursor"] == 1
 
 
-def test_feedback_is_persistent_session_scoped_and_changes_search_ranking(
-    tmp_path: Path,
-) -> None:
+def test_active_feedback_surface_is_absent(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
-    common_source = "def main(input, ctx):\n    return 'feedbackmarker'\n"
-    write(kernel, "alpha_candidate", common_source, description="Same candidate.")
-    write(kernel, "beta_candidate", common_source, description="Same candidate.")
+    write(kernel, "observed", "def main(input, ctx):\n    return True\n")
+    call_tool(kernel, "observed", {})
 
-    before = kernel.call(
-        "search_tools", {"query": "feedbackmarker", "include_core": False}
+    search_schema = CORE_SCHEMAS["search_tools"]
+    assert search_schema["required"] == ["query"]
+    assert "feedback" not in search_schema["properties"]
+    assert not hasattr(kernel_module._KernelCapability, "submit_tool_feedback")
+    assert "feedback" not in next(
+        item for item in kernel.catalog() if item["name"] == "observed"
     )
-    assert [item["name"] for item in before["items"]] == [
-        "alpha_candidate",
-        "beta_candidate",
-    ]
-    assert set(before["items"][0]) == {"name", "description"}
-
-    first = kernel.call(
-        "search_tools",
-        {
-            "feedback": {
-                "name": "alpha_candidate",
-                "rating": -1,
-                "comment": "Returned malformed data.",
-            }
-        },
-        session_id="agent-one",
-    )["feedback"]
-    assert first == {
-        "name": "alpha_candidate",
-        "version": 1,
-        "rating": -1,
-        "comment": "Returned malformed data.",
-        "replaced": False,
-        "aggregate": {
-            "score": -1,
-            "upvotes": 0,
-            "downvotes": 1,
-            "comments": 1,
-        },
-    }
-
-    updated = kernel.call(
-        "search_tools",
-        {"feedback": {"name": "alpha_candidate", "rating": 1}},
-        session_id="agent-one",
-    )["feedback"]
-    assert updated["replaced"] is True
-    assert updated["aggregate"] == {
-        "score": 1,
-        "upvotes": 1,
-        "downvotes": 0,
-        "comments": 0,
-    }
-
-    kernel.call(
-        "search_tools",
-        {"feedback": {"name": "alpha_candidate", "rating": -1}},
-        session_id="agent-two",
-    )
-    kernel.call(
-        "search_tools",
-        {"feedback": {"name": "alpha_candidate", "rating": -1}},
-        session_id="agent-three",
-    )
-    after = kernel.call(
-        "search_tools", {"query": "feedbackmarker", "include_core": False}
-    )
-    assert [item["name"] for item in after["items"]] == [
-        "beta_candidate",
-        "alpha_candidate",
-    ]
-    assert set(after["items"][1]) == {"name", "description"}
+    assert "feedback" not in kernel.view_tool("observed")
+    assert "feedback" not in kernel.tool_history("observed")["versions"][0]
 
 
-def test_feedback_is_version_specific_and_validated(tmp_path: Path) -> None:
-    kernel = kernel_at(tmp_path)
-    source = "def main(input, ctx):\n    return None\n"
-    write(kernel, "rated", source)
-    kernel.call(
-        "search_tools",
-        {"feedback": {"name": "rated", "rating": -1}},
-        session_id="critic",
-    )
-    write(kernel, "rated", source, base_version=1)
-
-    active = next(item for item in kernel.catalog() if item["name"] == "rated")
-    assert active["version"] == 2
-    assert active["feedback"]["downvotes"] == 0
-    old = kernel.submit_tool_feedback(
-        "rated", rating=0, comment="Version one note.", version=1
-    )
-    assert old["version"] == 1
-    assert old["aggregate"]["downvotes"] == 1
-    assert old["aggregate"]["comments"] == 1
-    viewed_old = kernel.view_tool("rated", version=1)
-    assert viewed_old["feedback"]["recent_comments"][0]["comment"] == (
-        "Version one note."
-    )
-    assert viewed_old["feedback"]["recent_comments"][0]["rating"] == 0
-
-    with pytest.raises(ToolboxError) as error:
-        kernel.submit_tool_feedback("rated", rating=2)
-    assert error.value.code == "invalid_feedback"
-    with pytest.raises(ToolboxError) as error:
-        kernel.submit_tool_feedback("rated", rating=0, comment="   ")
-    assert error.value.code == "invalid_feedback"
-
-
-def test_schema_two_database_migrates_feedback_storage(tmp_path: Path) -> None:
+def test_schema_two_database_migrates_without_feedback_storage(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     with closing(kernel._connect()) as connection, connection:
-        connection.execute("DROP TABLE tool_feedback")
         connection.execute("PRAGMA user_version = 2")
 
     reopened = kernel_at(tmp_path)
@@ -495,8 +400,36 @@ def test_schema_two_database_migrates_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 5
-    assert table is not None
+    assert version == 6
+    assert table is None
+
+
+def test_schema_five_database_removes_feedback_storage(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute(
+            """
+            CREATE TABLE tool_feedback (
+                id INTEGER PRIMARY KEY,
+                tool_version_id INTEGER NOT NULL REFERENCES tool_versions(id),
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                rating INTEGER NOT NULL,
+                comment TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("PRAGMA user_version = 5")
+
+    reopened = kernel_at(tmp_path)
+    with closing(reopened._connect()) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
+        ).fetchone()
+    assert version == 6
+    assert table is None
 
 
 def test_schema_three_database_migrates_real_pre_lineage_sessions(
@@ -1623,7 +1556,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 6
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -1806,7 +1739,7 @@ def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
     Harness(kernel_at(tmp_path)).run(model, "Rewrite search.")
 
     assert model.search_descriptions == [
-        "Search active tools, returning names and descriptions, and record feedback.",
+        "Search active tools, returning names and descriptions.",
         "Live rewritten search.",
     ]
 

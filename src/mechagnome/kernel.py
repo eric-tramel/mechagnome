@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
@@ -198,24 +198,6 @@ class _KernelCapability:
             include_core=include_core, scope=self._context._state.scope
         )
 
-    def submit_tool_feedback(
-        self,
-        name: str,
-        *,
-        rating: int = 0,
-        comment: str | None = None,
-        version: int | None = None,
-    ) -> dict[str, Any]:
-        """Record session-scoped feedback through the search capability."""
-        self._require("search_tools")
-        return self._context._kernel.submit_tool_feedback(
-            name,
-            rating=rating,
-            comment=comment,
-            version=version,
-            scope=self._context._state.scope,
-        )
-
     def view_tool(self, name: str, version: int | None = None) -> dict[str, Any]:
         """View a tool through the inspection capability."""
         self._require("view_tool")
@@ -331,14 +313,17 @@ class Kernel:
                         connection.execute("PRAGMA user_version").fetchone()[0]
                     )
                     if version == 2:
-                        self._migrate_v2(connection)
                         version = 3
                     if version == 3:
                         self._migrate_v3(connection)
                         version = 4
                     if version == 4:
                         self._migrate_v4(connection)
-                    elif version != _SCHEMA_VERSION:
+                        version = 5
+                    if version == 5:
+                        self._migrate_v5(connection)
+                        version = 6
+                    if version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
                             f"unsupported toolbox schema version: {version}",
@@ -349,31 +334,6 @@ class Kernel:
             except Exception:
                 connection.rollback()
                 raise
-
-    @staticmethod
-    def _create_feedback_schema(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            CREATE TABLE tool_feedback (
-                id INTEGER PRIMARY KEY,
-                tool_version_id INTEGER NOT NULL REFERENCES tool_versions(id),
-                session_id TEXT NOT NULL REFERENCES sessions(id),
-                rating INTEGER NOT NULL CHECK(rating IN (-1, 0, 1)),
-                comment TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(tool_version_id, session_id)
-            )
-            """
-        )
-        connection.execute(
-            "CREATE INDEX tool_feedback_version_updated "
-            "ON tool_feedback(tool_version_id, updated_at DESC)"
-        )
-
-    @classmethod
-    def _migrate_v2(cls, connection: sqlite3.Connection) -> None:
-        cls._create_feedback_schema(connection)
 
     @staticmethod
     def _migrate_v3(connection: sqlite3.Connection) -> None:
@@ -439,6 +399,11 @@ class Kernel:
                 "UPDATE bindings SET name = ? WHERE toolbox_id = ? AND name = ?",
                 ("view_tool", toolbox_id, "read_tool_source"),
             )
+
+    @staticmethod
+    def _migrate_v5(connection: sqlite3.Connection) -> None:
+        """Remove agent-authored ratings and comments from existing databases."""
+        connection.execute("DROP TABLE IF EXISTS tool_feedback")
 
     @staticmethod
     def _create_session_indexes_and_triggers(
@@ -555,7 +520,6 @@ class Kernel:
         for statement in statements:
             connection.execute(statement)
         Kernel._create_session_indexes_and_triggers(connection)
-        Kernel._create_feedback_schema(connection)
 
     def _migrate_legacy(self, connection: sqlite3.Connection) -> None:
         for table in ("tool_versions", "bindings", "sessions", "events"):
@@ -1479,12 +1443,6 @@ class Kernel:
                     "kind": "core" if name in CORE_NAMES else "user",
                     "created_at": row["created_at"],
                     "toolbox": row["toolbox_name"],
-                    "feedback": {
-                        "score": int(row["feedback_score"]),
-                        "upvotes": int(row["feedback_upvotes"]),
-                        "downvotes": int(row["feedback_downvotes"]),
-                        "comments": int(row["feedback_comments"]),
-                    },
                 }
             )
         return tools
@@ -1500,24 +1458,10 @@ class Kernel:
                 """
                 SELECT b.name, v.id AS tool_version_id, v.lineage_id, v.version,
                        v.description, v.schema_json, v.source, v.created_at,
-                       b.toolbox_id, t.name AS toolbox_name,
-                       COALESCE(f.score, 0) AS feedback_score,
-                       COALESCE(f.upvotes, 0) AS feedback_upvotes,
-                       COALESCE(f.downvotes, 0) AS feedback_downvotes,
-                       COALESCE(f.comments, 0) AS feedback_comments
+                       b.toolbox_id, t.name AS toolbox_name
                 FROM bindings AS b
                 JOIN tool_versions AS v ON v.id = b.tool_version_id
                 JOIN toolboxes AS t ON t.id = b.toolbox_id
-                LEFT JOIN (
-                    SELECT tool_version_id,
-                           SUM(rating) AS score,
-                           SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END) AS upvotes,
-                           SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END) AS downvotes,
-                           SUM(CASE WHEN comment IS NOT NULL THEN 1 ELSE 0 END)
-                               AS comments
-                    FROM tool_feedback
-                    GROUP BY tool_version_id
-                ) AS f ON f.tool_version_id = v.id
                 WHERE b.toolbox_id = ?
                 ORDER BY b.name
                 """,
@@ -1556,20 +1500,6 @@ class Kernel:
                 toolbox_id=tool.toolbox_id,
                 connection=connection,
             )
-            comment_rows = connection.execute(
-                """
-                SELECT rating, comment, updated_at
-                FROM tool_feedback
-                WHERE tool_version_id = ? AND comment IS NOT NULL
-                ORDER BY updated_at DESC, id DESC
-                LIMIT 10
-                """,
-                (tool.id,),
-            ).fetchall()
-            feedback = {
-                **self._feedback_summary(connection, tool.id),
-                "recent_comments": [dict(row) for row in comment_rows],
-            }
         return {
             "name": tool.name,
             "version": tool.version,
@@ -1579,114 +1509,6 @@ class Kernel:
             "source": tool.source,
             "kind": "core" if name in CORE_NAMES else "user",
             "toolbox": tool.toolbox_name,
-            "feedback": feedback,
-        }
-
-    @staticmethod
-    def _feedback_summary(
-        connection: sqlite3.Connection, tool_version_id: int
-    ) -> dict[str, int]:
-        row = connection.execute(
-            """
-            SELECT COALESCE(SUM(rating), 0) AS score,
-                   SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END) AS upvotes,
-                   SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END) AS downvotes,
-                   SUM(CASE WHEN comment IS NOT NULL THEN 1 ELSE 0 END) AS comments
-            FROM tool_feedback
-            WHERE tool_version_id = ?
-            """,
-            (tool_version_id,),
-        ).fetchone()
-        assert row is not None
-        return {
-            "score": int(row["score"]),
-            "upvotes": int(row["upvotes"] or 0),
-            "downvotes": int(row["downvotes"] or 0),
-            "comments": int(row["comments"] or 0),
-        }
-
-    def submit_tool_feedback(
-        self,
-        name: str,
-        *,
-        rating: int = 0,
-        comment: str | None = None,
-        version: int | None = None,
-        session_id: str | None = None,
-        scope: InvocationScope | None = None,
-    ) -> dict[str, Any]:
-        """Create or replace one session's feedback for a tool version."""
-        if (
-            isinstance(rating, bool)
-            or not isinstance(rating, int)
-            or rating not in (-1, 0, 1)
-        ):
-            raise ToolboxError(
-                "invalid_feedback", "feedback rating must be -1, 0, or 1"
-            )
-        if comment is not None:
-            if not isinstance(comment, str):
-                raise ToolboxError(
-                    "invalid_feedback", "feedback comment must be a string"
-                )
-            comment = comment.strip() or None
-            if comment is not None and len(comment) > 4000:
-                raise ToolboxError(
-                    "invalid_feedback",
-                    "feedback comment must not exceed 4000 characters",
-                )
-        if rating == 0 and comment is None:
-            raise ToolboxError(
-                "invalid_feedback", "a rating or nonempty comment is required"
-            )
-
-        if scope is None and session_id is None:
-            identifier = self.create_session()
-            active_scope = self.snapshot_scope(identifier)
-        else:
-            active_scope = self._scope(session_id=session_id, scope=scope)
-        with closing(self._connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                tool = self._resolve(
-                    name,
-                    version=version,
-                    scope=active_scope,
-                    connection=connection,
-                )
-                existing = connection.execute(
-                    """
-                    SELECT 1 FROM tool_feedback
-                    WHERE tool_version_id = ? AND session_id = ?
-                    """,
-                    (tool.id, active_scope.session_id),
-                ).fetchone()
-                now = _now()
-                connection.execute(
-                    """
-                    INSERT INTO tool_feedback (
-                        tool_version_id, session_id, rating, comment,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(tool_version_id, session_id) DO UPDATE SET
-                        rating = excluded.rating,
-                        comment = excluded.comment,
-                        updated_at = excluded.updated_at
-                    """,
-                    (tool.id, active_scope.session_id, rating, comment, now, now),
-                )
-                summary = self._feedback_summary(connection, tool.id)
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-        return {
-            "name": tool.name,
-            "version": tool.version,
-            "rating": rating,
-            "comment": comment,
-            "replaced": existing is not None,
-            "aggregate": summary,
         }
 
     def write_tool(
@@ -2184,24 +2006,6 @@ class Kernel:
                 if ids
                 else []
             )
-            feedback_data = {}
-            for vid in ids:
-                feedback_data[vid] = {
-                    **self._feedback_summary(connection, vid),
-                    "recent_comments": [
-                        dict(cr)
-                        for cr in connection.execute(
-                            """
-                            SELECT rating, comment, updated_at
-                            FROM tool_feedback
-                            WHERE tool_version_id = ? AND comment IS NOT NULL
-                            ORDER BY updated_at DESC, id DESC
-                            LIMIT 10
-                            """,
-                            (vid,),
-                        ).fetchall()
-                    ],
-                }
         active_version = int(active_row["version"]) if active_row is not None else None
         grouped: dict[int, list[sqlite3.Row]] = {}
         for event in event_rows:
@@ -2255,16 +2059,6 @@ class Kernel:
                     "timed_call_count": len(durations),
                     "average_duration_ms": (
                         sum(durations) / len(durations) if durations else None
-                    ),
-                    "feedback": feedback_data.get(
-                        int(row["id"]),
-                        {
-                            "score": 0,
-                            "upvotes": 0,
-                            "downvotes": 0,
-                            "comments": 0,
-                            "recent_comments": [],
-                        },
                     ),
                 }
             )
