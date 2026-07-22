@@ -14,8 +14,12 @@ from typing import Any
 
 import httpx
 
-from mechagnome.kernel import ToolboxError
-from mechagnome.model_provider import ModelStreamEvent, ModelTurn, ToolCall
+from mechagnome.model_provider import (
+    ModelStreamEvent,
+    ModelTransportError,
+    ModelTurn,
+    ToolCall,
+)
 
 DEFAULT_MODEL = "z-ai/glm-5.2"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -24,6 +28,20 @@ MAX_STREAM_BYTES = 4_000_000
 MAX_COMPLETION_TOKENS = 2048
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _DEFAULT_SESSION = object()
+_PUBLIC_ERROR_MESSAGES = {
+    "missing_api_key": "OpenRouter API key is missing",
+    "openrouter_cancelled": "OpenRouter request was cancelled",
+    "openrouter_finish_reason": "OpenRouter returned an unexpected finish reason",
+    "openrouter_http": "OpenRouter returned an HTTP error",
+    "openrouter_models": "OpenRouter returned an invalid model catalog",
+    "openrouter_response": "OpenRouter returned an invalid response",
+    "openrouter_response_too_large": "OpenRouter response exceeded the size limit",
+    "openrouter_stream": "OpenRouter stream failed",
+    "openrouter_timeout": "OpenRouter request timed out",
+    "openrouter_tool_call": "OpenRouter returned an invalid tool call",
+    "openrouter_transport": "OpenRouter transport failed",
+    "openrouter_truncated": "OpenRouter stream ended unexpectedly",
+}
 
 # Open-ended nested objects are not represented consistently by every model or
 # provider behind an OpenAI-compatible tool-calling endpoint. Keep the kernel's
@@ -62,8 +80,16 @@ complete, return a concise final answer instead of making another tool call.
 """
 
 
-class OpenRouterError(ToolboxError):
+class OpenRouterError(ModelTransportError):
     """A structured provider or response-shape failure."""
+
+    def __init__(self, code: str, message: str, **details: Any) -> None:
+        super().__init__(
+            code,
+            message,
+            public_message=_PUBLIC_ERROR_MESSAGES.get(code),
+            **details,
+        )
 
 
 @dataclass(frozen=True)
@@ -526,12 +552,16 @@ class OpenRouterModel:
             )
             for _, item in sorted(tool_calls.items())
         )
+        reasoning = "".join(reasoning_parts) or None
+        preserved_details = tuple(reasoning_details)
+        if self._details_duplicate_reasoning(reasoning, preserved_details):
+            preserved_details = ()
         yield ModelStreamEvent(
             turn=ModelTurn(
                 text="".join(text_parts) or None,
                 calls=calls,
-                reasoning="".join(reasoning_parts) or None,
-                reasoning_details=tuple(reasoning_details),
+                reasoning=reasoning,
+                reasoning_details=preserved_details,
                 total_tokens=total_tokens,
             )
         )
@@ -761,11 +791,14 @@ class OpenRouterModel:
                         for call in calls
                     ]
                 reasoning = message.get("reasoning")
-                if isinstance(reasoning, str) and reasoning:
-                    item["reasoning"] = reasoning
                 reasoning_details = message.get("reasoning_details")
-                if reasoning_details:
+                details_duplicate_text = OpenRouterModel._details_duplicate_reasoning(
+                    reasoning, reasoning_details
+                )
+                if reasoning_details and not details_duplicate_text:
                     item["reasoning_details"] = reasoning_details
+                elif isinstance(reasoning, str) and reasoning:
+                    item["reasoning"] = reasoning
                 wired.append(item)
             elif role == "tool":
                 content = message.get("content")
@@ -782,6 +815,31 @@ class OpenRouterModel:
             else:
                 wired.append({"role": role, "content": message.get("content", "")})
         return wired
+
+    @staticmethod
+    def _details_duplicate_reasoning(
+        reasoning: Any,
+        details: Any,
+    ) -> bool:
+        """Whether details exactly duplicate the assembled plaintext reasoning."""
+        return (
+            isinstance(reasoning, str)
+            and bool(reasoning)
+            and isinstance(details, Sequence)
+            and not isinstance(details, (str, bytes))
+            and bool(details)
+            and all(
+                isinstance(detail, Mapping)
+                and detail.get("type") == "reasoning.text"
+                and isinstance(detail.get("text"), str)
+                and not any(
+                    detail.get(field)
+                    for field in ("data", "id", "signature", "summary")
+                )
+                for detail in details
+            )
+            and "".join(detail["text"] for detail in details) == reasoning
+        )
 
     @staticmethod
     def _tool_call(item: Any) -> ToolCall:

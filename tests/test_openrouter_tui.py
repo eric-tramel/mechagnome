@@ -592,7 +592,7 @@ def test_openrouter_preserves_reasoning_across_tool_continuation(
                 finish_reason="tool_calls",
             )
         assistant = body["messages"][-2]
-        assert assistant["reasoning"] == "I should inspect the help topic."
+        assert "reasoning" not in assistant
         assert assistant["reasoning_details"] == [detail]
         assert body["reasoning"] == {"effort": "high"}
         return sse_response({"choices": [{"delta": {"content": "Ready with help."}}]})
@@ -612,6 +612,116 @@ def test_openrouter_preserves_reasoning_across_tool_continuation(
         if event["kind"] == "model"
     )
     assert first_model_event["payload"]["reasoning_details"] == [detail]
+
+
+def test_openrouter_compacts_plaintext_reasoning_details(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return sse_response(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning": "Inspect",
+                                "reasoning_details": [
+                                    {
+                                        "type": "reasoning.text",
+                                        "text": "Inspect",
+                                        "format": "unknown",
+                                        "index": 0,
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning": " help.",
+                                "reasoning_details": [
+                                    {
+                                        "type": "reasoning.text",
+                                        "text": " help.",
+                                        "format": "unknown",
+                                        "index": 0,
+                                    }
+                                ],
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "reason-call",
+                                        "function": {
+                                            "name": "help",
+                                            "arguments": '{"topic":"quickstart"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                finish_reason="tool_calls",
+            )
+        assistant = body["messages"][-2]
+        assert assistant["reasoning"] == "Inspect help."
+        assert "reasoning_details" not in assistant
+        return sse_response({"choices": [{"delta": {"content": "Ready."}}]})
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = Harness(kernel).start(model).send("How do I begin?")
+
+    assert result.answer == "Ready."
+    first_model_event = next(
+        event
+        for event in kernel.read_session(result.session_id, limit=100)["events"]
+        if event["kind"] == "model"
+    )
+    assert first_model_event["payload"]["reasoning"] == "Inspect help."
+    assert "reasoning_details" not in first_model_event["payload"]
+
+    legacy_message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [],
+        "reasoning": "Inspect help.",
+        "reasoning_details": [
+            {
+                "type": "reasoning.text",
+                "text": "Inspect help.",
+                "format": "unknown",
+                "index": 0,
+            }
+        ],
+    }
+    assert OpenRouterModel._wire_messages([legacy_message]) == [
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning": "Inspect help.",
+        }
+    ]
+
+    legacy_message["reasoning"] = "A different summary."
+    assert OpenRouterModel._wire_messages([legacy_message]) == [
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_details": legacy_message["reasoning_details"],
+        }
+    ]
 
 
 def test_openrouter_adapter_round_trips_objects_and_keeps_parallel_calls(
@@ -757,6 +867,180 @@ def test_openrouter_adapter_normalizes_non_object_http_error(tmp_path: Path) -> 
 
     with pytest.raises(OpenRouterError, match="HTTP 400"):
         model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+
+def test_conversation_records_openrouter_transport_failure(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    secret = "sentinel-provider-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(secret, request=request)
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    conversation = Harness(kernel).start(model)
+
+    with pytest.raises(OpenRouterError, match=secret):
+        conversation.send("hello")
+
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "model_failed"]
+    assert events[-1]["payload"] == {
+        "code": "openrouter_transport",
+        "message": "OpenRouter transport failed",
+        "details": {},
+    }
+    assert secret not in str(events[-1]["payload"])
+
+
+@pytest.mark.parametrize(
+    ("response", "code", "message"),
+    [
+        (
+            httpx.Response(
+                400,
+                json={"error": {"message": "sentinel-provider-secret"}},
+            ),
+            "openrouter_http",
+            "OpenRouter returned an HTTP error",
+        ),
+        (
+            httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=(
+                    'data: {"error":{"message":"sentinel-provider-secret"}}\n\n'
+                    "data: [DONE]\n\n"
+                ),
+            ),
+            "openrouter_stream",
+            "OpenRouter stream failed",
+        ),
+    ],
+)
+def test_conversation_sanitizes_provider_controlled_openrouter_errors(
+    tmp_path: Path,
+    response: httpx.Response,
+    code: str,
+    message: str,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    secret = "sentinel-provider-secret"
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(lambda request: response)),
+    )
+    conversation = Harness(kernel).start(model)
+
+    with pytest.raises(OpenRouterError, match=secret):
+        conversation.send("hello")
+
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert events[-1]["payload"] == {
+        "code": code,
+        "message": message,
+        "details": {},
+    }
+    assert secret not in str(events[-1]["payload"])
+
+
+def test_completion_session_records_safe_openrouter_failure(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    secret = "sentinel-provider-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(secret, request=request)
+
+    completion_model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    provider = ModelProvider(
+        kernel,
+        FinalModel(),
+        completion_transport=completion_model,
+    )
+    session = provider.start_session()
+
+    with pytest.raises(ToolboxError) as failure:
+        session.completion_provider().complete([{"role": "user", "content": "hello"}])
+
+    assert failure.value.code == "model_provider_failed"
+    children = [
+        child
+        for child in kernel.list_sessions(limit=100)["sessions"]
+        if child["parent_session_id"] == session.session_id
+    ]
+    assert len(children) == 1
+    events = kernel.read_session(children[0]["id"], limit=100)["events"]
+    assert events[-1]["payload"] == {
+        "code": "openrouter_transport",
+        "message": "OpenRouter transport failed",
+        "details": {},
+    }
+    assert secret not in str(events[-1]["payload"])
+
+
+def test_completion_session_sanitizes_unknown_failure(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    secret = "sentinel-provider-secret"
+
+    class UnsafeCompletion:
+        def complete(self, messages: Any) -> str:
+            raise RuntimeError(secret)
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+    provider = ModelProvider(
+        kernel,
+        FinalModel(),
+        completion_transport=UnsafeCompletion(),
+    )
+    session = provider.start_session()
+
+    with pytest.raises(ToolboxError) as failure:
+        session.completion_provider().complete([{"role": "user", "content": "hello"}])
+
+    assert failure.value.code == "model_provider_failed"
+    children = [
+        child
+        for child in kernel.list_sessions(limit=100)["sessions"]
+        if child["parent_session_id"] == session.session_id
+    ]
+    events = kernel.read_session(children[0]["id"], limit=100)["events"]
+    assert events[-1]["payload"] == {
+        "code": "model_provider_failed",
+        "message": "model provider request failed",
+        "details": {},
+    }
+    assert secret not in str(events[-1]["payload"])
+
+
+def test_conversation_still_sanitizes_unknown_model_failures(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    secret = "sentinel-provider-secret"
+
+    class UnsafeModel:
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            raise ToolboxError("unsafe_provider_error", secret)
+
+    conversation = Harness(kernel).start(UnsafeModel())
+
+    with pytest.raises(ToolboxError, match=secret):
+        conversation.send("hello")
+
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert events[-1]["payload"] == {
+        "code": "model_provider_failed",
+        "message": "model provider request failed",
+        "details": {},
+    }
 
 
 def test_openrouter_adapter_rejects_truncated_stream(tmp_path: Path) -> None:

@@ -58,6 +58,31 @@ class ModelStreamEvent:
     turn: ModelTurn | None = None
 
 
+class ModelTransportError(ToolboxError):
+    """A provider failure with a separately curated durable-session message."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        public_message: str | None = None,
+        **details: Any,
+    ) -> None:
+        super().__init__(code, message, **details)
+        self.public_message = public_message
+
+    def public_error(self) -> dict[str, Any]:
+        """Return provider-safe diagnostics for durable events and the UI."""
+        if self.public_message is None:
+            return _error("model_provider_failed").to_dict()["error"]
+        return {
+            "code": self.code,
+            "message": self.public_message,
+            "details": {},
+        }
+
+
 class ModelTransport(Protocol):
     """Raw provider transport hidden behind the session-aware gateway."""
 
@@ -277,14 +302,17 @@ class ModelProvider:
             if len(result.encode("utf-8")) > MAX_MODEL_RESPONSE_BYTES:
                 raise _error("model_provider_limit")
         except Exception as error:
-            failure = (
-                error
-                if isinstance(error, ToolboxError) and error.code in _ERROR_MESSAGES
-                else _error("model_provider_failed")
-            )
-            self.kernel.append_event(
-                child_id, "model_failed", failure.to_dict()["error"]
-            )
+            if isinstance(error, ModelTransportError):
+                record = error.public_error()
+                failure = _error("model_provider_failed")
+            else:
+                failure = (
+                    error
+                    if isinstance(error, ToolboxError) and error.code in _ERROR_MESSAGES
+                    else _error("model_provider_failed")
+                )
+                record = failure.to_dict()["error"]
+            self.kernel.append_event(child_id, "model_failed", record)
             raise failure from error
         self.kernel.append_event(
             child_id,
@@ -409,8 +437,12 @@ class ModelSession:
                 isinstance(error, ToolboxError) and error.code == "cancelled"
             ) or (cancelled is not None and cancelled())
             if not is_cancelled:
-                failure = _error("model_provider_failed")
-                self._record("model_failed", failure.to_dict()["error"], on_record)
+                failure = (
+                    error.public_error()
+                    if isinstance(error, ModelTransportError)
+                    else _error("model_provider_failed").to_dict()["error"]
+                )
+                self._record("model_failed", failure, on_record)
             raise
 
         payload = _model_payload(completed)
