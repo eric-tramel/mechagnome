@@ -40,6 +40,7 @@ def write(
     description: str | None = None,
     input_schema: dict[str, Any] | None = None,
     base_version: int | None = None,
+    namespaces: list[str] | None = None,
 ) -> dict[str, Any]:
     """Write through the editable model-facing operation."""
     args: dict[str, Any] = {
@@ -50,6 +51,8 @@ def write(
     }
     if base_version is not None:
         args["base_version"] = base_version
+    if namespaces is not None:
+        args["namespaces"] = namespaces
     result = kernel.call("write_tool", args, session_id=session_id)
     assert isinstance(result, dict)
     return result
@@ -189,6 +192,8 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "authoring": "# Authoring tools\n",
         "composition": "# Composing tools\n",
         "sessions": "# Sessions\n",
+        "namespaces": "# Hierarchical tool namespaces\n",
+        "toolboxes": "# Toolbox stacks\n",
         "versioning": "# Versioning\n",
         "core": "# Core operations\n",
     }
@@ -264,6 +269,7 @@ def test_write_immediately_search_view_and_call(tmp_path: Path) -> None:
         "version": 1,
         "active": True,
         "previous_version": None,
+        "namespaces": ["uncategorized"],
     }
     assert call_tool(kernel, "echo", {"value": "hello"}) == {"echo": "hello"}
     search = kernel.call("search_tools", {"query": "echo"})
@@ -331,6 +337,7 @@ def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None
     assert partial["items"][0] == {
         "name": "send_email",
         "description": "Deliver an electronic message.",
+        "namespaces": ["uncategorized"],
     }
 
 
@@ -403,9 +410,195 @@ def test_search_exact_name_priority_filtering_and_pagination(tmp_path: Path) -> 
         {"query": "   ", "include_core": False, "limit": 1},
     )
     assert [item["name"] for item in empty["items"]] == ["haystack"]
-    assert set(empty["items"][0]) == {"name", "description"}
+    assert set(empty["items"][0]) == {"name", "description", "namespaces"}
     assert empty["total"] == 2
     assert empty["next_cursor"] == 1
+
+
+def test_hierarchical_namespaces_are_mutable_lineage_metadata(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    original_source = "async def main(input, ctx):\n    return 'v1'\n"
+
+    created = write(
+        kernel,
+        "formatter",
+        original_source,
+        session_id=session_id,
+        namespaces=["development/python", "shared", "development/python"],
+    )
+    assert created["namespaces"] == ["development/python", "shared"]
+    before = kernel.tool_history("formatter", session_id=session_id)
+
+    reassigned = kernel.call(
+        "write_tool",
+        {
+            "name": "formatter",
+            "namespaces": ["quality/formatting", "development/python"],
+            "base_version": 1,
+        },
+        session_id=session_id,
+    )
+
+    assert reassigned == {
+        "name": "formatter",
+        "version": 1,
+        "active": True,
+        "namespaces": ["development/python", "quality/formatting"],
+        "metadata_only": True,
+    }
+    after = kernel.tool_history("formatter", session_id=session_id)
+    assert after["namespaces"] == ["development/python", "quality/formatting"]
+    assert after["versions"] == before["versions"]
+    assert kernel.view_tool("formatter", version=1)["source"] == original_source
+    assert call_tool(kernel, "formatter", {}, session_id=session_id) == "v1"
+    namespace_events = [
+        event
+        for event in kernel.read_session(session_id, limit=100)["events"]
+        if event["kind"] == "tool_namespaces_changed"
+    ]
+    assert namespace_events[-1]["payload"] == {
+        "name": "formatter",
+        "before": ["development/python", "shared"],
+        "after": ["development/python", "quality/formatting"],
+        "toolbox_id": kernel.list_toolboxes()[0]["id"],
+    }
+
+    updated = write(
+        kernel,
+        "formatter",
+        "async def main(input, ctx):\n    return 'v2'\n",
+        session_id=session_id,
+        base_version=1,
+    )
+    assert updated["namespaces"] == ["development/python", "quality/formatting"]
+    assert kernel.tool_history("formatter")["namespaces"] == updated["namespaces"]
+
+
+@pytest.mark.parametrize(
+    "namespaces",
+    [[], ["/development"], ["development/"], ["development//python"], ["dev space"]],
+)
+def test_namespace_assignments_reject_invalid_paths(
+    tmp_path: Path, namespaces: list[str]
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(kernel, "organized", "async def main(input, ctx):\n    return True\n")
+
+    with pytest.raises(ToolboxError) as error:
+        kernel.call("write_tool", {"name": "organized", "namespaces": namespaces})
+
+    assert error.value.code == "invalid_namespace"
+    assert kernel.view_tool("organized")["namespaces"] == ["uncategorized"]
+
+
+def test_write_tool_rejects_partial_authoring_and_unknown_reassignment(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+
+    with pytest.raises(ToolboxError) as partial:
+        kernel.call(
+            "write_tool",
+            {"name": "partial", "description": "Incomplete.", "namespaces": ["x"]},
+        )
+    assert partial.value.code == "invalid_write"
+
+    with pytest.raises(ToolboxError) as unknown:
+        kernel.call("write_tool", {"name": "missing", "namespaces": ["x"]})
+    assert unknown.value.code == "unknown_tool"
+
+
+def test_search_browses_namespace_subtrees_without_duplicates(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "python_format",
+        "async def main(input, ctx):\n    return True\n",
+        namespaces=["development/python", "quality/python"],
+    )
+    write(
+        kernel,
+        "release",
+        "async def main(input, ctx):\n    return True\n",
+        namespaces=["development"],
+    )
+    write(
+        kernel,
+        "device_info",
+        "async def main(input, ctx):\n    return True\n",
+        namespaces=["device/python"],
+    )
+
+    browsed = kernel.call(
+        "search_tools",
+        {"query": "", "namespace": "development", "include_core": False},
+    )
+    assert [item["name"] for item in browsed["items"]] == [
+        "python_format",
+        "release",
+    ]
+    assert browsed["total"] == 2
+    assert browsed["items"][0]["namespaces"] == [
+        "development/python",
+        "quality/python",
+    ]
+
+    namespace_match = kernel.call(
+        "search_tools", {"query": "quality", "include_core": False}
+    )
+    assert [item["name"] for item in namespace_match["items"]] == ["python_format"]
+    exact = kernel.call(
+        "search_tools",
+        {"query": "", "namespace": "development/python", "include_core": False},
+    )
+    assert [item["name"] for item in exact["items"]] == ["python_format"]
+
+
+def test_namespace_filter_respects_winning_toolbox_binding(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    kernel.create_toolbox("alpha")
+    kernel.create_toolbox("beta")
+    session_id = kernel.create_session()
+
+    kernel.select_toolboxes(session_id, ["alpha"], mode="use")
+    write(
+        kernel,
+        "same",
+        "async def main(input, ctx):\n    return 'alpha'\n",
+        session_id=session_id,
+        namespaces=["operations"],
+    )
+    kernel.select_toolboxes(session_id, ["beta"], mode="use")
+    write(
+        kernel,
+        "same",
+        "async def main(input, ctx):\n    return 'beta'\n",
+        session_id=session_id,
+        namespaces=["development/python"],
+    )
+
+    kernel.select_toolboxes(session_id, ["alpha", "beta"], mode="use")
+    assert kernel.catalog(session_id=session_id, namespace="development") == []
+    kernel.select_toolboxes(session_id, ["beta", "alpha"], mode="use")
+    assert [
+        item["name"]
+        for item in kernel.catalog(session_id=session_id, namespace="development")
+    ] == ["same"]
+
+
+def test_core_namespace_is_discovery_metadata_not_capability_identity(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+
+    kernel.call(
+        "write_tool", {"name": "help", "namespaces": ["platform/documentation"]}
+    )
+
+    assert kernel.view_tool("help")["namespaces"] == ["platform/documentation"]
+    assert "#" in kernel.call("help", {"topic": "quickstart"})
+    assert "help" not in {item["name"] for item in kernel.catalog(include_core=False)}
 
 
 def test_active_feedback_surface_is_absent(tmp_path: Path) -> None:
@@ -435,7 +628,7 @@ def test_schema_two_database_migrates_without_feedback_storage(tmp_path: Path) -
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 6
+    assert version == 7
     assert table is None
 
 
@@ -463,8 +656,53 @@ def test_schema_five_database_removes_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 6
+    assert version == 7
     assert table is None
+
+
+def test_schema_six_backfills_all_lineage_namespaces_idempotently(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "toolbox.db"
+    kernel = Kernel(database, cwd=tmp_path)
+    write(kernel, "active_user", "async def main(input, ctx):\n    return True\n")
+    write(kernel, "retired_user", "async def main(input, ctx):\n    return False\n")
+    retired_version_id = kernel.view_tool("retired_user")["version"]
+    kernel.delete_tool("retired_user")
+    with closing(kernel._connect()) as connection, connection:
+        lineage_ids = {
+            str(row["name"]): int(row["id"])
+            for row in connection.execute("SELECT id, name FROM tool_lineages")
+        }
+        connection.execute("DROP TABLE tool_namespaces")
+        connection.execute("PRAGMA user_version = 6")
+
+    reopened = Kernel(database, cwd=tmp_path)
+    with closing(reopened._connect()) as connection:
+        rows = connection.execute(
+            "SELECT l.name, n.path FROM tool_lineages AS l "
+            "JOIN tool_namespaces AS n ON n.lineage_id = l.id "
+            "ORDER BY l.name, n.path"
+        ).fetchall()
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    paths = {str(row["name"]): str(row["path"]) for row in rows}
+    assert all(paths[name] == "core" for name in CORE_NAMES)
+    assert paths["active_user"] == "uncategorized"
+    assert paths["retired_user"] == "uncategorized"
+    assert reopened.tool_history("retired_user")["namespaces"] == ["uncategorized"]
+    assert reopened.tool_history("retired_user")["versions"][0]["version"] == (
+        retired_version_id
+    )
+    assert foreign_key_errors == []
+
+    second_reopen = Kernel(database, cwd=tmp_path)
+    with closing(second_reopen._connect()) as connection:
+        counts = connection.execute(
+            "SELECT lineage_id, COUNT(*) AS count FROM tool_namespaces "
+            "GROUP BY lineage_id"
+        ).fetchall()
+    assert {int(row["lineage_id"]) for row in counts} == set(lineage_ids.values())
+    assert all(int(row["count"]) == 1 for row in counts)
 
 
 def test_schema_three_database_migrates_real_pre_lineage_sessions(
@@ -1722,7 +1960,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 7
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -1757,6 +1995,14 @@ def test_cli_lists_and_creates_toolbox_namespaces(
     assert cli.main() == 0
     listed = json.loads(capsys.readouterr().out)
     assert "research" in {item["name"] for item in listed}
+
+    monkeypatch.setattr(sys, "argv", ["mechagnome", "toolboxes", "--help"])
+    with pytest.raises(SystemExit) as help_exit:
+        cli.main()
+    help_text = capsys.readouterr().out
+    assert help_exit.value.code == 0
+    assert "list registered toolboxes" in help_text
+    assert "namespace" not in help_text
 
 
 def test_cli_recovery_failure_returns_nonzero(
@@ -2508,7 +2754,7 @@ def test_harness_refreshes_core_descriptions_each_turn(tmp_path: Path) -> None:
     Harness(kernel_at(tmp_path)).run(model, "Rewrite search.")
 
     assert model.search_descriptions == [
-        "Search active tools, returning names and descriptions.",
+        "Search or browse active tools by metadata and hierarchical namespace.",
         "Live rewritten search.",
     ]
 

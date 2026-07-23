@@ -297,12 +297,17 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
         "call_tool",
     ]
     write_schema = tools["write_tool"]["parameters"]["properties"]["input_schema"]
+    namespaces_schema = tools["write_tool"]["parameters"]["properties"]["namespaces"]
+    namespace_filter = tools["search_tools"]["parameters"]["properties"]["namespace"]
     source_schema = tools["write_tool"]["parameters"]["properties"]["source"]
     call_schema = tools["call_tool"]["parameters"]["properties"]["args"]
     assert write_schema["type"] == "string"
     assert "JSON-encoded JSON Schema object" in write_schema["description"]
     assert "async def main(input, ctx)" in source_schema["description"]
     assert "ctx.call_tool" in source_schema["description"]
+    assert namespaces_schema["type"] == "array"
+    assert namespaces_schema["minItems"] == 1
+    assert namespace_filter["type"] == "string"
     assert call_schema["type"] == "string"
     assert "JSON-encoded object" in call_schema["description"]
     assert turn.calls[0].name == "help"
@@ -3931,7 +3936,7 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
             assert "beta + alpha" in str(app.query_one("#model-info", Static).render())
             await submit(pilot, "/toolbox list")
             chat = chat_text(app)
-            assert "toolbox namespaces" in chat
+            assert "toolboxes" in chat
 
     asyncio.run(exercise())
 
@@ -3948,6 +3953,7 @@ def test_tool_manager_switches_blanks_and_renames_namespaces(tmp_path: Path) -> 
         input_schema={"type": "object"},
         source="async def main(input, ctx):\n    return 'alpha'\n",
         session_id=session_id,
+        namespaces=["development/python", "shared"],
     )
     kernel.select_toolboxes(session_id, ["beta"], mode="use")
     kernel.write_tool(
@@ -3967,6 +3973,12 @@ def test_tool_manager_switches_blanks_and_renames_namespaces(tmp_path: Path) -> 
             manager = app.screen
             assert manager.selected_namespace == "alpha"
             assert manager.selected_name == "alpha_tool"
+            assert "TOOLBOX" in str(
+                manager.query_one("#namespace-label", Static).render()
+            )
+            assert "namespaces: development/python, shared" in str(
+                manager.query_one("#tool-summary", Static).render()
+            )
 
             manager.query_one("#namespace-picker", Select).value = "beta"
             await pilot.pause()

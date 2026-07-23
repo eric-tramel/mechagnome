@@ -1,7 +1,8 @@
 # Versioning
 
-Every `write_tool` call creates an immutable integer version. A successful write
-atomically moves the active binding to the new version.
+Every source-authoring `write_tool` call creates an immutable integer version
+and atomically moves the active binding to it. A namespace-only `write_tool`
+call updates current lineage metadata without creating or activating a version.
 
 Core version 1 is the exception: it is the code-shipped default and refreshes
 from the installed Mechagnome library at startup. Persisted core version 2 and

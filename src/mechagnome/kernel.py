@@ -13,6 +13,7 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
@@ -20,17 +21,24 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from mechagnome.bootstrap import BOOTSTRAP_TOOLS, CORE_NAMES, CORE_SCHEMAS
+from mechagnome.bootstrap import (
+    BOOTSTRAP_TOOLS,
+    CORE_NAMES,
+    CORE_SCHEMAS,
+    NAMESPACE_PATH_MAX,
+    NAMESPACE_PATH_PATTERN,
+)
 
 if TYPE_CHECKING:
     from mechagnome.model_provider import _BoundedModelProvider
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+_NAMESPACE_PATH = re.compile(NAMESPACE_PATH_PATTERN)
 
 
 class ToolboxError(RuntimeError):
@@ -78,6 +86,7 @@ class _InvocationState:
 @dataclass(frozen=True)
 class _ResolvedTool:
     id: int
+    lineage_id: int
     toolbox_id: str
     toolbox_name: str
     name: str
@@ -254,11 +263,15 @@ class _KernelCapability:
                 f"{self._context._logical_slot} cannot use the {slot} capability",
             )
 
-    def catalog(self, include_core: bool = True) -> list[dict[str, Any]]:
+    def catalog(
+        self, include_core: bool = True, namespace: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return effective metadata to the search implementation."""
         self._require("search_tools")
         return self._context._kernel.catalog(
-            include_core=include_core, scope=self._context._state.scope
+            include_core=include_core,
+            namespace=namespace,
+            scope=self._context._state.scope,
         )
 
     def view_tool(self, name: str, version: int | None = None) -> dict[str, Any]:
@@ -272,10 +285,11 @@ class _KernelCapability:
         self,
         *,
         name: str,
-        description: str,
-        input_schema: dict[str, Any],
-        source: str,
+        description: str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        source: str | None = None,
         base_version: int | None = None,
+        namespaces: list[str] | None = None,
     ) -> dict[str, Any]:
         """Store source through the write capability."""
         self._require("write_tool")
@@ -285,6 +299,7 @@ class _KernelCapability:
             input_schema=input_schema,
             source=source,
             base_version=base_version,
+            namespaces=namespaces,
             session_id=self._context._state.session_id,
             parent_call_id=self._context._call_id,
             scope=self._context._state.scope,
@@ -386,6 +401,9 @@ class Kernel:
                     if version == 5:
                         self._migrate_v5(connection)
                         version = 6
+                    if version == 6:
+                        self._migrate_v6(connection)
+                        version = 7
                     if version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -469,6 +487,39 @@ class Kernel:
         connection.execute("DROP TABLE IF EXISTS tool_feedback")
 
     @staticmethod
+    def _migrate_v6(connection: sqlite3.Connection) -> None:
+        """Add hierarchical namespace memberships to every tool lineage."""
+        Kernel._create_namespace_schema(connection)
+        Kernel._backfill_namespaces(connection)
+
+    @staticmethod
+    def _create_namespace_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_namespaces (
+                lineage_id INTEGER NOT NULL
+                    REFERENCES tool_lineages(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                PRIMARY KEY(lineage_id, path)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS tool_namespaces_path_lineage "
+            "ON tool_namespaces(path, lineage_id)"
+        )
+
+    @staticmethod
+    def _backfill_namespaces(connection: sqlite3.Connection) -> None:
+        for row in connection.execute("SELECT id, name FROM tool_lineages"):
+            path = "core" if str(row["name"]) in CORE_NAMES else "uncategorized"
+            connection.execute(
+                "INSERT OR IGNORE INTO tool_namespaces (lineage_id, path) "
+                "VALUES (?, ?)",
+                (int(row["id"]), path),
+            )
+
+    @staticmethod
     def _create_session_indexes_and_triggers(
         connection: sqlite3.Connection,
     ) -> None:
@@ -518,6 +569,14 @@ class Kernel:
                 name TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 UNIQUE(toolbox_id, name)
+            )
+            """,
+            """
+            CREATE TABLE tool_namespaces (
+                lineage_id INTEGER NOT NULL
+                    REFERENCES tool_lineages(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                PRIMARY KEY(lineage_id, path)
             )
             """,
             """
@@ -579,6 +638,8 @@ class Kernel:
             """,
             "CREATE INDEX events_tool_version_id ON events(tool_version_id)",
             "CREATE INDEX events_session_seq ON events(session_id, seq)",
+            "CREATE INDEX tool_namespaces_path_lineage "
+            "ON tool_namespaces(path, lineage_id)",
         )
         for statement in statements:
             connection.execute(statement)
@@ -697,6 +758,7 @@ class Kernel:
         ):
             connection.execute(f"DROP TABLE {table}")
         self._seed_missing_core(connection, toolbox_id)
+        self._backfill_namespaces(connection)
 
     def _seed_missing_core(
         self, connection: sqlite3.Connection, toolbox_id: str
@@ -738,6 +800,10 @@ class Kernel:
                 VALUES (?, ?, ?)
                 """,
                 (toolbox_id, tool.name, int(version.lastrowid)),
+            )
+            connection.execute(
+                "INSERT INTO tool_namespaces (lineage_id, path) VALUES (?, 'core')",
+                (int(lineage.lastrowid),),
             )
 
     @staticmethod
@@ -1478,6 +1544,7 @@ class Kernel:
                 )
             return _ResolvedTool(
                 id=int(row["id"]),
+                lineage_id=int(binding["lineage_id"]),
                 toolbox_id=str(binding["toolbox_id"]),
                 toolbox_name=str(binding["toolbox_name"]),
                 name=str(binding["name"]),
@@ -1508,17 +1575,30 @@ class Kernel:
         self,
         *,
         include_core: bool = True,
+        namespace: str | None = None,
         session_id: str | None = None,
         scope: InvocationScope | None = None,
     ) -> list[dict[str, Any]]:
         """Return effective metadata for an editable search implementation."""
+        namespace_filter = (
+            self._normalize_namespace_path(namespace) if namespace is not None else None
+        )
         active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
             rows = self._effective_rows(connection, active_scope)
+            namespaces = self._lineage_namespace_map(
+                connection, (int(row["lineage_id"]) for row in rows)
+            )
         tools = []
         for row in rows:
             name = str(row["name"])
             if not include_core and name in CORE_NAMES:
+                continue
+            paths = namespaces[int(row["lineage_id"])]
+            if namespace_filter is not None and not any(
+                path == namespace_filter or path.startswith(f"{namespace_filter}/")
+                for path in paths
+            ):
                 continue
             tools.append(
                 {
@@ -1530,6 +1610,7 @@ class Kernel:
                     "kind": "core" if name in CORE_NAMES else "user",
                     "created_at": row["created_at"],
                     "toolbox": row["toolbox_name"],
+                    "namespaces": list(paths),
                 }
             )
         return tools
@@ -1587,6 +1668,7 @@ class Kernel:
                 toolbox_id=tool.toolbox_id,
                 connection=connection,
             )
+            namespaces = self._lineage_namespaces(connection, tool.lineage_id)
         return {
             "name": tool.name,
             "version": tool.version,
@@ -1596,24 +1678,47 @@ class Kernel:
             "source": tool.source,
             "kind": "core" if name in CORE_NAMES else "user",
             "toolbox": tool.toolbox_name,
+            "namespaces": list(namespaces),
         }
 
     def write_tool(
         self,
         *,
         name: str,
-        description: str,
-        input_schema: dict[str, Any],
-        source: str,
+        description: str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        source: str | None = None,
         base_version: int | None = None,
+        namespaces: list[str] | None = None,
         session_id: str | None = None,
         parent_call_id: str | None = None,
         scope: InvocationScope | None = None,
         toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Compile, store, and bind one namespace-owned immutable version."""
-        self._validate_tool(name, description, input_schema, source)
-        if name in CORE_SCHEMAS and input_schema != CORE_SCHEMAS[name]:
+        """Create a tool version or replace its discovery namespaces."""
+        authoring_values = (description, input_schema, source)
+        full_write = all(value is not None for value in authoring_values)
+        if any(value is not None for value in authoring_values) and not full_write:
+            raise ToolboxError(
+                "invalid_write",
+                "description, input_schema, and source must be supplied together",
+            )
+        if not full_write and namespaces is None:
+            raise ToolboxError(
+                "invalid_write",
+                "write_tool requires tool source or namespace assignments",
+            )
+        normalized_namespaces = (
+            self._normalize_namespaces(namespaces) if namespaces is not None else None
+        )
+        if full_write:
+            assert description is not None
+            assert input_schema is not None
+            assert source is not None
+            self._validate_tool(name, description, input_schema, source)
+        elif not isinstance(name, str) or _TOOL_NAME.fullmatch(name) is None:
+            raise ToolboxError("invalid_name", f"invalid tool name: {name!r}")
+        if full_write and name in CORE_SCHEMAS and input_schema != CORE_SCHEMAS[name]:
             raise ToolboxError(
                 "core_schema_pinned",
                 f"the outer schema for {name} cannot change in this prototype",
@@ -1632,6 +1737,8 @@ class Kernel:
                     except ToolboxError as error:
                         if error.code != "unknown_tool":
                             raise
+                        if not full_write:
+                            raise
                         target_id = active_scope.toolbox_ids[0]
                 lineage = connection.execute(
                     """
@@ -1641,6 +1748,8 @@ class Kernel:
                     (target_id, name),
                 ).fetchone()
                 if lineage is None:
+                    if not full_write:
+                        raise ToolboxError("unknown_tool", f"unknown tool {name!r}")
                     lineage_id = int(
                         connection.execute(
                             """
@@ -1654,7 +1763,7 @@ class Kernel:
                     lineage_id = int(lineage["id"])
                 active_row = connection.execute(
                     """
-                    SELECT v.version
+                    SELECT v.id, v.version
                     FROM bindings AS b
                     JOIN tool_versions AS v ON v.id = b.tool_version_id
                     WHERE b.toolbox_id = ? AND b.name = ?
@@ -1664,6 +1773,8 @@ class Kernel:
                 active_version = (
                     int(active_row["version"]) if active_row is not None else None
                 )
+                if not full_write and active_row is None:
+                    raise ToolboxError("unknown_tool", f"unknown tool {name!r}")
                 if base_version is not None and active_version != base_version:
                     raise ToolboxError(
                         "stale_base_version",
@@ -1674,50 +1785,79 @@ class Kernel:
                         active_version=active_version,
                         base_version=base_version,
                     )
-                row = connection.execute(
-                    """
-                    SELECT COALESCE(MAX(version), 0) + 1 AS next
-                    FROM tool_versions WHERE lineage_id = ?
-                    """,
-                    (lineage_id,),
-                ).fetchone()
-                assert row is not None
-                version = int(row["next"])
-                cursor = connection.execute(
-                    """
-                    INSERT INTO tool_versions (
-                        lineage_id, version, description, schema_json, source,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        lineage_id,
-                        version,
-                        description,
-                        _json(input_schema),
-                        source,
-                        _now(),
-                    ),
-                )
-                version_id = int(cursor.lastrowid)
-                connection.execute(
-                    """
-                    INSERT INTO bindings (toolbox_id, name, tool_version_id)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(toolbox_id, name)
-                    DO UPDATE SET tool_version_id = excluded.tool_version_id
-                    """,
-                    (target_id, name, version_id),
-                )
-                if session_id is not None:
+                previous_namespaces = self._lineage_namespaces(connection, lineage_id)
+                next_namespaces = normalized_namespaces
+                if next_namespaces is None:
+                    next_namespaces = previous_namespaces or (
+                        "core" if name in CORE_NAMES else "uncategorized",
+                    )
+                if full_write:
+                    row = connection.execute(
+                        """
+                        SELECT COALESCE(MAX(version), 0) + 1 AS next
+                        FROM tool_versions WHERE lineage_id = ?
+                        """,
+                        (lineage_id,),
+                    ).fetchone()
+                    assert row is not None
+                    version = int(row["next"])
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO tool_versions (
+                            lineage_id, version, description, schema_json, source,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            lineage_id,
+                            version,
+                            description,
+                            _json(input_schema),
+                            source,
+                            _now(),
+                        ),
+                    )
+                    version_id = int(cursor.lastrowid)
+                    connection.execute(
+                        """
+                        INSERT INTO bindings (toolbox_id, name, tool_version_id)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(toolbox_id, name)
+                        DO UPDATE SET tool_version_id = excluded.tool_version_id
+                        """,
+                        (target_id, name, version_id),
+                    )
+                    if session_id is not None:
+                        self._append_event_connection(
+                            connection,
+                            session_id,
+                            "binding_changed",
+                            {
+                                "name": name,
+                                "from_version": active_version,
+                                "to_version": version,
+                                "toolbox_id": target_id,
+                            },
+                            parent_call_id=parent_call_id,
+                            toolbox_id=target_id,
+                            tool_name=name,
+                            tool_version=version,
+                            tool_version_id=version_id,
+                        )
+                else:
+                    version = active_version
+                    assert version is not None
+                    version_id = int(active_row["id"])
+                self._replace_namespaces(connection, lineage_id, next_namespaces)
+                if session_id is not None and previous_namespaces != next_namespaces:
                     self._append_event_connection(
                         connection,
                         session_id,
-                        "binding_changed",
+                        "tool_namespaces_changed",
                         {
                             "name": name,
-                            "from_version": active_version,
-                            "to_version": version,
+                            "before": previous_namespaces,
+                            "after": next_namespaces,
                             "toolbox_id": target_id,
                         },
                         parent_call_id=parent_call_id,
@@ -1730,12 +1870,74 @@ class Kernel:
             except Exception:
                 connection.rollback()
                 raise
-        return {
+        result = {
             "name": name,
             "version": version,
             "active": True,
-            "previous_version": active_version,
+            "namespaces": list(next_namespaces),
         }
+        if full_write:
+            result["previous_version"] = active_version
+        else:
+            result["metadata_only"] = True
+        return result
+
+    @staticmethod
+    def _normalize_namespace_path(path: Any) -> str:
+        if (
+            not isinstance(path, str)
+            or len(path) > NAMESPACE_PATH_MAX
+            or _NAMESPACE_PATH.fullmatch(path) is None
+        ):
+            raise ToolboxError("invalid_namespace", f"invalid namespace path: {path!r}")
+        return path
+
+    @classmethod
+    def _normalize_namespaces(cls, namespaces: Any) -> tuple[str, ...]:
+        if not isinstance(namespaces, list) or not namespaces:
+            raise ToolboxError(
+                "invalid_namespace", "namespaces must be a non-empty array"
+            )
+        return tuple(
+            sorted({cls._normalize_namespace_path(path) for path in namespaces})
+        )
+
+    @staticmethod
+    def _lineage_namespaces(
+        connection: sqlite3.Connection, lineage_id: int
+    ) -> tuple[str, ...]:
+        return Kernel._lineage_namespace_map(connection, (lineage_id,))[lineage_id]
+
+    @staticmethod
+    def _lineage_namespace_map(
+        connection: sqlite3.Connection, lineage_ids: Iterable[int]
+    ) -> dict[int, tuple[str, ...]]:
+        identifiers = tuple(sorted(set(lineage_ids)))
+        if not identifiers:
+            return {}
+        grouped: dict[int, list[str]] = {lineage_id: [] for lineage_id in identifiers}
+        placeholders = ",".join("?" for _ in identifiers)
+        for row in connection.execute(
+            f"SELECT lineage_id, path FROM tool_namespaces "
+            f"WHERE lineage_id IN ({placeholders}) ORDER BY lineage_id, path",
+            identifiers,
+        ):
+            grouped[int(row["lineage_id"])].append(str(row["path"]))
+        return {lineage_id: tuple(paths) for lineage_id, paths in grouped.items()}
+
+    @staticmethod
+    def _replace_namespaces(
+        connection: sqlite3.Connection,
+        lineage_id: int,
+        namespaces: tuple[str, ...],
+    ) -> None:
+        connection.execute(
+            "DELETE FROM tool_namespaces WHERE lineage_id = ?", (lineage_id,)
+        )
+        connection.executemany(
+            "INSERT INTO tool_namespaces (lineage_id, path) VALUES (?, ?)",
+            ((lineage_id, path) for path in namespaces),
+        )
 
     def _validate_tool(
         self,
@@ -2047,7 +2249,7 @@ class Kernel:
     def tool_inventory(
         self, *, session_id: str | None = None, scope: InvocationScope | None = None
     ) -> list[dict[str, Any]]:
-        """Return visible and historical tools in the selected namespaces."""
+        """Return visible and historical tools in the selected toolboxes."""
         active_scope = self._scope(session_id=session_id, scope=scope)
         names: set[str] = set()
         with closing(self._connect()) as connection:
@@ -2086,7 +2288,7 @@ class Kernel:
         scope: InvocationScope | None = None,
         toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Return one namespace-owned lineage's versions and usage."""
+        """Return one toolbox-owned lineage's versions and usage."""
         active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
             lineage = self._lineage_for_history(connection, name, active_scope, toolbox)
@@ -2123,6 +2325,9 @@ class Kernel:
                 ).fetchall()
                 if ids
                 else []
+            )
+            lineage_namespaces = self._lineage_namespaces(
+                connection, int(lineage["id"])
             )
         active_version = int(active_row["version"]) if active_row is not None else None
         grouped: dict[int, list[sqlite3.Row]] = {}
@@ -2201,6 +2406,7 @@ class Kernel:
             "success_count": sum(item["success_count"] for item in versions),
             "failure_count": sum(item["failure_count"] for item in versions),
             "toolbox": lineage["toolbox_name"],
+            "namespaces": list(lineage_namespaces),
         }
 
     def delete_tool(
@@ -2211,7 +2417,7 @@ class Kernel:
         scope: InvocationScope | None = None,
         toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Remove one namespace binding while retaining its lineage history."""
+        """Remove one toolbox binding while retaining its lineage history."""
         if name in CORE_NAMES:
             raise ToolboxError("core_tool_required", f"cannot delete core tool: {name}")
         active_scope = self._scope(session_id=session_id, scope=scope)
@@ -2265,7 +2471,7 @@ class Kernel:
         scope: InvocationScope | None = None,
         toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Move one namespace binding without editable tool code."""
+        """Move one toolbox binding without editable tool code."""
         active_scope = self._scope(session_id=session_id, scope=scope)
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")

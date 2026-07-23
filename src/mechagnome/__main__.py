@@ -171,17 +171,17 @@ def build_parser() -> argparse.ArgumentParser:
     rollback_parser.add_argument("version", type=int)
     rollback_parser.add_argument("--toolbox", help="target one named toolbox")
     toolbox_parser = subparsers.add_parser(
-        "toolboxes", help="list and configure toolbox namespaces"
+        "toolboxes", help="list and configure toolboxes"
     )
     toolbox_actions = toolbox_parser.add_subparsers(
         dest="toolbox_action", required=True
     )
-    toolbox_actions.add_parser("list", help="list registered namespaces")
-    create_parser = toolbox_actions.add_parser("create", help="create a namespace")
+    toolbox_actions.add_parser("list", help="list registered toolboxes")
+    create_parser = toolbox_actions.add_parser("create", help="create a toolbox")
     create_parser.add_argument("name")
     create_parser.add_argument("--cwd", type=Path)
     default_parser = toolbox_actions.add_parser(
-        "set-default", help="set a cwd's default namespace"
+        "set-default", help="set a cwd's default toolbox"
     )
     default_parser.add_argument("name")
     default_parser.add_argument("--cwd", type=Path)

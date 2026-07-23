@@ -1,19 +1,41 @@
-# Toolbox namespaces
+# Hierarchical tool namespaces
 
-The host gives each durable session an ordered, nonempty set of toolbox
-namespaces. Unqualified names use the first matching toolbox, and search returns
-one effective result per name.
+Namespaces organize tools for discovery inside their owning toolbox. They are
+case-sensitive slash-delimited paths such as `development/python` or
+`quality/formatting`. A tool may belong to several namespaces and still has one
+flat callable name, one lineage, and one immutable version history.
 
-The host can replace the active order with one or more namespaces, append an
-ordered idempotent union, remove namespaces, or reset the session to its cwd
-default. A top-level call snapshots the active order for its complete nested
-call tree, so a hot swap affects the next call rather than an in-flight call.
+New core tools start in `core`; new user-authored tools start in
+`uncategorized`. Supply `namespaces` with a normal `write_tool` call to choose
+the initial or replacement assignments:
 
-In the TUI, `/tools` or `Ctrl+T` opens tool management. Its namespace picker
-switches the session to another registered namespace. **Blank** creates and
-selects a new core-only namespace, while **Save as…** renames the current
-namespace without changing its tools, history, or cwd association.
+```json
+{
+  "name": "format_python",
+  "description": "Format Python source.",
+  "input_schema": {"type": "object"},
+  "source": "async def main(input, ctx):\n    return input['source']\n",
+  "namespaces": ["development/python", "quality/formatting"]
+}
+```
 
-Cwd associations select defaults and preserve the session execution directory.
-They organize tools; they are not filesystem restrictions or security
-boundaries.
+For an existing active tool, call `write_tool` with only `name` and a nonempty
+`namespaces` array to replace its assignments without creating a new tool
+version. Memberships are mutable metadata for the complete lineage, so viewing
+an older version shows the lineage's current namespaces. Assignment updates are
+last-write-wins. `base_version`, when supplied, checks the active source version
+but does not create an independent namespace revision.
+
+`search_tools` returns each tool's sorted namespace paths. Namespace text also
+participates in keyword ranking. Pass `namespace` to browse one subtree; for
+example, filtering `development` includes exact `development` assignments and
+descendants such as `development/python`, but not `device`.
+
+Namespaces do not affect `call_tool` resolution, the fixed five core operation
+slots, capabilities, or filesystem access. They are organization metadata, not
+security boundaries. Use `help(topic="toolboxes")` for the separate ordered
+toolbox-stack and working-directory routing behavior.
+
+Persisted custom replacements for `search_tools` or `write_tool` remain
+callable, but they must be updated to forward the new namespace arguments before
+they provide the shipped namespace-aware behavior.

@@ -44,7 +44,7 @@ async def main(input, ctx):
 
 Prefer active calls when a composed workflow should pick up fixes and upgrades.
 Pin a version when reproducibility or compatibility with one exact contract is
-more important. A version number does not select a shadowed toolbox; namespace
+more important. A version number does not select a shadowed toolbox; toolbox
 precedence first chooses the lineage, and the version is resolved within it.
 
 ## Dispatch and mutation
