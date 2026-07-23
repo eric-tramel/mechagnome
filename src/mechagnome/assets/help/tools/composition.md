@@ -108,4 +108,6 @@ the failed call and its trace remain visible.
 Long-running work requested directly by the model may use the host's detached
 `call_tool` mode described in `help({"topic": "core"})`. Authored
 `ctx.call_tool` composition remains an awaited foreground call: a tool cannot
-detach one of its own nested calls.
+detach one of its own nested calls. Models can run full agents directly in
+foreground or detached mode through the host `run_agent` action described in
+the same help topic.

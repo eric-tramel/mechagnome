@@ -20,10 +20,17 @@ import pytest
 
 from mechagnome import Harness, Kernel, ModelProvider, ModelTurn, ToolboxError, ToolCall
 from mechagnome import __main__ as cli
+from mechagnome import harness as harness_module
 from mechagnome import isolation as isolation_module
 from mechagnome import kernel as kernel_module
 from mechagnome.bootstrap import CORE_NAMES, CORE_SCHEMAS, HELP_SOURCE
+from mechagnome.harness import (
+    MODEL_ACTION_NAMES,
+    Conversation,
+    _parse_run_agent_request,
+)
 from mechagnome.isolation import IsolatedToolRunner
+from mechagnome.model_provider import ModelTransportError
 
 
 def kernel_at(tmp_path: Path, **kwargs: Any) -> Kernel:
@@ -94,6 +101,25 @@ def wait_for_detached(
             raise AssertionError(
                 f"detached job did not reach expected state: {snapshot}"
             )
+        time.sleep(0.01)
+
+
+def wait_for_agent(
+    harness: Harness,
+    job_id: str,
+    session_id: str,
+    *,
+    status: str,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Wait for one supervised detached agent to reach a stable state."""
+    deadline = time.monotonic() + timeout
+    while True:
+        snapshot = harness._agent_coordinator.inspect(job_id, session_id=session_id)
+        if snapshot["status"] == status:
+            return snapshot
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"detached agent did not reach {status}: {snapshot}")
         time.sleep(0.01)
 
 
@@ -1279,7 +1305,8 @@ def test_isolated_tools_can_run_recursive_first_class_agents(tmp_path: Path) -> 
             pass
 
     transport = RecursiveAgentTransport()
-    result = Harness(kernel).run(ModelProvider(kernel, transport), "root")
+    provider = ModelProvider(kernel, transport)
+    result = Harness(kernel).run(provider, "root")
 
     sessions = kernel.list_sessions(limit=100)["sessions"]
     root = kernel.session_metadata(result.session_id)
@@ -1314,6 +1341,884 @@ def test_isolated_tools_can_run_recursive_first_class_agents(tmp_path: Path) -> 
         event["kind"]
         for event in kernel.read_session(grandchild["id"], limit=100)["events"]
     ] == ["user", "model", "final"]
+
+
+class UniformAgentTransport:
+    """Session-bound transport that exercises direct recursive agent actions."""
+
+    def __init__(self) -> None:
+        self.action_names: dict[str, tuple[str, ...]] = {}
+        self.bound_keys: list[str] = []
+        self.cancelled = threading.Event()
+
+    def for_session(self, session_id: str) -> UniformBoundAgentTransport:
+        self.bound_keys.append(session_id)
+        return UniformBoundAgentTransport(self, session_id)
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        raise AssertionError("unbound agent transport received model traffic")
+
+    def complete(self, messages: Any) -> str:
+        raise AssertionError("unbound agent transport received completion traffic")
+
+    def cancel_current(self) -> None:
+        raise AssertionError("unbound agent transport was cancelled")
+
+    def reset_cancellation(self) -> None:
+        raise AssertionError("unbound agent transport was reset")
+
+
+class UniformBoundAgentTransport:
+    def __init__(self, parent: UniformAgentTransport, session_id: str) -> None:
+        self.parent = parent
+        self.session_id = session_id
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        self.parent.action_names[self.session_id] = tuple(
+            tool["name"] for tool in tools
+        )
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        observations = [message for message in messages if message["role"] == "tool"]
+        if prompt == "root" and not observations:
+            return ModelTurn(
+                calls=(ToolCall("run_agent", {"prompt": "child"}, "agent"),)
+            )
+        if prompt == "child" and not observations:
+            return ModelTurn(calls=(ToolCall("help", {"topic": "toc"}, "help"),))
+        if prompt == "child":
+            assert str(observations[-1]["content"]).startswith("# Mechagnome")
+            return ModelTurn(text="child answer")
+        assert observations[-1]["content"] == "child answer"
+        return ModelTurn(text="root answer")
+
+    def complete(self, messages: Any) -> str:
+        return "completion"
+
+    def cancel_current(self) -> None:
+        self.parent.cancelled.set()
+
+    def reset_cancellation(self) -> None:
+        self.parent.cancelled.clear()
+
+
+def test_direct_agents_share_one_conversation_action_surface_and_lineage(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = UniformAgentTransport()
+    provider = ModelProvider(kernel, transport)
+
+    result = Harness(kernel).run(provider, "root")
+
+    sessions = kernel.list_sessions(limit=100)["sessions"]
+    child = next(
+        session
+        for session in sessions
+        if session["parent_session_id"] == result.session_id
+        and session["kind"] == "conversation"
+    )
+    assert result.answer == "root answer"
+    assert child["origin_call_id"] is None
+    assert child["root_session_id"] == result.session_id
+    assert transport.action_names == {
+        result.session_id: MODEL_ACTION_NAMES,
+        child["id"]: MODEL_ACTION_NAMES,
+    }
+    assert provider._session_transports == {}
+
+
+class RecursiveDetachedAgentTransport(UniformAgentTransport):
+    """Have a foreground child detach a grandchild through model actions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.job_id: str | None = None
+
+    def for_session(self, session_id: str) -> RecursiveDetachedBoundTransport:
+        self.bound_keys.append(session_id)
+        return RecursiveDetachedBoundTransport(self, session_id)
+
+
+class RecursiveDetachedBoundTransport(UniformBoundAgentTransport):
+    parent: RecursiveDetachedAgentTransport
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        self.parent.action_names[self.session_id] = tuple(
+            tool["name"] for tool in tools
+        )
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        observations = [message for message in messages if message["role"] == "tool"]
+        if prompt == "root" and messages[-1]["role"] == "user":
+            return ModelTurn(
+                calls=(ToolCall("run_agent", {"prompt": "child"}, "child"),)
+            )
+        if prompt == "root":
+            assert observations[-1]["content"] == "child detached a grandchild"
+            return ModelTurn(text="root continued")
+        if prompt == "child" and messages[-1]["role"] == "user":
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"prompt": "grandchild", "detach": True},
+                        "grandchild",
+                    ),
+                )
+            )
+        if prompt == "child":
+            handle = observations[-1]["content"]
+            self.parent.job_id = handle["job_id"]
+            return ModelTurn(text="child detached a grandchild")
+        if prompt == "grandchild":
+            return ModelTurn(text="grandchild answer")
+        if prompt == "inspect descendant" and messages[-1]["role"] == "user":
+            assert self.parent.job_id is not None
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"job_id": self.parent.job_id},
+                        "inspect",
+                    ),
+                )
+            )
+        snapshot = observations[-1]["content"]
+        assert snapshot["status"] == "succeeded"
+        assert snapshot["result"] == "grandchild answer"
+        return ModelTurn(text="ancestor inspected descendant")
+
+
+def test_recursive_agent_can_detach_and_ancestor_can_inspect(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = RecursiveDetachedAgentTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("root").answer == "root continued"
+    assert transport.job_id is not None
+    wait_for_agent(
+        harness,
+        transport.job_id,
+        conversation.session_id,
+        status="succeeded",
+    )
+    assert (
+        conversation.send("inspect descendant").answer
+        == "ancestor inspected descendant"
+    )
+
+    sessions = kernel.list_sessions(limit=100)["sessions"]
+    child = next(
+        session
+        for session in sessions
+        if session["parent_session_id"] == conversation.session_id
+    )
+    assert kernel.session_metadata(transport.job_id)["parent_session_id"] == child["id"]
+    assert transport.action_names == {
+        conversation.session_id: MODEL_ACTION_NAMES,
+        child["id"]: MODEL_ACTION_NAMES,
+        transport.job_id: MODEL_ACTION_NAMES,
+    }
+    harness.close()
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        {},
+        {"prompt": ""},
+        {"prompt": "work", "detach": 1},
+        {"prompt": "work", "extra": True},
+        {"job_id": ""},
+        {"job_id": "job", "prompt": "mixed"},
+        {"prompt": "x" * (256 * 1024 + 1)},
+    ),
+)
+def test_run_agent_request_validation_is_strict(args: dict[str, Any]) -> None:
+    with pytest.raises(ToolboxError) as error:
+        _parse_run_agent_request(args)
+    assert error.value.code == "invalid_run_agent_request"
+
+
+def test_raw_transport_cannot_implicitly_authorize_direct_agent_runs(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+
+    class UnauthorizedTransport:
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            observations = [
+                message for message in messages if message["role"] == "tool"
+            ]
+            assert tuple(tool["name"] for tool in tools) == MODEL_ACTION_NAMES
+            if not observations:
+                return ModelTurn(
+                    calls=(ToolCall("run_agent", {"prompt": "child"}, "agent"),)
+                )
+            assert observations[-1]["content"]["error"]["code"] == (
+                "model_provider_unavailable"
+            )
+            return ModelTurn(text="not authorized")
+
+    result = Harness(kernel).run(UnauthorizedTransport(), "root")
+
+    assert result.answer == "not authorized"
+    assert all(
+        session["parent_session_id"] is None
+        for session in kernel.list_sessions(limit=100)["sessions"]
+    )
+
+
+class DetachedAgentTransport(UniformAgentTransport):
+    """Hold one detached child while its root conversation continues."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.job_id: str | None = None
+
+    def for_session(self, session_id: str) -> DetachedBoundAgentTransport:
+        self.bound_keys.append(session_id)
+        return DetachedBoundAgentTransport(self, session_id)
+
+
+class DetachedBoundAgentTransport(UniformBoundAgentTransport):
+    parent: DetachedAgentTransport
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        self.parent.action_names[self.session_id] = tuple(
+            tool["name"] for tool in tools
+        )
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        observations = [message for message in messages if message["role"] == "tool"]
+        if prompt == "root" and not observations:
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"prompt": "detached child", "detach": True},
+                        "detach-agent",
+                    ),
+                )
+            )
+        if prompt == "root":
+            handle = observations[-1]["content"]
+            self.parent.job_id = handle["job_id"]
+            assert handle["status"] == "running"
+            return ModelTurn(text="root continued")
+        if prompt == "inspect":
+            assert self.parent.job_id is not None
+            if messages[-1]["role"] == "user":
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "run_agent",
+                            {"job_id": self.parent.job_id},
+                            "inspect-agent",
+                        ),
+                    )
+                )
+            assert observations[-1]["content"]["status"] == "succeeded"
+            assert observations[-1]["content"]["result"] == "detached answer"
+            return ModelTurn(text="inspection complete")
+        self.parent.started.set()
+        assert self.parent.release.wait(timeout=5)
+        return ModelTurn(text="detached answer")
+
+
+def test_detached_agent_continues_and_is_inspectable_by_parent(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = DetachedAgentTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    first = conversation.send("root")
+
+    assert first.answer == "root continued"
+    assert transport.started.wait(timeout=2)
+    assert transport.job_id is not None
+    running = harness._agent_coordinator.inspect(
+        transport.job_id, session_id=conversation.session_id
+    )
+    assert running == {"job_id": transport.job_id, "status": "running"}
+    child = kernel.session_metadata(transport.job_id)
+    assert child["kind"] == "conversation"
+    assert child["parent_session_id"] == conversation.session_id
+    assert transport.action_names[transport.job_id] == MODEL_ACTION_NAMES
+
+    transport.release.set()
+    completed = wait_for_agent(
+        harness,
+        transport.job_id,
+        conversation.session_id,
+        status="succeeded",
+    )
+    assert completed["result"] == "detached answer"
+    assert conversation.send("inspect").answer == "inspection complete"
+    harness.close()
+
+
+def test_detached_agent_handle_is_visible_to_ancestors_but_not_siblings(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = DetachedAgentTransport()
+    provider = ModelProvider(kernel, transport)
+    harness = Harness(kernel)
+    root = harness.start(provider)
+    child = harness._agent_coordinator._create_child(root)
+    sibling_session = provider.start_session(
+        parent_scope=kernel.snapshot_scope(root.session_id)
+    )
+
+    handle = harness._agent_coordinator.start_detached(
+        child, "detached descendant", sink=None
+    )
+    assert transport.started.wait(timeout=2)
+
+    assert (
+        harness._agent_coordinator.inspect(
+            handle["job_id"], session_id=root.session_id
+        )["status"]
+        == "running"
+    )
+    with pytest.raises(ToolboxError) as hidden:
+        harness._agent_coordinator.inspect(
+            handle["job_id"], session_id=sibling_session.session_id
+        )
+    assert hidden.value.code == "unknown_detached_agent"
+
+    transport.release.set()
+    wait_for_agent(
+        harness,
+        handle["job_id"],
+        root.session_id,
+        status="succeeded",
+    )
+    child.close()
+    sibling_session.close()
+    harness.close()
+
+
+class FailingAgentTransport(UniformAgentTransport):
+    """Raise provider-controlled failures inside foreground and detached children."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.detached_job_id: str | None = None
+        self.foreground_error: dict[str, Any] | None = None
+
+    def for_session(self, session_id: str) -> FailingBoundAgentTransport:
+        self.bound_keys.append(session_id)
+        return FailingBoundAgentTransport(self, session_id)
+
+
+class FailingBoundAgentTransport(UniformBoundAgentTransport):
+    parent: FailingAgentTransport
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        observations = [message for message in messages if message["role"] == "tool"]
+        if prompt == "foreground failure" and messages[-1]["role"] == "user":
+            return ModelTurn(
+                calls=(ToolCall("run_agent", {"prompt": "fail foreground"}, "f"),)
+            )
+        if prompt == "foreground failure":
+            self.parent.foreground_error = observations[-1]["content"]["error"]
+            return ModelTurn(text="foreground failure handled")
+        if prompt == "detached failure" and messages[-1]["role"] == "user":
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"prompt": "fail detached", "detach": True},
+                        "d",
+                    ),
+                )
+            )
+        if prompt == "detached failure":
+            self.parent.detached_job_id = observations[-1]["content"]["job_id"]
+            return ModelTurn(text="detached failure started")
+        if prompt == "fail foreground":
+            raise RuntimeError("FOREGROUND_SENTINEL_SECRET")
+        raise ModelTransportError(
+            "provider_internal",
+            "DETACHED_SENTINEL_SECRET",
+        )
+
+
+def test_agent_failures_are_sanitized_for_foreground_and_detached_results(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = FailingAgentTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("foreground failure").answer == (
+        "foreground failure handled"
+    )
+    assert transport.foreground_error == {
+        "code": "model_provider_failed",
+        "message": "model provider request failed",
+        "details": {},
+    }
+    assert conversation.send("detached failure").answer == "detached failure started"
+    assert transport.detached_job_id is not None
+    failed = wait_for_agent(
+        harness,
+        transport.detached_job_id,
+        conversation.session_id,
+        status="failed",
+    )
+    assert failed["error"] == {
+        "code": "model_provider_failed",
+        "message": "model provider request failed",
+        "details": {},
+    }
+    assert "SENTINEL_SECRET" not in json.dumps(failed)
+    harness.close()
+
+
+class CancellationDomainTransport:
+    """Block selected conversations and record session-local cancellation."""
+
+    def __init__(self) -> None:
+        self.events: dict[str, threading.Event] = {}
+        self.cancelled_keys: list[str] = []
+        self.detached_started = threading.Event()
+        self.foreground_started = threading.Event()
+        self.root_blocked = threading.Event()
+        self.release_detached = threading.Event()
+        self.detached_id: str | None = None
+
+    def for_session(self, session_id: str) -> CancellationBoundTransport:
+        self.events.setdefault(session_id, threading.Event())
+        return CancellationBoundTransport(self, session_id)
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        raise AssertionError("unbound cancellation transport received traffic")
+
+    def complete(self, messages: Any) -> str:
+        raise AssertionError("unbound cancellation transport received completion")
+
+    def cancel_current(self) -> None:
+        raise AssertionError("unbound cancellation transport was cancelled")
+
+    def reset_cancellation(self) -> None:
+        raise AssertionError("unbound cancellation transport was reset")
+
+
+class CancellationBoundTransport:
+    def __init__(self, parent: CancellationDomainTransport, session_id: str) -> None:
+        self.parent = parent
+        self.session_id = session_id
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        observations = [message for message in messages if message["role"] == "tool"]
+        if prompt == "start detached" and messages[-1]["role"] == "user":
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"prompt": "detached", "detach": True},
+                        "detach",
+                    ),
+                )
+            )
+        if prompt == "start detached":
+            self.parent.detached_id = observations[-1]["content"]["job_id"]
+            return ModelTurn(text="detached started")
+        if prompt == "detached":
+            self.parent.detached_started.set()
+            while not self.parent.release_detached.wait(timeout=0.01):
+                if self.parent.events[self.session_id].is_set():
+                    raise ToolboxError("cancelled", "detached cancelled")
+            return ModelTurn(text="detached complete")
+        if prompt == "block root":
+            self.parent.root_blocked.set()
+            while not self.parent.events[self.session_id].wait(timeout=0.01):
+                pass
+            raise ToolboxError("cancelled", "root cancelled")
+        if prompt == "start foreground" and messages[-1]["role"] == "user":
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"prompt": "foreground child"},
+                        "foreground",
+                    ),
+                )
+            )
+        if prompt == "foreground child":
+            self.parent.foreground_started.set()
+            while not self.parent.events[self.session_id].wait(timeout=0.01):
+                pass
+            raise ToolboxError("cancelled", "foreground child cancelled")
+        return ModelTurn(text="unexpected")
+
+    def complete(self, messages: Any) -> str:
+        return "completion"
+
+    def cancel_current(self) -> None:
+        self.parent.cancelled_keys.append(self.session_id)
+        self.parent.events[self.session_id].set()
+
+    def reset_cancellation(self) -> None:
+        self.parent.events[self.session_id].clear()
+
+
+def test_parent_cancellation_does_not_stop_detached_agent(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = CancellationDomainTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("start detached").answer == "detached started"
+    assert transport.detached_started.wait(timeout=2)
+    assert transport.detached_id is not None
+    failure: list[Exception] = []
+
+    def block_root() -> None:
+        try:
+            conversation.send("block root")
+        except Exception as error:
+            failure.append(error)
+
+    thread = threading.Thread(target=block_root)
+    thread.start()
+    assert transport.root_blocked.wait(timeout=2)
+    assert conversation.cancel() is True
+    thread.join(timeout=2)
+
+    assert len(failure) == 1
+    assert transport.cancelled_keys == [conversation.session_id]
+    assert (
+        harness._agent_coordinator.inspect(
+            transport.detached_id, session_id=conversation.session_id
+        )["status"]
+        == "running"
+    )
+
+    transport.release_detached.set()
+    wait_for_agent(
+        harness,
+        transport.detached_id,
+        conversation.session_id,
+        status="succeeded",
+    )
+    harness.close()
+
+
+def test_harness_close_stops_detached_agents_idempotently(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = CancellationDomainTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    conversation.send("start detached")
+    assert transport.detached_started.wait(timeout=2)
+    assert transport.detached_id is not None
+
+    harness.close()
+    harness.close()
+
+    stopped = harness._agent_coordinator.inspect(
+        transport.detached_id, session_id=conversation.session_id
+    )
+    assert stopped["status"] == "failed"
+    assert stopped["error"]["code"] == "detached_agent_shutdown"
+
+
+def test_detached_agent_limit_is_separate_and_bounded(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = CancellationDomainTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    handles = [
+        harness._agent_coordinator.start_detached(conversation, "detached", sink=None)
+        for _ in range(4)
+    ]
+    with pytest.raises(ToolboxError) as error:
+        harness._agent_coordinator.start_detached(conversation, "detached", sink=None)
+
+    assert len({handle["job_id"] for handle in handles}) == 4
+    assert error.value.code == "detached_agent_limit"
+    harness.close()
+
+
+class BoundaryAgentTransport(UniformAgentTransport):
+    def for_session(self, session_id: str) -> BoundaryBoundAgentTransport:
+        self.bound_keys.append(session_id)
+        return BoundaryBoundAgentTransport(self, session_id)
+
+
+class BoundaryBoundAgentTransport(UniformBoundAgentTransport):
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        if prompt == "oversized":
+            return ModelTurn(text="x" * (1024 * 1024))
+        if prompt == "surrogate":
+            return ModelTurn(text="\ud800")
+        return ModelTurn(text=f"answer:{prompt}")
+
+
+def test_detached_agent_result_limit_and_unicode_are_terminal(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, BoundaryAgentTransport()))
+
+    oversized = harness._agent_coordinator.start_detached(
+        conversation, "oversized", sink=None
+    )
+    failure = wait_for_agent(
+        harness,
+        oversized["job_id"],
+        conversation.session_id,
+        status="failed",
+    )
+    assert failure["error"]["code"] == "detached_agent_result_too_large"
+
+    surrogate = harness._agent_coordinator.start_detached(
+        conversation, "surrogate", sink=None
+    )
+    success = wait_for_agent(
+        harness,
+        surrogate["job_id"],
+        conversation.session_id,
+        status="succeeded",
+    )
+    assert success["result"] == "\ud800"
+    harness.close()
+
+
+def test_detached_agent_retention_evicts_oldest_terminal_handle(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, BoundaryAgentTransport()))
+    handles: list[str] = []
+
+    for index in range(65):
+        handle = harness._agent_coordinator.start_detached(
+            conversation, f"job-{index}", sink=None
+        )
+        handles.append(handle["job_id"])
+        wait_for_agent(
+            harness,
+            handle["job_id"],
+            conversation.session_id,
+            status="succeeded",
+        )
+
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            harness._agent_coordinator.inspect(
+                handles[0], session_id=conversation.session_id
+            )
+        except ToolboxError as error:
+            assert error.code == "unknown_detached_agent"
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError("oldest detached agent handle was not evicted")
+        time.sleep(0.01)
+    newest = harness._agent_coordinator.inspect(
+        handles[-1], session_id=conversation.session_id
+    )
+    assert newest["result"] == "answer:job-64"
+    harness.close()
+
+
+def test_parent_cancellation_cascades_to_foreground_agent(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = CancellationDomainTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+    failure: list[Exception] = []
+
+    def run_foreground() -> None:
+        try:
+            conversation.send("start foreground")
+        except Exception as error:
+            failure.append(error)
+
+    thread = threading.Thread(target=run_foreground)
+    thread.start()
+    assert transport.foreground_started.wait(timeout=2)
+    assert conversation.cancel() is True
+    thread.join(timeout=2)
+
+    child = next(
+        session
+        for session in kernel.list_sessions(limit=100)["sessions"]
+        if session["parent_session_id"] == conversation.session_id
+    )
+    assert len(failure) == 1
+    assert conversation.session_id in transport.cancelled_keys
+    assert child["id"] in transport.cancelled_keys
+    harness.close()
+
+
+def test_parent_cancellation_before_child_send_prevents_child_rollout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = UniformAgentTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+    child_send_entered = threading.Event()
+    release_child_send = threading.Event()
+    original_send = Conversation.send
+
+    def gated_send(
+        target: Conversation,
+        prompt: str,
+        *,
+        on_event: Any = None,
+        _agent_budget: Any = None,
+    ) -> Any:
+        if target is not conversation and prompt == "child":
+            child_send_entered.set()
+            assert release_child_send.wait(timeout=2)
+        return original_send(
+            target,
+            prompt,
+            on_event=on_event,
+            _agent_budget=_agent_budget,
+        )
+
+    monkeypatch.setattr(Conversation, "send", gated_send)
+    failures: list[Exception] = []
+
+    def run_parent() -> None:
+        try:
+            conversation.send("root")
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=run_parent)
+    thread.start()
+    assert child_send_entered.wait(timeout=2)
+    assert conversation.cancel() is True
+    release_child_send.set()
+    thread.join(timeout=2)
+
+    child = next(
+        session
+        for session in kernel.list_sessions(limit=100)["sessions"]
+        if session["parent_session_id"] == conversation.session_id
+    )
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], ToolboxError)
+    assert kernel.read_session(child["id"], limit=100)["events"] == []
+    harness.close()
+
+
+def test_recursive_foreground_agents_share_an_active_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(harness_module, "_MAX_ACTIVE_FOREGROUND_AGENTS", 1)
+    kernel = kernel_at(tmp_path)
+    transport = CancellationDomainTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+    failures: list[Exception] = []
+
+    def run_first() -> None:
+        try:
+            harness._agent_coordinator.run_foreground(conversation, "foreground child")
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert transport.foreground_started.wait(timeout=2)
+
+    with pytest.raises(ToolboxError) as error:
+        harness._agent_coordinator.run_foreground(conversation, "second child")
+    assert error.value.code == "foreground_agent_limit"
+
+    conversation.close()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    harness.close()
+
+
+def test_recursive_agent_launches_share_a_cumulative_rollout_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(harness_module, "_MAX_AGENT_LAUNCHES_PER_ROLLOUT", 2)
+    kernel = kernel_at(tmp_path)
+
+    class BudgetTransport(UniformAgentTransport):
+        def for_session(self, session_id: str) -> BudgetBoundTransport:
+            self.bound_keys.append(session_id)
+            return BudgetBoundTransport(self, session_id)
+
+    class BudgetBoundTransport(UniformBoundAgentTransport):
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            prompt = next(
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            )
+            if prompt.startswith("child-"):
+                return ModelTurn(text=f"answer:{prompt}")
+            observations = [
+                message for message in messages if message["role"] == "tool"
+            ]
+            if len(observations) < 3:
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "run_agent",
+                            {"prompt": f"child-{len(observations)}"},
+                            f"launch-{len(observations)}",
+                        ),
+                    )
+                )
+            assert observations[0]["content"] == "answer:child-0"
+            assert observations[1]["content"] == "answer:child-1"
+            assert observations[2]["content"]["error"]["code"] == ("agent_launch_limit")
+            return ModelTurn(text="budget enforced")
+
+    result = Harness(kernel).run(ModelProvider(kernel, BudgetTransport()), "root")
+
+    assert result.answer == "budget enforced"
 
 
 def test_child_agent_tools_see_child_identity_and_create_grandchildren(
@@ -2893,7 +3798,7 @@ def test_parallel_isolated_tools_emit_each_durable_event_once(tmp_path: Path) ->
     assert not any(event.kind == "call_failed" for event in tool_events)
 
 
-def test_harness_exposes_only_five_operations_and_saves_everything(
+def test_harness_exposes_five_core_operations_plus_run_agent_and_saves_everything(
     tmp_path: Path,
 ) -> None:
     kernel = kernel_at(tmp_path)
@@ -2903,7 +3808,12 @@ def test_harness_exposes_only_five_operations_and_saves_everything(
 
     assert result.answer == "Built and reused hello."
     assert result.turns == 3
-    assert model.tool_names == [CORE_NAMES, CORE_NAMES, CORE_NAMES]
+    assert model.tool_names == [
+        MODEL_ACTION_NAMES,
+        MODEL_ACTION_NAMES,
+        MODEL_ACTION_NAMES,
+    ]
+    assert tuple(tool["name"] for tool in kernel.tool_definitions()) == CORE_NAMES
     kinds = [
         event["kind"]
         for event in kernel.read_session(result.session_id, limit=100)["events"]

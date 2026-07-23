@@ -143,10 +143,10 @@ class _CompletionProvider(Protocol):
         ...
 
 
-def _bind_session_transport(transport: Any, root_session_id: str) -> Any:
-    """Bind an opt-in transport to one root cancellation domain."""
+def _bind_session_transport(transport: Any, session_id: str) -> Any:
+    """Bind an opt-in transport to one conversation cancellation domain."""
     bind = getattr(transport, "for_session", None)
-    return bind(root_session_id) if callable(bind) else transport
+    return bind(session_id) if callable(bind) else transport
 
 
 class ToolModelProvider:
@@ -195,17 +195,24 @@ class ModelProvider:
         self._session_transport_lock = Lock()
         self._session_transports: dict[tuple[int, str], Any] = {}
 
-    def _transport_for_session(self, transport: Any, root_session_id: str) -> Any:
-        """Return one cached transport view per source transport and root."""
+    def _transport_for_session(self, transport: Any, session_id: str) -> Any:
+        """Return one cached transport view per source and conversation."""
         if transport is None:
             return None
-        key = (id(transport), root_session_id)
+        key = (id(transport), session_id)
         with self._session_transport_lock:
             if key not in self._session_transports:
                 self._session_transports[key] = _bind_session_transport(
-                    transport, root_session_id
+                    transport, session_id
                 )
             return self._session_transports[key]
+
+    def _release_session(self, session_id: str) -> None:
+        """Release cached transport views owned by one terminal conversation."""
+        with self._session_transport_lock:
+            keys = [key for key in self._session_transports if key[1] == session_id]
+            for key in keys:
+                self._session_transports.pop(key, None)
 
     @classmethod
     def from_transport(
@@ -281,11 +288,8 @@ class ModelProvider:
             "model_input",
             {"messages": normalized},
         )
-        root_session_id = str(
-            self.kernel.session_metadata(parent_scope.session_id)["root_session_id"]
-        )
         completion_transport = self._transport_for_session(
-            self.completion_transport, root_session_id
+            self.completion_transport, parent_scope.session_id
         )
         complete = (
             getattr(completion_transport, "complete", None)
@@ -330,15 +334,13 @@ class ModelSession:
     def __init__(self, provider: ModelProvider, session_id: str) -> None:
         self.provider = provider
         self.session_id = session_id
-        root_session_id = str(
-            provider.kernel.session_metadata(session_id)["root_session_id"]
-        )
+        self._closed = False
         self._bound_transports: dict[int, Any] = {}
         for transport in (provider.transport, provider.completion_transport):
             if transport is None or id(transport) in self._bound_transports:
                 continue
             self._bound_transports[id(transport)] = provider._transport_for_session(
-                transport, root_session_id
+                transport, session_id
             )
 
     @property
@@ -351,6 +353,18 @@ class ModelSession:
         if transport is None:
             return None
         return self._bound_transports[id(transport)]
+
+    @property
+    def supports_detached_agents(self) -> bool:
+        """Whether this conversation has an isolated cancellation binding."""
+        if not self.provider.allow_tool_agents:
+            return False
+        if not callable(getattr(self.provider.transport, "for_session", None)):
+            return False
+        return all(
+            callable(getattr(self.transport, name, None))
+            for name in ("cancel_current", "reset_cancellation")
+        )
 
     def respond(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -456,7 +470,7 @@ class ModelSession:
         self,
         scope: InvocationScope | None = None,
         *,
-        agent_runner: Callable[[ModelSession, str], str] | None = None,
+        agent_runner: Callable[[InvocationScope, str | None, str], str] | None = None,
     ) -> _BoundedModelProvider:
         active_scope = (
             scope
@@ -493,6 +507,13 @@ class ModelSession:
             if callable(reset):
                 reset()
 
+    def close(self) -> None:
+        """Release provider-side bindings for a terminal conversation."""
+        if self._closed:
+            return
+        self._closed = True
+        self.provider._release_session(self.session_id)
+
 
 class _UnavailableConversationTransport:
     def respond(
@@ -523,7 +544,7 @@ class _SessionCompletionProvider:
         provider: ModelProvider,
         scope: InvocationScope,
         origin_call_id: str | None = None,
-        agent_runner: Callable[[ModelSession, str], str] | None = None,
+        agent_runner: Callable[[InvocationScope, str | None, str], str] | None = None,
     ) -> None:
         self._provider = provider
         self._scope = scope
@@ -560,11 +581,11 @@ class _SessionCompletionProvider:
             raise _error("model_provider_unavailable")
         if not self._provider.allow_tool_agents:
             raise _error("model_provider_unavailable")
-        child = self._provider.start_session(
-            parent_scope=self._scope,
-            origin_call_id=self._origin_call_id,
+        return self._agent_runner(
+            self._scope,
+            self._origin_call_id,
+            prompt,
         )
-        return self._agent_runner(child, prompt)
 
     def cancel_current(self) -> None:
         ModelSession(self._provider, self._scope.session_id).cancel_current()
