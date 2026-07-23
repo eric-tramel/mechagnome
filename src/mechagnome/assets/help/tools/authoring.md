@@ -211,10 +211,11 @@ The capability can raise
 failures are deliberately sanitized, so authored source should not depend on
 provider-specific exception details.
 
-### Running a child agent
+### Foreground agent compatibility
 
-Use `run_agent(prompt)` when the delegated work may need tools or further
-delegation:
+Models normally delegate through their direct host-owned `run_agent` action.
+Authored tools may use `ctx.model_provider.run_agent(prompt)` when a tool needs
+one foreground agent answer before it can return:
 
 ```python
 async def main(input, ctx):
@@ -224,12 +225,13 @@ async def main(input, ctx):
     return {"answer": answer}
 ```
 
-The call is asynchronous and returns the child agent's final text when awaited.
+The call is asynchronous and returns the agent's final text when awaited; it
+does not expose the host action's detached mode.
 Before any model traffic, the provider creates a durable `conversation` session
 parented to the caller's session and attributed to the current tool call. Child
-agents receive the same bounded capability, so a child calling `run_agent()`
-creates a grandchild with the child session as its direct parent. All model and
-tool events are recorded under the session in which they actually occur.
+agents receive the same model action surface, so they can launch further agents
+directly. All model and tool events are recorded under the conversation session
+in which they actually occur.
 
 These failures raise `mechagnome.ToolboxError`; inspect its stable `code` only
 when the tool has a meaningful fallback, and re-raise everything else:

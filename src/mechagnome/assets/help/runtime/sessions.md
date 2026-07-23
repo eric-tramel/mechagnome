@@ -18,9 +18,8 @@ is different: it becomes its own durable child session. A model session bound
 under that child can create grandchildren in the same way.
 
 Sessions have immutable `kind`, `parent_session_id`, and `origin_call_id`
-metadata. Kinds are `generic` for host/tool-only history, `conversation` for a
-multi-turn agent execution (including `await ctx.model_provider.run_agent(...)`
-children), and `completion` for one accepted text-only
+metadata. Kinds are `generic` for host/tool-only history, `conversation` for
+every root or recursively launched agent, and `completion` for one accepted text-only
 `await ctx.model_provider.complete(...)` call. `root_session_id` is derived by
 walking the parent chain rather than stored separately.
 

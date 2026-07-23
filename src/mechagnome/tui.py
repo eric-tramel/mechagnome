@@ -2365,8 +2365,9 @@ class ToolboxApp(App[None]):
             Panel(
                 Markdown(
                     f"**{self._active_model_name}** · {readiness}\n\n"
-                    "Ask for a task. The agent begins with only five core operations "
-                    "and grows the toolbox as needed. Use `/help` for TUI commands."
+                    "Ask for a task. The agent begins with five editable toolbox "
+                    "operations plus run_agent and grows the toolbox as needed. "
+                    "Use `/help` for TUI commands."
                 ),
                 title="mechagnome",
                 border_style="bright_blue",

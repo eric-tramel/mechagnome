@@ -24,14 +24,17 @@
 </p>
 <p align="center"><sub><strong>Reuse tools across sessions.</strong> A fresh conversation calls the persisted tool directly—no regeneration or provider-side magic.</sub></p>
 
-A small proof of a metaprogrammable agent toolbox. The model sees only five
-operations:
+A small proof of a metaprogrammable agent toolbox. The model sees five editable
+toolbox operations:
 
 - `help`
 - `search_tools`
 - `view_tool`
 - `write_tool`
 - `call_tool`
+
+It also sees the host-owned `run_agent` action. Every agent session—root or
+recursively launched—receives this same six-action surface.
 
 It begins with no user-authored tools. During a session, an agent can write a
 Python tool, call it immediately, find it again later, compose it from other
@@ -276,19 +279,21 @@ eight attempts; requests and responses are size-bounded. Every accepted call
 implicitly creates a logged `completion` session whose parent is the tool's
 current session and whose origin is the actual nested tool call ID.
 
-For tool-capable delegation,
-`await ctx.model_provider.run_agent(prompt)` runs a full child agent and returns
-its final text. The provider implicitly creates a logged `conversation` child
-first. That agent receives the same capability, so further delegation produces
-a correctly parented session chain.
+Agents delegate directly with `run_agent({"prompt": "..."})`. The provider
+creates a logged `conversation` child first, and that agent receives the same
+actions, so delegation can recurse without a separate subagent capability set.
+Set `detach=true` to receive a process-lifetime child-session `job_id`, continue
+other work, and inspect that ID through `run_agent` later. Existing authored
+tools may still use `await ctx.model_provider.run_agent(prompt)` as a
+foreground-only compatibility API.
 
 ## Model adapter boundary
 
 The TUI wraps the bundled streaming `OpenRouterModel` in a host-owned
 `ModelProvider`. The provider creates/binds durable sessions and is the sole
 route from the harness to raw model transport. A transport adapter receives the
-accumulated messages and the same five operation definitions on every turn,
-then returns a `ModelTurn`:
+accumulated messages and the same five editable operation definitions plus the
+host `run_agent` definition on every turn, then returns a `ModelTurn`:
 
 ```python
 from mechagnome import Harness, Kernel, ModelProvider, ModelTurn, ToolCall
@@ -327,9 +332,9 @@ provider-reported native-tokenizer total. For OpenRouter models, the TUI compare
 that snapshot with the catalog's `context_length` and shows the percentage of
 context remaining; the indicator stays hidden when either value is unavailable.
 
-The harness rejects model calls outside the five-operation surface. Dynamic
-tools never need to be registered with the inference provider; they are reached
-through the stable `call_tool(name, args, version=None)` envelope.
+The harness rejects calls outside its six model actions. Dynamic tools never
+need to be registered with the inference provider; they are reached through the
+stable `call_tool(name, args, version=None)` envelope.
 
 Long-running top-level calls can be detached with
 `{"name": "tool", "args": {}, "detach": true}`. The immediate response is a
@@ -350,10 +355,21 @@ background job itself still executes one ordinary call through the active,
 editable `call_tool` dispatcher. Authored `ctx.call_tool` calls are awaited
 foreground calls and cannot request host detachment.
 
+Agent runs share a 16-active foreground limit and a cumulative 64-launch budget
+across each top-level rollout and all of its recursive descendants. They also
+have a separate detached pool with the same four-running and 64-terminal
+retention limits. Start one with
+`{"prompt": "...", "detach": true}` and inspect it with
+`{"job_id": "..."}`. The job ID is the durable child conversation ID. A
+successful inspection includes its final text as `result`; a failure includes a
+structured `error`. The creator conversation and its ancestors may inspect the
+handle, while unrelated and sibling sessions may not. Foreground cancellation
+does not stop detached agents; `Harness.close()` does.
+
 ## Metacircular core
 
-The outer names and schemas of the five operations are pinned so a provider can
-keep one stable tool surface. Their version 1 descriptions, source, and behavior
+The outer names and schemas of the five editable operations are pinned so a
+provider can keep one stable toolbox surface. Their version 1 descriptions, source, and behavior
 are code-shipped defaults refreshed from the installed library at startup.
 Persisted version 2 and later implementations can override those defaults like
 any other tool version. Privilege comes from the logical core slot being invoked:
