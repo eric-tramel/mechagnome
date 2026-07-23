@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import signal
 import sys
 import threading
 import time
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from PIL import Image as PILImage
 from rich.console import Console
 from rich.markup import render as render_markup
 from rich.syntax import Syntax
@@ -28,6 +30,7 @@ from textual.widgets import (
     Static,
     TabbedContent,
 )
+from textual_image.widget import Image as TerminalImage
 
 from mechagnome import (
     Harness,
@@ -41,6 +44,7 @@ from mechagnome import (
 )
 from mechagnome import __main__ as cli
 from mechagnome import openrouter as openrouter_module
+from mechagnome import tui as tui_module
 from mechagnome.harness import AgentEvent
 from mechagnome.isolation import IsolatedToolRunner
 from mechagnome.openrouter import (
@@ -3732,6 +3736,153 @@ def test_tool_argument_summary_is_single_line_and_truncated() -> None:
     )
     assert unsafe == ' [que\\n\\u001bry="value", \\u009b="x"]'
     assert all(character.isprintable() for character in unsafe)
+
+
+def test_tui_displays_images_embedded_in_tool_responses(tmp_path: Path) -> None:
+    image_bytes = BytesIO()
+    PILImage.new("RGB", (2, 1), "red").save(image_bytes, format="PNG")
+    encoded = base64.b64encode(image_bytes.getvalue()).decode()
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"), FinalModel(), model_name="test/model"
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._display_event(
+                app.active_session,
+                AgentEvent(
+                    "call_succeeded",
+                    {
+                        "result": {
+                            "content": [
+                                {"type": "text", "text": "captured"},
+                                {
+                                    "type": "image",
+                                    "data": encoded,
+                                    "mimeType": "image/png",
+                                },
+                                {
+                                    "type": "image",
+                                    "data": "not base64",
+                                    "mimeType": "image/png",
+                                },
+                            ]
+                        },
+                        "duration_ms": 1.0,
+                    },
+                    1,
+                    call_id="capture",
+                    tool_name="capture_screen",
+                ),
+            )
+            await pilot.pause()
+
+            images = list(app.query(TerminalImage))
+            assert len(images) == 1
+            assert images[0].image.size == (2, 1)
+            event = app.query_one(ToolEvent)
+            assert encoded not in event.detail
+            assert "<image/png data omitted>" in event.detail
+
+            app._display_detached_event(
+                app.active_session,
+                AgentEvent(
+                    "detached_finished",
+                    {
+                        "job_id": "detached-capture",
+                        "name": "background_capture",
+                        "args": {},
+                        "status": "succeeded",
+                        "output_tail": "",
+                        "truncated": False,
+                        "result": {
+                            "type": "image",
+                            "data": encoded,
+                            "mimeType": "image/png",
+                        },
+                    },
+                    None,
+                ),
+            )
+            await pilot.pause()
+
+            assert len(list(app.query(TerminalImage))) == 2
+            detached = next(
+                item
+                for item in app.query(ToolEvent)
+                if item.tool_name == "background_capture"
+            )
+            assert encoded not in detached.detail
+            assert "<image/png data omitted>" in detached.detail
+
+    asyncio.run(exercise())
+
+
+def test_tool_image_decoder_enforces_resource_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block = {"type": "image", "data": "AAAA", "mimeType": "image/png"}
+    with monkeypatch.context() as scoped:
+        scoped.setattr(tui_module, "MAX_TOOL_IMAGE_BYTES", 2)
+        assert tui_module._decode_tool_image(block) is None
+
+    class OversizedImage:
+        width = tui_module.MAX_TOOL_IMAGE_PIXELS + 1
+        height = 1
+
+        def __enter__(self) -> OversizedImage:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def load(self) -> None:
+            raise AssertionError("oversized images must be rejected before loading")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(PILImage, "open", lambda _stream: OversizedImage())
+        assert tui_module._decode_tool_image(block) is None
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            PILImage,
+            "open",
+            lambda _stream: (_ for _ in ()).throw(
+                PILImage.DecompressionBombError("oversized")
+            ),
+        )
+        assert tui_module._decode_tool_image(block) is None
+
+
+def test_tool_image_extraction_limits_images_per_result() -> None:
+    image_bytes = BytesIO()
+    PILImage.new("RGB", (1, 1), "blue").save(image_bytes, format="PNG")
+    block = {
+        "type": "image",
+        "data": base64.b64encode(image_bytes.getvalue()).decode(),
+        "mimeType": "image/png",
+    }
+
+    images = tui_module._tool_images([block] * (tui_module.MAX_TOOL_IMAGES + 1))
+
+    assert len(images) == tui_module.MAX_TOOL_IMAGES
+
+
+def test_tool_image_extraction_enforces_aggregate_pixel_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_bytes = BytesIO()
+    PILImage.new("RGB", (2, 2), "green").save(image_bytes, format="PNG")
+    block = {
+        "type": "image",
+        "data": base64.b64encode(image_bytes.getvalue()).decode(),
+        "mimeType": "image/png",
+    }
+    monkeypatch.setattr(tui_module, "MAX_TOOL_IMAGE_TOTAL_PIXELS", 4)
+
+    images = tui_module._tool_images([block, block])
+
+    assert len(images) == 1
 
 
 class SingleToolModel:
