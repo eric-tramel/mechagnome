@@ -7,6 +7,7 @@ import binascii
 import difflib
 import json
 import math
+import re
 import shlex
 import warnings
 from dataclasses import dataclass, field
@@ -57,6 +58,12 @@ MAX_TOOL_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TOOL_IMAGE_PIXELS = 16 * 1024 * 1024
 MAX_TOOL_IMAGE_TOTAL_PIXELS = MAX_TOOL_IMAGE_PIXELS
 MAX_TOOL_IMAGES = 8
+MAX_TOOL_IMAGE_CONTAINER_CHARS = 16 * 1024 * 1024
+TOOL_IMAGE_MARKDOWN_PATTERN = re.compile(
+    r"!\[(?P<alt>[^\]\r\n]*)\]\("
+    r"(?P<uri>data:(?P<mime>image/[A-Za-z0-9.+-]+);base64,"
+    r"[A-Za-z0-9+/]+={0,2})\)"
+)
 
 
 def _format_duration(value: Any) -> str:
@@ -135,6 +142,20 @@ def _decode_tool_image(
         return None
 
 
+def _structured_tool_string(value: Any) -> dict[str, Any] | list[Any] | None:
+    """Decode a JSON-stringified structured result without parsing arbitrary text."""
+    if not isinstance(value, str) or len(value) > MAX_TOOL_IMAGE_CONTAINER_CHARS:
+        return None
+    stripped = value.strip()
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        decoded = json.loads(stripped)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    return decoded if isinstance(decoded, (dict, list)) else None
+
+
 def _tool_images(value: Any) -> tuple[PILImage.Image, ...]:
     """Find valid image content blocks anywhere in a JSON tool result."""
     images: list[PILImage.Image] = []
@@ -149,6 +170,23 @@ def _tool_images(value: Any) -> tuple[PILImage.Image, ...]:
         if decoded is not None:
             images.append(decoded)
             total_pixels += decoded.width * decoded.height
+        elif structured := _structured_tool_string(item):
+            pending.append(structured)
+        elif isinstance(item, str) and len(item) <= MAX_TOOL_IMAGE_CONTAINER_CHARS:
+            for match in TOOL_IMAGE_MARKDOWN_PATTERN.finditer(item):
+                decoded = _decode_tool_image(
+                    {
+                        "type": "image",
+                        "data": match.group("uri"),
+                        "mimeType": match.group("mime"),
+                    },
+                    max_pixels=MAX_TOOL_IMAGE_TOTAL_PIXELS - total_pixels,
+                )
+                if decoded is not None:
+                    images.append(decoded)
+                    total_pixels += decoded.width * decoded.height
+                    if len(images) >= MAX_TOOL_IMAGES:
+                        break
         elif isinstance(item, dict):
             pending.extend(reversed(tuple(item.values())))
         elif isinstance(item, list):
@@ -166,6 +204,17 @@ def _summarize_tool_images(value: Any) -> Any:
         return summarized
     if isinstance(value, list):
         return [_summarize_tool_images(item) for item in value]
+    if structured := _structured_tool_string(value):
+        return _summarize_tool_images(structured)
+    if isinstance(value, str):
+        if len(value) > MAX_TOOL_IMAGE_CONTAINER_CHARS:
+            return "<tool response omitted: exceeds image container limit>"
+        return TOOL_IMAGE_MARKDOWN_PATTERN.sub(
+            lambda match: (
+                f"![{match.group('alt')}](<{match.group('mime')} data omitted>)"
+            ),
+            value,
+        )
     return value
 
 
