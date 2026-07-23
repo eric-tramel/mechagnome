@@ -102,7 +102,7 @@ def test_bounded_provider_validates_normalizes_and_counts_attempts() -> None:
     assert len(provider.messages) == MAX_MODEL_CALLS - len(invalid_messages)
 
 
-def test_model_and_completion_transports_bind_to_the_durable_root(
+def test_model_and_completion_transports_bind_to_the_conversation_session(
     tmp_path: Path,
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
@@ -111,19 +111,19 @@ def test_model_and_completion_transports_bind_to_the_durable_root(
     root = provider.start_session()
     child = provider.start_session(parent_scope=kernel.snapshot_scope(root.session_id))
 
-    assert child.transport.respond([], []).text == root.session_id
+    assert child.transport.respond([], []).text == child.session_id
     completion = child.completion_provider()
     assert completion.complete([{"role": "user", "content": "hello"}]) == (
-        root.session_id
+        child.session_id
     )
 
     child.cancel_current()
     child.reset_cancellation()
 
-    assert transport.completed_keys == [root.session_id]
-    assert transport.cancelled_keys == [root.session_id]
-    assert transport.reset_keys == [root.session_id]
-    assert transport.bound_keys == [root.session_id]
+    assert transport.completed_keys == [child.session_id]
+    assert transport.cancelled_keys == [child.session_id]
+    assert transport.reset_keys == [child.session_id]
+    assert transport.bound_keys == [root.session_id, child.session_id]
 
 
 def test_bounded_provider_sanitizes_failures_and_enforces_result_limit() -> None:

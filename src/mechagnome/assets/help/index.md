@@ -1,7 +1,9 @@
 # Mechagnome help
 
-Mechagnome begins with five core operations and no domain-specific user tools.
-Use these topics as you grow and reuse the toolbox:
+Mechagnome begins with five editable core operations, the host-owned
+`run_agent` action, and no domain-specific user tools. Every recursively launched
+agent receives the same actions. Use these topics as you grow and reuse the
+toolbox:
 
 - `quickstart` — the write/call loop
 - `authoring` — the Python tool ABI

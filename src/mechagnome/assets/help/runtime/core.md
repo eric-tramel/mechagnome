@@ -15,6 +15,35 @@ for example, does not grant catalog access.
 
 A host-only rollback command can recover a broken core binding.
 
+## Agent action
+
+`run_agent` is a host action rather than an editable core tool. Every root,
+child, and grandchild conversation receives it alongside the five operations
+above. Run another full agent in the foreground with:
+
+```json
+{"prompt": "Investigate the failing tests and summarize the cause."}
+```
+
+Set `detach` when the agent should continue independently:
+
+```json
+{"prompt": "Run the long analysis and return the result.", "detach": true}
+```
+
+The immediate response is `{"job_id": "...", "status": "running"}`. The job
+ID is the child conversation's durable session ID. Inspect it later through the
+same action with `{"job_id": "..."}`. Successful terminal snapshots include
+`result`; failures include a structured `error`.
+
+Foreground agents share a 16-active limit. Each top-level rollout and all of
+its recursive descendants also share a cumulative 64-agent launch budget.
+Detached agents use a separate four-job pool, retain the latest 64 terminal
+handles, and retain at most 1 MiB per answer. The creator or any ancestor
+conversation may inspect a handle. Foreground cancellation does not stop a
+detached agent; application or `Harness` shutdown does. Detached mode requires
+a provider that can isolate cancellation per conversation session.
+
 ## Detached `call_tool` jobs
 
 The model-facing `call_tool` operation can return before a long-running tool

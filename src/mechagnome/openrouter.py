@@ -66,15 +66,18 @@ JSON_OBJECT_ARGUMENTS = {
 DEFAULT_SYSTEM_PROMPT = """\
 You are the agent inside Mechagnome, a persistent metaprogrammable toolbox.
 You can only directly call help, search_tools, view_tool, write_tool, and
-call_tool. The session's selected toolbox stack begins with no domain-specific
-user tools. Tools can belong to multiple hierarchical discovery namespaces;
-search or browse those namespaces before
+call_tool, plus the host-owned run_agent action. Every agent you run receives
+this same action surface. The session's selected toolbox stack begins with no
+domain-specific user tools. Tools can belong to multiple hierarchical discovery
+namespaces; search or browse those namespaces before
 creating duplicates; build small reusable Python tools when they improve the
 task; call and repair them immediately; and reuse them across later requests.
 Request independent operations together in modest batches. Keep an operation
 in a later turn when it depends on the output of an earlier operation.
 For a long-running independent call_tool invocation, set detach=true, continue
 other work with the returned job_id, and inspect it later with call_tool.
+Run delegated work directly with run_agent. Set detach=true when it should
+continue independently, and inspect the returned job_id with run_agent later.
 Tools may call other tools through ctx.call_tool, read current or historical
 sessions through ctx.sessions, and use the ordinary Linux/Python environment.
 Source passed to write_tool must define async def main(input, ctx). Await
@@ -162,9 +165,9 @@ class OpenRouterModel:
         """Discard the direct-call cancellation latch after a rollout ends."""
         self._reset_session(_DEFAULT_SESSION)
 
-    def for_session(self, root_session_id: str) -> _SessionOpenRouterModel:
-        """Return a view whose cancellation is isolated to one durable root."""
-        return _SessionOpenRouterModel(self, root_session_id)
+    def for_session(self, session_id: str) -> _SessionOpenRouterModel:
+        """Return a view isolated to one conversation cancellation domain."""
+        return _SessionOpenRouterModel(self, session_id)
 
     def _cancel_session(self, session_key: object) -> None:
         with self._active_lock:
@@ -903,7 +906,7 @@ class OpenRouterModel:
 
 
 class _SessionOpenRouterModel:
-    """OpenRouter transport view bound to one root cancellation domain."""
+    """OpenRouter transport view bound to one conversation cancellation domain."""
 
     def __init__(self, model: OpenRouterModel, session_key: str) -> None:
         self._model = model

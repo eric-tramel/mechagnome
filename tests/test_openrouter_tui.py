@@ -3353,6 +3353,44 @@ def test_detached_terminal_snapshot_marks_local_tail_truncation(
             app._reset_session_ui(state)
             assert "job-2" not in state.ignored_detached_jobs
 
+            app._display_detached_event(
+                state,
+                AgentEvent(
+                    "detached_started",
+                    {
+                        "job_id": "agent-job",
+                        "job_kind": "agent",
+                        "name": "run_agent",
+                        "args": {"prompt": "investigate"},
+                        "status": "running",
+                        "output_tail": "",
+                        "truncated": False,
+                    },
+                    None,
+                ),
+            )
+            agent_row = state.detached_tool_events["agent-job"]
+            assert agent_row.tool_name == "run_agent"
+            app._display_detached_event(
+                state,
+                AgentEvent(
+                    "detached_finished",
+                    {
+                        "job_id": "agent-job",
+                        "job_kind": "agent",
+                        "name": "run_agent",
+                        "args": {"prompt": "investigate"},
+                        "status": "succeeded",
+                        "output_tail": "",
+                        "truncated": False,
+                        "result": "done",
+                    },
+                    None,
+                ),
+            )
+            assert agent_row.processing is False
+            assert "done" in agent_row.detail
+
     asyncio.run(exercise())
 
 
