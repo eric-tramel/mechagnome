@@ -3856,6 +3856,43 @@ def test_tui_displays_images_embedded_in_tool_responses(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_tui_displays_images_from_string_tool_responses(tmp_path: Path) -> None:
+    image_bytes = BytesIO()
+    PILImage.new("RGB", (2, 1), "purple").save(image_bytes, format="PNG")
+    encoded = base64.b64encode(image_bytes.getvalue()).decode()
+    image_block = {"type": "image", "data": encoded, "mimeType": "image/png"}
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db"), FinalModel(), model_name="test/model"
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            for index, result in enumerate(
+                (json.dumps(image_block), f"![](data:image/png;base64,{encoded})")
+            ):
+                app._display_event(
+                    app.active_session,
+                    AgentEvent(
+                        "call_succeeded",
+                        {"result": result, "duration_ms": 1.0},
+                        index + 1,
+                        call_id=f"capture-{index}",
+                        tool_name="capture_screen",
+                    ),
+                )
+            await pilot.pause()
+
+            images = list(app.query(TerminalImage))
+            assert len(images) == 2
+            assert all(image.image.size == (2, 1) for image in images)
+            events = list(app.query(ToolEvent))
+            assert len(events) == 2
+            assert all(encoded not in event.detail for event in events)
+            assert all("<image/png data omitted>" in event.detail for event in events)
+
+    asyncio.run(exercise())
+
+
 def test_tool_image_decoder_enforces_resource_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3904,6 +3941,46 @@ def test_tool_image_extraction_limits_images_per_result() -> None:
     images = tui_module._tool_images([block] * (tui_module.MAX_TOOL_IMAGES + 1))
 
     assert len(images) == tui_module.MAX_TOOL_IMAGES
+
+
+def test_markdown_image_extraction_stops_at_image_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_bytes = BytesIO()
+    PILImage.new("RGB", (1, 1), "orange").save(image_bytes, format="PNG")
+    encoded = base64.b64encode(image_bytes.getvalue()).decode()
+
+    class Match:
+        def group(self, name: str) -> str:
+            return {
+                "uri": f"data:image/png;base64,{encoded}",
+                "mime": "image/png",
+            }[name]
+
+    class Pattern:
+        def finditer(self, _value: str) -> Any:
+            for _ in range(tui_module.MAX_TOOL_IMAGES):
+                yield Match()
+            raise AssertionError("image discovery must stop at the image limit")
+
+    monkeypatch.setattr(tui_module, "TOOL_IMAGE_MARKDOWN_PATTERN", Pattern())
+
+    images = tui_module._tool_images("markdown result")
+
+    assert len(images) == tui_module.MAX_TOOL_IMAGES
+
+
+def test_markdown_image_extraction_respects_container_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Pattern:
+        def finditer(self, _value: str) -> Any:
+            raise AssertionError("oversized containers must not be scanned")
+
+    monkeypatch.setattr(tui_module, "MAX_TOOL_IMAGE_CONTAINER_CHARS", 4)
+    monkeypatch.setattr(tui_module, "TOOL_IMAGE_MARKDOWN_PATTERN", Pattern())
+
+    assert tui_module._tool_images("oversized") == ()
 
 
 def test_tool_image_extraction_enforces_aggregate_pixel_budget(
