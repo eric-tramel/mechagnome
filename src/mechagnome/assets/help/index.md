@@ -7,7 +7,8 @@ Use these topics as you grow and reuse the toolbox:
 - `authoring` — the Python tool ABI
 - `composition` — tools calling tools
 - `sessions` — current and historical event access
-- `namespaces` — ordered session toolbox composition
+- `namespaces` — hierarchical tool discovery and organization
+- `toolboxes` — ordered session toolbox composition and cwd routing
 - `versioning` — immutable versions, activation, and rollback
 - `core` — editing the five base operations
 

@@ -445,7 +445,7 @@ class DeleteToolScreen(ModalScreen[bool]):
 
 
 class NamespaceNameScreen(ModalScreen[str | None]):
-    """Collect a namespace name for Blank or Save as."""
+    """Collect a toolbox name for Blank or Save as."""
 
     CSS = """
     NamespaceNameScreen {
@@ -895,7 +895,7 @@ class ToolManagerScreen(Screen[None]):
         yield Header(show_clock=True)
         with Vertical(id="tool-manager"):
             with Horizontal(id="namespace-toolbar"):
-                yield Static("NAMESPACE", id="namespace-label")
+                yield Static("TOOLBOX", id="namespace-label")
                 yield Select(
                     self._namespace_options(),
                     value=self.selected_namespace,
@@ -946,17 +946,17 @@ class ToolManagerScreen(Screen[None]):
         try:
             self.kernel.select_toolboxes(self.session_id, [name], mode="use")
         except Exception as error:
-            self._status(f"Namespace change failed: {error}")
+            self._status(f"Toolbox change failed: {error}")
             self.query_one("#namespace-picker", Select).value = self.selected_namespace
             return
         self.selected_namespace = name
-        self._refresh_after_namespace_change(f"Switched to namespace {name}.")
+        self._refresh_after_namespace_change(f"Switched to toolbox {name}.")
 
     @on(Button.Pressed, "#blank-namespace")
     def blank_namespace(self) -> None:
         self.app.push_screen(
             NamespaceNameScreen(
-                title="Create a blank namespace",
+                title="Create a blank toolbox",
                 action_label="Create",
             ),
             self._finish_blank_namespace,
@@ -966,7 +966,7 @@ class ToolManagerScreen(Screen[None]):
     def save_as_namespace(self) -> None:
         self.app.push_screen(
             NamespaceNameScreen(
-                title=f"Rename namespace {self.selected_namespace!r}",
+                title=f"Rename toolbox {self.selected_namespace!r}",
                 action_label="Save as",
                 initial_name=self.selected_namespace,
             ),
@@ -980,16 +980,16 @@ class ToolManagerScreen(Screen[None]):
             self.kernel.create_toolbox(name)
             self.kernel.select_toolboxes(self.session_id, [name], mode="use")
         except Exception as error:
-            self._status(f"Blank namespace failed: {error}")
+            self._status(f"Blank toolbox failed: {error}")
             return
         self.selected_namespace = name
-        self._refresh_after_namespace_change(f"Created blank namespace {name}.")
+        self._refresh_after_namespace_change(f"Created blank toolbox {name}.")
 
     def _finish_save_as_namespace(self, name: str | None) -> None:
         if name is None:
             return
         if name == self.selected_namespace:
-            self._status("Namespace name unchanged.")
+            self._status("Toolbox name unchanged.")
             return
         old_name = self.selected_namespace
         try:
@@ -998,7 +998,7 @@ class ToolManagerScreen(Screen[None]):
             self._status(f"Save as failed: {error}")
             return
         self.selected_namespace = name
-        self._refresh_after_namespace_change(f"Renamed namespace {old_name} to {name}.")
+        self._refresh_after_namespace_change(f"Renamed toolbox {old_name} to {name}.")
 
     @on(Select.Changed, "#tool-picker")
     def select_tool(self, event: Select.Changed) -> None:
@@ -1151,6 +1151,10 @@ class ToolManagerScreen(Screen[None]):
         summary.append(self.selected_name, style="bold cyan")
         summary.append(
             f"  ·  {self.history['kind']}  ·  {self.history['toolbox']}  ·  {state}\n"
+        )
+        summary.append(
+            "namespaces: " + ", ".join(self.history["namespaces"]) + "\n",
+            style="dim",
         )
         summary.append(str(version["description"]))
         summary.append(
@@ -2055,7 +2059,7 @@ class ToolboxApp(App[None]):
                 "primary" if active and active["primary"] else "yes" if active else ""
             )
             table.add_row(toolbox["name"], marker, str(toolbox["cwd"] or "—"))
-        self.chat.write(Panel(table, title="toolbox namespaces", border_style="blue"))
+        self.chat.write(Panel(table, title="toolboxes", border_style="blue"))
 
     async def action_new_session(self) -> None:
         """Open and activate a fresh model conversation in a new tab."""
@@ -2210,8 +2214,8 @@ class ToolboxApp(App[None]):
                     "- `/clear` — reset the active tab with a fresh session\n"
                     "- `/end` — close the active session tab\n"
                     "- `/tools` or `Ctrl+T` — toggle tool management\n"
-                    "- `/toolbox list` — list namespaces and active order\n"
-                    "- `/toolbox create NAME [CWD]` — create a namespace\n"
+                    "- `/toolbox list` — list toolboxes and active order\n"
+                    "- `/toolbox create NAME [CWD]` — create a toolbox\n"
                     "- `/toolbox use|add|remove NAME...` — change this session\n"
                     "- `/toolbox default` — restore the session cwd default\n"
                     "- `/sessions` — list saved sessions\n"

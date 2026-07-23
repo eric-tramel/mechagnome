@@ -55,6 +55,28 @@ example above, a useful schema is:
 }
 ```
 
+## Discovery namespaces
+
+The optional `namespaces` array assigns a tool to one or more hierarchical
+discovery paths inside its toolbox:
+
+```json
+{
+  "name": "summarize_python",
+  "description": "Summarize Python source.",
+  "input_schema": {"type": "object"},
+  "source": "async def main(input, ctx):\n    return input['source']\n",
+  "namespaces": ["development/python", "analysis/source"]
+}
+```
+
+Omitting `namespaces` preserves an existing tool's assignments. A new user tool
+without explicit assignments starts in `uncategorized`. To reorganize an active
+tool without creating a source version, call `write_tool` with only its `name`
+and a nonempty `namespaces` array. Namespace paths are current lineage metadata,
+not immutable per-version data. Use `search_tools` with an empty query and a
+`namespace` filter to browse an exact path and its descendants.
+
 `main` may return any JSON-serializable value: an object, array, string, finite
 number, boolean, or `None`. Do not return Python-only values such as `Path`,
 `set`, bytes, generators, exceptions, or a context object. An unhandled
@@ -369,7 +391,7 @@ logical slot, not the source text.
 
 Imports, filesystem access, network clients, and subprocesses are ordinary
 Python capabilities. Relative paths resolve from the durable session's launch
-working directory; selecting another toolbox namespace does not change it.
+working directory; selecting another toolbox does not change it.
 Persist durable tool state explicitly in a suitable file or service rather than
 in module globals, and account for concurrent calls when updating shared state.
 

@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from textwrap import dedent
 from typing import Any
 
+NAMESPACE_PATH_MAX = 255
+NAMESPACE_PATH_PATTERN = (
+    r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"
+    r"(?:/[A-Za-z0-9_][A-Za-z0-9_.-]{0,63})*$"
+)
+
 
 @dataclass(frozen=True)
 class BootstrapTool:
@@ -30,6 +36,11 @@ SEARCH_SCHEMA = {
     "properties": {
         "query": {"type": "string"},
         "include_core": {"type": "boolean"},
+        "namespace": {
+            "type": "string",
+            "maxLength": NAMESPACE_PATH_MAX,
+            "pattern": NAMESPACE_PATH_PATTERN,
+        },
         "cursor": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 50},
     },
@@ -61,8 +72,30 @@ WRITE_SCHEMA = {
             ),
         },
         "base_version": {"type": "integer", "minimum": 1},
+        "namespaces": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "string",
+                "maxLength": NAMESPACE_PATH_MAX,
+                "pattern": NAMESPACE_PATH_PATTERN,
+            },
+        },
     },
-    "required": ["name", "description", "input_schema", "source"],
+    "required": ["name"],
+    "oneOf": [
+        {"required": ["description", "input_schema", "source"]},
+        {
+            "required": ["namespaces"],
+            "not": {
+                "anyOf": [
+                    {"required": ["description"]},
+                    {"required": ["input_schema"]},
+                    {"required": ["source"]},
+                ]
+            },
+        },
+    ],
     "additionalProperties": False,
 }
 
@@ -92,6 +125,7 @@ HELP_SOURCE = dedent(
         "composition": "tools/composition.md",
         "sessions": "runtime/sessions.md",
         "namespaces": "runtime/namespaces.md",
+        "toolboxes": "runtime/toolboxes.md",
         "versioning": "runtime/versioning.md",
         "core": "runtime/core.md",
     }
@@ -122,6 +156,7 @@ SEARCH_SOURCE = dedent(
 
     FIELD_WEIGHTS = (
         ("name", 8.0),
+        ("namespaces", 6.0),
         ("description", 4.0),
         ("input_schema", 2.0),
         ("source", 1.0),
@@ -176,7 +211,10 @@ SEARCH_SOURCE = dedent(
         include_core = input.get("include_core", True)
         cursor = max(0, input.get("cursor", 0))
         limit = min(50, max(1, input.get("limit", 10)))
-        tools = ctx.kernel.catalog(include_core=include_core)
+        tools = ctx.kernel.catalog(
+            include_core=include_core,
+            namespace=input.get("namespace"),
+        )
         query_tokens = _tokens(query)
 
         if not query_tokens:
@@ -184,7 +222,11 @@ SEARCH_SOURCE = dedent(
             next_cursor = cursor + limit if cursor + limit < len(items) else None
             return {
                 "items": [
-                    {"name": tool["name"], "description": tool["description"]}
+                    {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "namespaces": tool["namespaces"],
+                    }
                     for tool in items[cursor:cursor + limit]
                 ],
                 "next_cursor": next_cursor,
@@ -207,7 +249,11 @@ SEARCH_SOURCE = dedent(
         next_cursor = cursor + limit if cursor + limit < len(items) else None
         return {
             "items": [
-                {"name": tool["name"], "description": tool["description"]}
+                {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "namespaces": tool["namespaces"],
+                }
                 for tool in items[cursor:cursor + limit]
             ],
             "next_cursor": next_cursor,
@@ -229,15 +275,16 @@ VIEW_SOURCE = dedent(
 
 WRITE_SOURCE = dedent(
     '''\
-    """Compile, store, and activate an immutable tool version."""
+    """Create tool versions or replace hierarchical namespace assignments."""
 
     async def main(input, ctx):
         return ctx.kernel.write_tool(
             name=input["name"],
-            description=input["description"],
-            input_schema=input["input_schema"],
-            source=input["source"],
+            description=input.get("description"),
+            input_schema=input.get("input_schema"),
+            source=input.get("source"),
             base_version=input.get("base_version"),
+            namespaces=input.get("namespaces"),
         )
     '''
 )
@@ -263,7 +310,7 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "search_tools",
-        "Search active tools, returning names and descriptions.",
+        "Search or browse active tools by metadata and hierarchical namespace.",
         SEARCH_SCHEMA,
         SEARCH_SOURCE,
     ),
@@ -275,7 +322,7 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "write_tool",
-        "Create and activate an immutable async Python tool version.",
+        "Create tool versions or replace hierarchical namespace assignments.",
         WRITE_SCHEMA,
         WRITE_SOURCE,
     ),

@@ -38,12 +38,12 @@ Python tool, call it immediately, find it again later, compose it from other
 tools, and inspect current or historical sessions. The five core operations are
 also readable and replaceable through `write_tool`; their code-shipped version 1
 defaults track the installed library, while persisted version 2 and later
-implementations are immutable. Tools live in named toolbox namespaces. Each
-session starts from the toolbox mapped to its working directory and can replace
-or compose its active namespaces without changing the provider-facing five-tool
-surface. Search results expose only each matching tool's name and description,
-while the tool manager summarizes passive call, outcome, duration, and session
-metrics.
+implementations are immutable. Each working directory has a default toolbox,
+and sessions may compose an ordered toolbox stack without changing the
+provider-facing five-tool surface. Inside a toolbox, tools belong to one or more
+hierarchical discovery namespaces such as `development/python`. Search results
+expose those namespaces alongside each matching tool, while the tool manager
+summarizes passive call, outcome, duration, and session metrics.
 
 The fixed part is deliberately small: SQLite storage, version resolution,
 execution, event append, recursion limits, binding changes, and host rollback.
@@ -63,9 +63,9 @@ That opens the terminal UI with `z-ai/glm-5.2` as the default model. Responses
 appear incrementally as OpenRouter streams them; fragmented tool calls are
 assembled before execution. The main pane is the saved multi-turn conversation,
 and the sidebar updates as the agent creates or replaces tools. State defaults to
-`~/.local/share/mechagnome/toolbox.db`, which holds the namespace registry,
-tools, and sessions. A fresh working directory receives its own default
-namespace; an existing session retains its saved ordered selection when resumed.
+`~/.local/share/mechagnome/toolbox.db`, which holds toolbox routing, namespace
+assignments, tools, and sessions. A fresh working directory receives its own
+default toolbox; an existing session retains its saved ordered stack when resumed.
 Databases upgraded from the original global-toolbox schema retain a `legacy`
 fallback for unmapped directories until an explicit cwd default is configured.
 Click the model name in the status bar to switch among tool-capable OpenRouter
@@ -86,15 +86,15 @@ TUI commands:
   creation provenance, per-version call outcomes, and calling sessions. User
   tools can be deleted from the active toolbox after confirmation; source,
   versions, usage, and session history remain available for audit. The
-  namespace controls switch the session to a registered namespace, create a new
-  blank namespace, or rename the current namespace with **Save as…**.
-- `/toolbox list` shows registered namespaces and the current selection.
-- `/toolbox create NAME [CWD]` creates an independently versioned namespace and
+  toolbox controls switch the session to a registered toolbox, create a new
+  blank toolbox, or rename the current toolbox with **Save as…**.
+- `/toolbox list` shows registered toolboxes and the current selection.
+- `/toolbox create NAME [CWD]` creates an independently versioned toolbox and
   maps the supplied (or current) cwd to it.
 - `/toolbox use NAME...` replaces this session's ordered selection.
-- `/toolbox add NAME...` appends namespaces to the selection; `/toolbox remove
+- `/toolbox add NAME...` appends toolboxes to the selection; `/toolbox remove
   NAME...` deselects them.
-- `/toolbox default` restores the namespace mapped to the session launch cwd;
+- `/toolbox default` restores the toolbox mapped to the session launch cwd;
   `/toolbox set-default NAME [CWD]` changes a cwd mapping.
 - Bare `/toolbox` remains an alias for the tool manager.
 - `/sessions` lists saved sessions.
@@ -149,7 +149,7 @@ uv run mechagnome --db .toolbox/demo.db rollback search_tools 1
 uv run mechagnome --db .toolbox/demo.db rollback call_tool 1
 ```
 
-Namespace registry operations are also available without launching the TUI:
+Toolbox registry operations are also available without launching the TUI:
 
 ```bash
 uv run mechagnome toolboxes list
@@ -158,16 +158,16 @@ uv run mechagnome bindings --toolbox research
 uv run mechagnome rollback search_tools 1 --toolbox research
 ```
 
-## Toolbox namespaces
+## Toolboxes and namespaces
 
-A session stores an ordered, nonempty list of toolbox IDs. Unqualified lookup
+A session stores an ordered, nonempty stack of toolbox IDs. Unqualified lookup
 uses deterministic first-wins precedence, so `use project shared` resolves a
 collision from `project`; reversing the order reverses the winner. `add` is an
 ordered idempotent union. Catalogs expose each effective tool once and include
 its toolbox origin.
 
 Each toolbox owns independent tool lineages and immutable versions. Thus
-`formatter@1` in two namespaces is two distinct versions, and an exact-version
+`formatter@1` in two toolboxes is two distinct versions, and an exact-version
 call remains within the winning lineage. Updating, deleting, or rolling back an
 existing visible name affects its winning toolbox; a new name is written to the
 first (primary) toolbox. Deleting a winner reveals the next selected binding.
@@ -180,8 +180,30 @@ inside that snapshot, preserving write-then-call behavior.
 
 A toolbox's cwd association is routing metadata for cwd defaults. Authored tools
 run in the session's persisted launch cwd; selecting a toolbox associated with
-another directory does not change filesystem context. Namespaces organize and
-compose executable code—they do not isolate it or restrict its access.
+another directory does not change filesystem context.
+
+Within its owning toolbox, each tool lineage has one or more sorted namespace
+paths. New core tools start in `core`; new user tools start in `uncategorized`.
+Pass `namespaces` to `write_tool` when authoring a version, or call it with only
+`name` and `namespaces` to replace classification without creating a version:
+
+```json
+{
+  "name": "format_python",
+  "namespaces": ["development/python", "quality/formatting"]
+}
+```
+
+Namespace assignment is last-write-wins mutable metadata. `base_version`, when
+provided, verifies the active source version but does not version namespace
+changes independently.
+
+`search_tools` returns namespace paths, indexes them for keyword search, and
+accepts a `namespace` filter. Filtering `development` includes tools explicitly
+assigned to `development` or descendants such as `development/python`. Callable
+tool names remain flat, and multiple memberships never duplicate a result.
+Toolboxes and namespaces organize executable code; neither isolates it or
+restricts filesystem access.
 
 ## Tool ABI
 
@@ -348,8 +370,10 @@ Copying the source of `search_tools` into a user tool does not give that copy
 the catalog capability. Activating the same source in the `search_tools` slot
 does. This is an API invariant, not an adversarial security boundary.
 
-Every successful write creates and activates an immutable integer version in
-one transaction, while `base_version` rejects stale binding updates. Core
+Every successful source write creates and activates an immutable integer
+version in one transaction, while namespace-only writes change current lineage
+metadata without creating a version. `base_version` rejects stale source-version
+assumptions. Core
 version 1 is the exception: it tracks the current code-shipped default, so
 rolling back to version 1 restores the implementation bundled with the running
 library. An invocation resolves its version before executing, so a core tool can
