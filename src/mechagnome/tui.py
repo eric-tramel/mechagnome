@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import difflib
 import json
 import math
 import shlex
+import warnings
 from dataclasses import dataclass, field
+from io import BytesIO
 from threading import Lock
 from typing import Any
 
+from PIL import Image as PILImage
 from rich.cells import split_graphemes
 from rich.markdown import Markdown
 from rich.markup import escape
@@ -36,6 +41,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from textual_image.widget import Image as TerminalImage
 
 from mechagnome.harness import AgentEvent, Conversation, Harness, Model, RunCancelled
 from mechagnome.kernel import Kernel
@@ -47,6 +53,10 @@ from mechagnome.openrouter import (
 )
 
 MODEL_INPUT_EMOJIS = (("image", "🖼️"), ("audio", "🎧"))
+MAX_TOOL_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_TOOL_IMAGE_PIXELS = 16 * 1024 * 1024
+MAX_TOOL_IMAGE_TOTAL_PIXELS = MAX_TOOL_IMAGE_PIXELS
+MAX_TOOL_IMAGES = 8
 
 
 def _format_duration(value: Any) -> str:
@@ -72,6 +82,91 @@ def _compact_json(value: Any, limit: int = 1600) -> str:
     except (TypeError, ValueError):
         rendered = repr(value)
     return rendered if len(rendered) <= limit else f"{rendered[:limit]}\n…"
+
+
+def _decode_tool_image(
+    value: Any, *, max_pixels: int | None = None
+) -> PILImage.Image | None:
+    """Decode one MCP-style image content block, ignoring malformed data."""
+    if not isinstance(value, dict) or value.get("type") != "image":
+        return None
+    encoded = value.get("data")
+    media_type = value.get("mimeType", value.get("mime_type", ""))
+    if not isinstance(encoded, str) or not isinstance(media_type, str):
+        return None
+
+    if encoded.startswith("data:"):
+        header, separator, encoded = encoded.partition(",")
+        if not separator or ";base64" not in header:
+            return None
+        data_media_type = header[5:].split(";", 1)[0]
+        media_type = media_type or data_media_type
+    if media_type and not media_type.startswith("image/"):
+        return None
+    pixel_limit = (
+        MAX_TOOL_IMAGE_PIXELS
+        if max_pixels is None
+        else min(max_pixels, MAX_TOOL_IMAGE_PIXELS)
+    )
+    if pixel_limit <= 0:
+        return None
+    maximum_encoded_size = ((MAX_TOOL_IMAGE_BYTES + 2) // 3) * 4
+    if len(encoded) > maximum_encoded_size:
+        return None
+
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > MAX_TOOL_IMAGE_BYTES:
+            return None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", PILImage.DecompressionBombWarning)
+            with PILImage.open(BytesIO(decoded)) as source:
+                if source.width * source.height > pixel_limit:
+                    return None
+                source.load()
+                return source.copy()
+    except (
+        binascii.Error,
+        OSError,
+        ValueError,
+        PILImage.DecompressionBombError,
+        PILImage.DecompressionBombWarning,
+    ):
+        return None
+
+
+def _tool_images(value: Any) -> tuple[PILImage.Image, ...]:
+    """Find valid image content blocks anywhere in a JSON tool result."""
+    images: list[PILImage.Image] = []
+    total_pixels = 0
+    pending = [value]
+    while pending and len(images) < MAX_TOOL_IMAGES:
+        item = pending.pop()
+        decoded = _decode_tool_image(
+            item,
+            max_pixels=MAX_TOOL_IMAGE_TOTAL_PIXELS - total_pixels,
+        )
+        if decoded is not None:
+            images.append(decoded)
+            total_pixels += decoded.width * decoded.height
+        elif isinstance(item, dict):
+            pending.extend(reversed(tuple(item.values())))
+        elif isinstance(item, list):
+            pending.extend(reversed(item))
+    return tuple(images)
+
+
+def _summarize_tool_images(value: Any) -> Any:
+    """Keep image metadata in textual details without dumping its base64 body."""
+    if isinstance(value, dict):
+        summarized = {key: _summarize_tool_images(item) for key, item in value.items()}
+        if value.get("type") == "image" and isinstance(value.get("data"), str):
+            media_type = value.get("mimeType", value.get("mime_type", "image"))
+            summarized["data"] = f"<{media_type} data omitted>"
+        return summarized
+    if isinstance(value, list):
+        return [_summarize_tool_images(item) for item in value]
+    return value
 
 
 class ToolEvent(Collapsible):
@@ -197,6 +292,8 @@ class ToolEvent(Collapsible):
         self.add_class(f"tool-{self.kind}")
         label = "response" if succeeded else "error"
         value = payload.get("result") if succeeded else payload.get("error")
+        if succeeded:
+            value = _summarize_tool_images(value)
         self.detail = f"{self._detached_detail()}\n\n{label}\n{_compact_json(value)}"
         self.detail_widget.update(Text(self.detail, style="dim"))
         self.stop_spinner()
@@ -333,6 +430,13 @@ class ChatFeed(VerticalScroll):
     def write_activity(self) -> ModelActivity:
         """Mount one animated model-activity row at the end of the feed."""
         entry = ModelActivity()
+        self.mount(entry)
+        self.call_after_refresh(self.scroll_end, animate=False)
+        return entry
+
+    def write_image(self, image: PILImage.Image) -> TerminalImage:
+        """Mount an image returned by a tool as a visible chat entry."""
+        entry = TerminalImage(image, classes="chat-entry tool-response-image")
         self.mount(entry)
         self.call_after_refresh(self.scroll_end, animate=False)
         return entry
@@ -1320,6 +1424,13 @@ class ToolboxApp(App[None]):
         margin-bottom: 1;
     }
 
+    .tool-response-image {
+        width: auto;
+        max-width: 100%;
+        height: auto;
+        max-height: 24;
+    }
+
     .streaming-response {
         height: 1;
         min-height: 1;
@@ -1809,6 +1920,8 @@ class ToolboxApp(App[None]):
                 )
             else:
                 active.finish("response", name, detail, outcome_summary)
+            for image in _tool_images(event.payload.get("result")):
+                state.chat.write_image(image)
             if state is self.active_session:
                 self._refresh_sidebar()
         elif event.kind == "binding_changed":
@@ -1872,6 +1985,9 @@ class ToolboxApp(App[None]):
         if terminal:
             displayed.finish_detached(event.payload)
             state.detached_tool_events.pop(job_id, None)
+            if event.payload.get("status") == "succeeded":
+                for image in _tool_images(event.payload.get("result")):
+                    state.chat.write_image(image)
         else:
             displayed.set_detached_output(
                 str(event.payload.get("output_tail") or ""),
@@ -2497,7 +2613,7 @@ class ToolboxApp(App[None]):
         value = payload if failed else payload.get("result")
         duration = _format_duration(duration_ms)
         outcome_summary = f" · completed in {duration}" if duration else ""
-        return name, self._compact(value), outcome_summary
+        return name, self._compact(_summarize_tool_images(value)), outcome_summary
 
     @staticmethod
     def _compact(value: Any, limit: int = 1600) -> str:
