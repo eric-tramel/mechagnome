@@ -1463,7 +1463,6 @@ class ToolboxApp(App[None]):
         model: Model | ModelProvider,
         *,
         model_name: str,
-        max_turns: int = 50,
         model_provider: CompletionTransport | None = None,
     ) -> None:
         super().__init__()
@@ -1476,7 +1475,7 @@ class ToolboxApp(App[None]):
         self.kernel = kernel
         self.model = model.transport if isinstance(model, ModelProvider) else model
         self.model_name = model_name
-        self.harness = Harness(kernel, max_turns=max_turns)
+        self.harness = Harness(kernel)
         initial_conversation = self.harness.start(
             model,
             model_provider=model_provider,

@@ -2667,6 +2667,41 @@ def test_harness_exposes_only_five_operations_and_saves_everything(
     assert kinds[-1] == "final"
 
 
+def test_harness_does_not_limit_model_turns(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+
+    class LongRunningModel:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def respond(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        ) -> ModelTurn:
+            self.turn += 1
+            if self.turn <= 51:
+                return ModelTurn(calls=(ToolCall("help", {}, f"help-{self.turn}"),))
+            return ModelTurn(text="Finished after the former limit.")
+
+    class ImmediateRunner:
+        def call(
+            self,
+            name: str,
+            args: dict[str, Any],
+            *,
+            session_id: str,
+            on_event: Any = None,
+            cancelled: Any = None,
+        ) -> str:
+            return "help"
+
+    result = Harness(kernel, tool_runner=ImmediateRunner()).run(
+        LongRunningModel(), "Keep working."
+    )
+
+    assert result.answer == "Finished after the former limit."
+    assert result.turns == 52
+
+
 def test_harness_rejects_oversized_batches_without_partial_execution(
     tmp_path: Path,
 ) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import count
 from threading import Event, Lock
 from typing import Any
 
@@ -144,7 +145,6 @@ class Conversation:
         kernel: Kernel,
         model_session: ModelSession,
         *,
-        max_turns: int,
         max_calls_per_turn: int,
         tool_runner: IsolatedToolRunner,
         messages: list[dict[str, Any]] | None = None,
@@ -152,7 +152,6 @@ class Conversation:
         self.kernel = kernel
         self.model_session = model_session
         self.session_id = model_session.session_id
-        self.max_turns = max_turns
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner
         self.messages = messages or []
@@ -219,7 +218,7 @@ class Conversation:
         self.messages.append({"role": "user", "content": prompt})
         self._append(on_event, "user", {"content": prompt})
 
-        for turn_number in range(1, self.max_turns + 1):
+        for turn_number in count(1):
             token.check()
             tools = self.kernel.tool_definitions(session_id=self.session_id)
             try:
@@ -281,12 +280,6 @@ class Conversation:
                         "content": observation,
                     }
                 )
-
-        error = ToolboxError(
-            "max_turns", f"model exceeded the maximum {self.max_turns} turns"
-        )
-        self._append(on_event, "harness_failed", error.to_dict())
-        raise error
 
     async def _execute_all(
         self,
@@ -423,7 +416,6 @@ class Conversation:
         child = Conversation(
             self.kernel,
             model_session,
-            max_turns=self.max_turns,
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
         )
@@ -474,12 +466,10 @@ class Harness:
         self,
         kernel: Kernel,
         *,
-        max_turns: int = 50,
         max_calls_per_turn: int = DEFAULT_MAX_CALLS_PER_TURN,
         tool_runner: IsolatedToolRunner | None = None,
     ) -> None:
         self.kernel = kernel
-        self.max_turns = max_turns
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner or IsolatedToolRunner(kernel)
 
@@ -520,7 +510,6 @@ class Harness:
         return Conversation(
             self.kernel,
             model_session,
-            max_turns=self.max_turns,
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
             messages=self._session_messages(identifier),
