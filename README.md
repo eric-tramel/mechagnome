@@ -87,7 +87,9 @@ TUI commands:
   clearing tools. Use `TAB` or click a session tab to switch conversations.
 - `/compact` replaces the active conversation with a durable child session in
   the same tab, preserves the visible transcript, and immediately asks it to
-  continue from where its parent left off.
+  continue from where its parent left off. A horizontal divider marks the
+  compaction boundary. When token usage and context-length metadata are
+  available, the TUI does this automatically at 25% context remaining.
 - `/clear` resets the active tab with a fresh saved session. The previous
   session remains available in durable session history.
 - `/end` closes the active session tab. Ending the final tab exits the TUI.
@@ -338,6 +340,8 @@ Adapters may set `ModelTurn.total_tokens` to the latest completed request's
 provider-reported native-tokenizer total. For OpenRouter models, the TUI compares
 that snapshot with the catalog's `context_length` and shows the percentage of
 context remaining; the indicator stays hidden when either value is unavailable.
+After a successful rollout reaches 25% remaining, the TUI automatically continues
+in a compacted child session.
 
 The harness rejects calls outside its six model actions. Dynamic tools never
 need to be registered with the inference provider; they are reached through the

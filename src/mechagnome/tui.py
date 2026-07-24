@@ -20,6 +20,7 @@ from rich.cells import split_graphemes
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -65,6 +66,7 @@ TOOL_IMAGE_MARKDOWN_PATTERN = re.compile(
     r"[A-Za-z0-9+/]+={0,2})\)"
 )
 COMPACT_CONTINUATION_PROMPT = "Continue from where the parent session left off."
+AUTO_COMPACT_REMAINING_PERCENT = 25
 
 
 def _format_duration(value: Any) -> str:
@@ -524,6 +526,12 @@ class ChatFeed(VerticalScroll):
         self.call_after_refresh(self.scroll_end, animate=False)
         return event
 
+    def write_compaction_divider(self) -> Static:
+        """Mark the boundary between parent and compacted child sessions."""
+        return self.write(
+            Rule("compacted", style="bright_blue"), classes="compaction-divider"
+        )
+
     def clear(self) -> None:
         self.remove_children()
 
@@ -544,6 +552,7 @@ class SessionTab:
     status: str = "ready"
     total_tokens: int | None = None
     context_model: str | None = None
+    auto_compact_suppressed: bool = False
     streamed_text: str = ""
     pending_stream_text: list[str] = field(default_factory=list)
     stream_timer: Timer | None = None
@@ -1814,6 +1823,13 @@ class ToolboxApp(App[None]):
             self.model.reasoning_effort = None
         self._refresh_model_controls()
         self._refresh_active_status()
+        for state in self.session_tabs:
+            if (
+                not state.running
+                and state.status == "ready"
+                and self._should_auto_compact(state)
+            ):
+                self._compact_session(state, automatic=True)
 
     @on(Button.Pressed, "#model-selector")
     def choose_model(self) -> None:
@@ -1884,6 +1900,7 @@ class ToolboxApp(App[None]):
             event.input.value = ""
         if prompt.startswith("/") and await self._command(prompt):
             return
+        state.auto_compact_suppressed = False
         self._write_user(prompt, state)
         self._start_rollout(state)
         self.run_agent(prompt, state)
@@ -2258,9 +2275,14 @@ class ToolboxApp(App[None]):
 
     async def action_compact_session(self) -> None:
         """Continue the active tab in a new child conversation."""
-        state = self.active_session
+        self._compact_session(self.active_session)
+
+    def _compact_session(self, state: SessionTab, *, automatic: bool = False) -> None:
+        """Continue one tab in a child conversation after a visible boundary."""
         if state.running:
-            self._set_status("stop the active rollout before compacting a session")
+            self._set_status(
+                "stop the active rollout before compacting a session", state
+            )
             return
         parent = state.conversation
         try:
@@ -2271,10 +2293,15 @@ class ToolboxApp(App[None]):
         for detached in state.detached_tool_events.values():
             detached.finish_detached_handoff(parent.session_id)
         parent.close()
+        draft = state.draft if automatic else ""
         self._reset_session_ui(state)
+        state.draft = draft
         state.conversation = child
+        state.chat.write_compaction_divider()
         self._write_user(COMPACT_CONTINUATION_PROMPT, state)
-        self._refresh_sidebar()
+        state.auto_compact_suppressed = True
+        if state is self.active_session:
+            self._refresh_sidebar()
         self._start_rollout(state)
         self.run_agent(COMPACT_CONTINUATION_PROMPT, state)
 
@@ -2576,6 +2603,21 @@ class ToolboxApp(App[None]):
         self._refresh_active_status()
         if state is self.active_session:
             prompt.focus()
+        if state.status == "ready" and self._should_auto_compact(state):
+            self._compact_session(state, automatic=True)
+
+    def _should_auto_compact(self, state: SessionTab) -> bool:
+        """Return whether a completed turn crossed the context threshold."""
+        option = self._current_model_option()
+        return (
+            not state.auto_compact_suppressed
+            and state.total_tokens is not None
+            and state.context_model == self._active_model_name
+            and option is not None
+            and option.context_length is not None
+            and (option.context_length - state.total_tokens) * 100
+            <= option.context_length * AUTO_COMPACT_REMAINING_PERCENT
+        )
 
     def _stop_active_tool_events(self, state: SessionTab) -> None:
         for tool_event in state.active_tool_events.values():
@@ -2658,6 +2700,7 @@ class ToolboxApp(App[None]):
         state.status = "ready"
         state.total_tokens = None
         state.context_model = None
+        state.auto_compact_suppressed = False
 
     def _forwarded_child(
         self, state: SessionTab, event: AgentEvent, name: str, args: Any

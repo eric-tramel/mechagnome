@@ -19,6 +19,7 @@ import pytest
 from PIL import Image as PILImage
 from rich.console import Console
 from rich.markup import render as render_markup
+from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 from textual.widgets import (
@@ -103,6 +104,32 @@ class FinalModel:
     ) -> ModelTurn:
         self.message_snapshots.append([dict(message) for message in messages])
         return ModelTurn(text=f"answer {len(self.message_snapshots)}")
+
+
+class ContextUsageModel(FinalModel):
+    """Report controlled context usage on the first request of a session."""
+
+    def __init__(
+        self, first_total_tokens: int, subsequent_total_tokens: int = 1
+    ) -> None:
+        super().__init__()
+        self.first_total_tokens = first_total_tokens
+        self.subsequent_total_tokens = subsequent_total_tokens
+        self.reasoning_effort: str | None = None
+
+    def respond(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ModelTurn:
+        self.message_snapshots.append([dict(message) for message in messages])
+        total_tokens = (
+            self.first_total_tokens
+            if len(self.message_snapshots) == 1
+            else self.subsequent_total_tokens
+        )
+        return ModelTurn(
+            text=f"answer {len(self.message_snapshots)}",
+            total_tokens=total_tokens,
+        )
 
 
 class StaticProvider:
@@ -2555,6 +2582,7 @@ def test_compact_continues_in_a_child_session_in_the_same_tab(
             parent_id = parent.session_id
             pane_id = state.pane_id
             transcript = chat_text(app)
+            parent_entry_count = len(state.chat.children)
 
             await submit(pilot, "/compact")
 
@@ -2578,8 +2606,162 @@ def test_compact_continues_in_a_child_session_in_the_same_tab(
             compacted_chat = chat_text(app)
             assert transcript in compacted_chat
             assert tui_module.COMPACT_CONTINUATION_PROMPT in compacted_chat
+            divider = state.chat.children[parent_entry_count]
+            assert divider.has_class("compaction-divider")
+            assert isinstance(divider.content, Rule)
+            assert divider.content.title == "compacted"
             with pytest.raises(RunCancelled):
                 parent.send("closed")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("total_tokens", "should_compact"),
+    [(74, False), (75, True), (100, True)],
+)
+def test_tui_auto_compacts_at_25_percent_context_remaining(
+    tmp_path: Path,
+    total_tokens: int,
+    should_compact: bool,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    model = ContextUsageModel(total_tokens)
+    app = ToolboxApp(kernel, model, model_name="test/model")
+    app.model_options = [
+        OpenRouterModelOption(id="test/model", name="Test Model", context_length=100)
+    ]
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            state = app.active_session
+            parent = state.conversation
+            parent_entry_count = len(state.chat.children)
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "use some context"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            if not should_compact:
+                assert state.conversation is parent
+                assert len(model.message_snapshots) == 1
+                assert not any(
+                    entry.has_class("compaction-divider")
+                    for entry in state.chat.children
+                )
+                return
+
+            child = state.conversation
+            assert child is not parent
+            assert kernel.session_metadata(child.session_id)["parent_session_id"] == (
+                parent.session_id
+            )
+            assert len(model.message_snapshots) == 2
+            assert child.messages[1] == {
+                "role": "user",
+                "content": tui_module.COMPACT_CONTINUATION_PROMPT,
+            }
+            divider = state.chat.children[parent_entry_count + 2]
+            assert divider.has_class("compaction-divider")
+            assert isinstance(divider.content, Rule)
+            assert divider.content.title == "compacted"
+            with pytest.raises(RunCancelled):
+                parent.send("closed")
+
+    asyncio.run(exercise())
+
+
+def test_tui_does_not_chain_auto_compaction_from_generated_continuation(
+    tmp_path: Path,
+) -> None:
+    model = ContextUsageModel(75, subsequent_total_tokens=75)
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db", cwd=tmp_path),
+        model,
+        model_name="test/model",
+    )
+    app.model_options = [
+        OpenRouterModelOption(id="test/model", name="Test Model", context_length=100)
+    ]
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            state = app.active_session
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "use some context"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            compacted_session_id = state.conversation.session_id
+            app._set_model_options(app.model_options)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert state.conversation.session_id == compacted_session_id
+            assert len(model.message_snapshots) == 2
+            assert (
+                sum(
+                    entry.has_class("compaction-divider")
+                    for entry in state.chat.children
+                )
+                == 1
+            )
+            assert state.running is False
+
+    asyncio.run(exercise())
+
+
+def test_tui_auto_compacts_when_context_metadata_arrives_after_rollout(
+    tmp_path: Path,
+) -> None:
+    model = ContextUsageModel(75)
+    app = ToolboxApp(
+        Kernel(tmp_path / "toolbox.db", cwd=tmp_path),
+        model,
+        model_name="test/model",
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            state = app.active_session
+            parent = state.conversation
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "use some context"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert state.conversation is parent
+
+            prompt.value = "preserve this draft"
+            await pilot.pause()
+            app._set_model_options(
+                [
+                    OpenRouterModelOption(
+                        id="test/model",
+                        name="Test Model",
+                        context_length=100,
+                    )
+                ]
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert state.conversation is not parent
+            assert len(model.message_snapshots) == 2
+            assert state.draft == "preserve this draft"
+            assert prompt.value == "preserve this draft"
+            assert (
+                sum(
+                    entry.has_class("compaction-divider")
+                    for entry in state.chat.children
+                )
+                == 1
+            )
 
     asyncio.run(exercise())
 
