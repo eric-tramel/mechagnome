@@ -64,6 +64,7 @@ TOOL_IMAGE_MARKDOWN_PATTERN = re.compile(
     r"(?P<uri>data:(?P<mime>image/[A-Za-z0-9.+-]+);base64,"
     r"[A-Za-z0-9+/]+={0,2})\)"
 )
+COMPACT_CONTINUATION_PROMPT = "Continue from where the parent session left off."
 
 
 def _format_duration(value: Any) -> str:
@@ -221,7 +222,7 @@ def _summarize_tool_images(value: Any) -> Any:
 class ToolEvent(Collapsible):
     """One quiet, expandable tool invocation or observation."""
 
-    SYMBOLS = {"call": "→", "response": "✓", "error": "✕"}
+    SYMBOLS = {"call": "→", "response": "✓", "error": "✕", "handoff": "↗"}
     SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     MAX_DETACHED_TAIL_BYTES = 16 * 1024
 
@@ -344,6 +345,20 @@ class ToolEvent(Collapsible):
         if succeeded:
             value = _summarize_tool_images(value)
         self.detail = f"{self._detached_detail()}\n\n{label}\n{_compact_json(value)}"
+        self.detail_widget.update(Text(self.detail, style="dim"))
+        self.stop_spinner()
+
+    def finish_detached_handoff(self, parent_session_id: str) -> None:
+        """Stop tracking a parent-owned detached job after tab compaction."""
+        self.kind = "handoff"
+        self.remove_class("tool-call")
+        self.add_class("tool-response")
+        self.outcome_summary = " · parent session"
+        self.detail = (
+            f"{self._detached_detail()}\n\nstatus\n"
+            "no longer tracked in this compacted tab; job remains owned by "
+            f"parent session {parent_session_id}"
+        )
         self.detail_widget.update(Text(self.detail, style="dim"))
         self.stop_spinner()
 
@@ -2149,6 +2164,8 @@ class ToolboxApp(App[None]):
             self.action_quit()
         elif command == "/new":
             await self.action_new_session()
+        elif command == "/compact":
+            await self.action_compact_session()
         elif command in {"/clear", "/reset"}:
             await self.action_clear_session()
         elif command == "/end":
@@ -2238,6 +2255,28 @@ class ToolboxApp(App[None]):
         tabs.active = state.pane_id
         self._show_welcome(state)
         self._set_status("new session", state)
+
+    async def action_compact_session(self) -> None:
+        """Continue the active tab in a new child conversation."""
+        state = self.active_session
+        if state.running:
+            self._set_status("stop the active rollout before compacting a session")
+            return
+        parent = state.conversation
+        try:
+            child = self.harness.start_child(parent)
+        except Exception as error:
+            self._write_error(str(error), state)
+            return
+        for detached in state.detached_tool_events.values():
+            detached.finish_detached_handoff(parent.session_id)
+        parent.close()
+        self._reset_session_ui(state)
+        state.conversation = child
+        self._write_user(COMPACT_CONTINUATION_PROMPT, state)
+        self._refresh_sidebar()
+        self._start_rollout(state)
+        self.run_agent(COMPACT_CONTINUATION_PROMPT, state)
 
     def action_previous_prompt(self) -> None:
         """Replace the active draft with the previous submitted prompt."""
@@ -2376,6 +2415,7 @@ class ToolboxApp(App[None]):
                     "- `Esc` — stop the active tab's rollout\n"
                     "- `Ctrl+N` or `/new` — open a new session tab\n"
                     "- `TAB` or click — switch session tabs\n"
+                    "- `/compact` — continue in a child session in this tab\n"
                     "- `/clear` — reset the active tab with a fresh session\n"
                     "- `/end` — close the active session tab\n"
                     "- `/tools` or `Ctrl+T` — toggle tool management\n"

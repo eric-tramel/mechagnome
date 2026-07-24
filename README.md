@@ -81,6 +81,9 @@ TUI commands:
 - `Esc` stops the active tab's model stream or tool rollout.
 - `Ctrl+N` or `/new` opens a fresh saved conversation in a new tab without
   clearing tools. Use `TAB` or click a session tab to switch conversations.
+- `/compact` replaces the active conversation with a durable child session in
+  the same tab, preserves the visible transcript, and immediately asks it to
+  continue from where its parent left off.
 - `/clear` resets the active tab with a fresh saved session. The previous
   session remains available in durable session history.
 - `/end` closes the active session tab. Ending the final tab exits the TUI.

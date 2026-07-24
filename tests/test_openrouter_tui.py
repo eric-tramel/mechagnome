@@ -2533,6 +2533,57 @@ def test_tui_preserves_model_provider_when_starting_a_new_session(
     asyncio.run(exercise())
 
 
+def test_compact_continues_in_a_child_session_in_the_same_tab(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    model = FinalModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def submit(pilot: Any, value: str) -> None:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = value
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(pilot, "work in the parent")
+            state = app.active_session
+            parent = state.conversation
+            parent_id = parent.session_id
+            pane_id = state.pane_id
+            transcript = chat_text(app)
+
+            await submit(pilot, "/compact")
+
+            child = state.conversation
+            assert app.active_session is state
+            assert app.session_tabs == [state]
+            assert state.pane_id == pane_id
+            assert child.session_id != parent_id
+            assert kernel.session_metadata(child.session_id)["parent_session_id"] == (
+                parent_id
+            )
+            assert child.messages[0] == {
+                "role": "system",
+                "content": f"Parent session ID: {parent_id}.",
+            }
+            assert child.messages[1] == {
+                "role": "user",
+                "content": tui_module.COMPACT_CONTINUATION_PROMPT,
+            }
+            assert model.message_snapshots[-1][:2] == child.messages[:2]
+            compacted_chat = chat_text(app)
+            assert transcript in compacted_chat
+            assert tui_module.COMPACT_CONTINUATION_PROMPT in compacted_chat
+            with pytest.raises(RunCancelled):
+                parent.send("closed")
+
+    asyncio.run(exercise())
+
+
 def test_clear_resets_one_tab_and_end_closes_it(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
     app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
@@ -3301,9 +3352,11 @@ class DetachedToolModel:
                     ),
                 )
             )
-        handle = messages[-1]["content"]
-        self.job_id = handle["job_id"]
-        return ModelTurn(text="Foreground is free.")
+        if self.turn == 2:
+            handle = messages[-1]["content"]
+            self.job_id = handle["job_id"]
+            return ModelTurn(text="Foreground is free.")
+        return ModelTurn(text="Continued in the compacted session.")
 
 
 def test_detached_terminal_snapshot_marks_local_tail_truncation(
@@ -3467,6 +3520,66 @@ def test_tui_detached_tool_keeps_spinning_and_streams_tail_after_rollout(
             assert "stream finished" in row.detail
             assert '"ok": true' in row.detail
             assert tool_title_text(row).startswith("✓ detached_slow")
+
+    asyncio.run(exercise())
+
+
+def test_tui_compact_finalizes_parent_detached_row(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    started = tmp_path / "compact-detached-started"
+    release = tmp_path / "compact-detached-release"
+    kernel.call(
+        "write_tool",
+        {
+            "name": "detached_slow",
+            "description": "Wait for release while compacting the parent.",
+            "input_schema": {"type": "object"},
+            "source": (
+                "import time\n"
+                "from pathlib import Path\n\n"
+                "async def main(input, ctx):\n"
+                f"    Path({str(started)!r}).write_text('yes')\n"
+                f"    while not Path({str(release)!r}).exists():\n"
+                "        time.sleep(0.01)\n"
+                "    return {'ok': True}\n"
+            ),
+        },
+    )
+    model = DetachedToolModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "detach the slow tool"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            for _ in range(200):
+                await pilot.pause()
+                rows = [row for row in app.query(ToolEvent) if row.detached_job_id]
+                if started.exists() and rows:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("detached tool did not start before compaction")
+
+            row = rows[0]
+            parent_id = app.conversation.session_id
+            assert row.processing is True
+            prompt.value = "/compact"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert row.kind == "handoff"
+            assert row.processing is False
+            assert row._spinner_timer is None
+            assert parent_id in row.detail
+            assert "no longer tracked in this compacted tab" in row.detail
+            assert model.job_id in app.active_session.ignored_detached_jobs
+            release.write_text("go")
 
     asyncio.run(exercise())
 

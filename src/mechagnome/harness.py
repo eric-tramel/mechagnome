@@ -996,6 +996,24 @@ class Harness:
             messages=self._session_messages(identifier),
         )
 
+    def start_child(self, parent: Conversation) -> Conversation:
+        """Start a child conversation from a parent owned by this harness."""
+        if parent._agent_coordinator is not self._agent_coordinator:
+            raise ToolboxError(
+                "invalid_session",
+                "parent conversation belongs to another harness",
+            )
+        model_session = parent.model_session.provider.start_session(
+            parent_scope=self.kernel.snapshot_scope(parent.session_id),
+        )
+        return Conversation(
+            self.kernel,
+            model_session,
+            max_calls_per_turn=self.max_calls_per_turn,
+            tool_runner=self.tool_runner,
+            _agent_coordinator=self._agent_coordinator,
+        )
+
     def _session_messages(self, session_id: str) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         call_names: dict[str, str] = {}

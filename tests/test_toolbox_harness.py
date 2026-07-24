@@ -1450,8 +1450,8 @@ def test_child_conversation_has_parent_session_provenance_message(
         for m in root.messages
     )
 
-    # Create a child conversation
-    child = harness._agent_coordinator._create_child(root)
+    # Create a child conversation through the host-facing start path.
+    child = harness.start_child(root)
 
     # Child conversation starts with a provenance system message
     assert len(child.messages) >= 1
@@ -1481,7 +1481,7 @@ def test_resumed_child_session_gets_provenance_message_prepended(
 
     # Create root and child sessions
     root = harness.start(provider)
-    child = harness._agent_coordinator._create_child(root)
+    child = harness.start_child(root)
     child_session_id = child.session_id
     child.close()
     root.close()
