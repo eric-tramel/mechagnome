@@ -1,5 +1,9 @@
 # Mechagnome
 
+<p align="center">
+  <img src="docs/images/mechagnome-header.png" alt="A mechanical garden gnome building a reusable tool while miniature helper gnomes emerge from nested toolboxes" width="100%">
+</p>
+
 > [!WARNING]
 > **Mechagnome is experimental research software. Run it only inside a
 > disposable, tightly sandboxed environment such as an isolated VM or
