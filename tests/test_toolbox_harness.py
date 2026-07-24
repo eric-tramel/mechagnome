@@ -1431,6 +1431,75 @@ def test_direct_agents_share_one_conversation_action_surface_and_lineage(
     assert provider._session_transports == {}
 
 
+def test_child_conversation_has_parent_session_provenance_message(
+    tmp_path: Path,
+) -> None:
+    """A child agent's messages start with a system note identifying its parent."""
+    kernel = kernel_at(tmp_path)
+    transport = UniformAgentTransport()
+    provider = ModelProvider(kernel, transport)
+    harness = Harness(kernel)
+    root = harness.start(provider)
+
+    # Root conversation has no provenance message
+    assert all(
+        not (
+            m.get("role") == "system"
+            and "parented to session" in m.get("content", "")
+        )
+        for m in root.messages
+    )
+
+    # Create a child conversation
+    child = harness._agent_coordinator._create_child(root)
+
+    # Child conversation starts with a provenance system message
+    assert len(child.messages) >= 1
+    first = child.messages[0]
+    assert first["role"] == "system"
+    assert root.session_id in first["content"]
+    assert "parented to session" in first["content"]
+    assert "session tools" in first["content"]
+
+    # The parent session ID in the message matches the root session
+    child_metadata = kernel.session_metadata(child.session_id)
+    assert child_metadata["parent_session_id"] == root.session_id
+
+    child.close()
+    root.close()
+    harness.close()
+
+
+def test_resumed_child_session_gets_provenance_message_prepended(
+    tmp_path: Path,
+) -> None:
+    """Resuming a child session via Harness.start injects the provenance note."""
+    kernel = kernel_at(tmp_path)
+    transport = UniformAgentTransport()
+    provider = ModelProvider(kernel, transport)
+    harness = Harness(kernel)
+
+    # Create root and child sessions
+    root = harness.start(provider)
+    child = harness._agent_coordinator._create_child(root)
+    child_session_id = child.session_id
+    child.close()
+    root.close()
+
+    # Resume the child session directly
+    resumed = harness.start(provider, session_id=child_session_id)
+
+    # The provenance message should be prepended to the reconstructed messages
+    assert len(resumed.messages) >= 1
+    first = resumed.messages[0]
+    assert first["role"] == "system"
+    assert root.session_id in first["content"]
+    assert "parented to session" in first["content"]
+
+    resumed.close()
+    harness.close()
+
+
 class RecursiveDetachedAgentTransport(UniformAgentTransport):
     """Have a foreground child detach a grandchild through model actions."""
 

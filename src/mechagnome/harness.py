@@ -427,6 +427,7 @@ class _AgentCoordinator:
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
             _agent_coordinator=self,
+            parent_session_id=parent.session_id,
         )
 
     def _run_detached(self, job: _DetachedAgentJob) -> None:
@@ -537,6 +538,18 @@ def _agent_failure(error: Exception) -> ToolboxError:
     return ToolboxError("model_provider_failed", "model provider request failed")
 
 
+def _parent_session_message(parent_session_id: str) -> dict[str, Any]:
+    """System message informing a child agent of its parent session."""
+    return {
+        "role": "system",
+        "content": (
+            f"This session is a child agent session parented to session "
+            f"{parent_session_id}. Use session tools to read the parent "
+            f"session for prior context."
+        ),
+    }
+
+
 class Conversation:
     """A durable, multi-prompt model conversation over one toolbox session."""
 
@@ -548,6 +561,7 @@ class Conversation:
         max_calls_per_turn: int,
         tool_runner: IsolatedToolRunner,
         _agent_coordinator: _AgentCoordinator,
+        parent_session_id: str | None = None,
         messages: list[dict[str, Any]] | None = None,
     ) -> None:
         self.kernel = kernel
@@ -556,7 +570,12 @@ class Conversation:
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner
         self._agent_coordinator = _agent_coordinator
-        self.messages = messages or []
+        if messages is not None:
+            self.messages = list(messages)
+        elif parent_session_id is not None:
+            self.messages = [_parent_session_message(parent_session_id)]
+        else:
+            self.messages = []
         self._run_lock = Lock()
         self._current_token: _CancellationToken | None = None
         self._current_agent_budget: _AgentLaunchBudget | None = None
@@ -974,13 +993,19 @@ class Harness:
             )
         model_session = provider.start_session(session_id=session_id)
         identifier = model_session.session_id
+        messages = self._session_messages(identifier)
+        parent_session_id = self.kernel.session_metadata(identifier).get(
+            "parent_session_id"
+        )
+        if parent_session_id is not None:
+            messages.insert(0, _parent_session_message(parent_session_id))
         return Conversation(
             self.kernel,
             model_session,
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
             _agent_coordinator=self._agent_coordinator,
-            messages=self._session_messages(identifier),
+            messages=messages,
         )
 
     def _session_messages(self, session_id: str) -> list[dict[str, Any]]:
