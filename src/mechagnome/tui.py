@@ -2563,10 +2563,12 @@ class ToolboxApp(App[None]):
         self._set_status("error", state)
 
     def _refresh_sidebar(self) -> None:
-        catalog = self.kernel.catalog(session_id=self.conversation.session_id)
+        # Historical inventory retains deleted lineages for audit; the effective
+        # catalog intentionally contains only tools that remain callable.
+        active_tools = self.kernel.catalog(session_id=self.conversation.session_id)
         selected = self.kernel.active_toolboxes(self.conversation.session_id)
-        core_count = sum(tool["kind"] == "core" for tool in catalog)
-        user_count = len(catalog) - core_count
+        core_count = sum(tool["kind"] == "core" for tool in active_tools)
+        user_count = len(active_tools) - core_count
         self.query_one("#model-info", Static).update(
             f"{self._active_model_name}\n"
             f"session {self.conversation.session_id[:10]}\n"
@@ -2577,7 +2579,7 @@ class ToolboxApp(App[None]):
         with self.prevent(Select.Changed):
             picker.set_options(options)
             picker.value = value
-        self._populate_tool_tree(catalog, selected)
+        self._populate_tool_tree(active_tools, selected)
 
     def _sidebar_toolbox_options(
         self, selected: list[dict[str, Any]] | None = None

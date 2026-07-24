@@ -4720,7 +4720,7 @@ def test_sidebar_toggles_navigates_namespaces_opens_tools_and_swaps_toolbox(
     asyncio.run(exercise())
 
 
-def test_tool_manager_navigates_source_diff_stats_and_deletes(tmp_path: Path) -> None:
+def test_tool_manager_deletes_tool_and_removes_it_from_sidebar(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     creator = kernel.create_session()
     kernel.write_tool(
@@ -4790,5 +4790,11 @@ def test_tool_manager_navigates_source_diff_stats_and_deletes(tmp_path: Path) ->
             assert manager.query_one("#delete-tool", Button).disabled is True
             assert "number" not in {binding["name"] for binding in kernel.bindings()}
             assert kernel.tool_history("number")["versions"][0]["version"] == 2
+            sidebar_tools = {
+                node.data.value
+                for node in sidebar_tree_nodes(app.query_one("#tools", Tree))
+                if isinstance(node.data, SidebarTreeItem) and node.data.kind == "tool"
+            }
+            assert "number" not in sidebar_tools
 
     asyncio.run(exercise())
