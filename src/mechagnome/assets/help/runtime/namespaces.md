@@ -31,6 +31,9 @@ participates in keyword ranking. Pass `namespace` to browse one subtree; for
 example, filtering `development` includes exact `development` assignments and
 descendants such as `development/python`, but not `device`.
 
+The TUI sidebar presents these paths as a collapsible tree. Tool leaves show only
+their callable names; selecting one opens its source, history, and usage details.
+
 Namespaces do not affect `call_tool` resolution, the fixed five core operation
 slots, capabilities, or filesystem access. They are organization metadata, not
 security boundaries. Use `help(topic="toolboxes")` for the separate ordered

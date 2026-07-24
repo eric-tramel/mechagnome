@@ -26,10 +26,10 @@ from textual.widgets import (
     Button,
     Input,
     OptionList,
-    RichLog,
     Select,
     Static,
     TabbedContent,
+    Tree,
 )
 from textual_image.widget import Image as TerminalImage
 
@@ -62,6 +62,7 @@ from mechagnome.tui import (
     ModelSelectionScreen,
     NamespaceNameScreen,
     ReasoningEffortScreen,
+    SidebarTreeItem,
     ToolboxApp,
     ToolEvent,
     ToolManagerScreen,
@@ -86,6 +87,19 @@ def chat_text(app: ToolboxApp, chat: ChatFeed | None = None) -> str:
         elif isinstance(entry, Static):
             console.print(entry.content)
     return output.getvalue().rstrip()
+
+
+def sidebar_tree_nodes(tree: Tree) -> list[Any]:
+    """Return all visible-model nodes below a sidebar tree root."""
+    nodes: list[Any] = []
+
+    def visit(node: Any) -> None:
+        for child in node.children:
+            nodes.append(child)
+            visit(child)
+
+    visit(tree.root)
+    return nodes
 
 
 def tool_title_text(event: ToolEvent) -> str:
@@ -3992,9 +4006,11 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(pilot, "build a hello tool")
             chat = chat_text(app)
-            tools = "\n".join(
-                line.text for line in app.query_one("#tools", RichLog).lines
-            )
+            tools = {
+                node.data.value
+                for node in sidebar_tree_nodes(app.query_one("#tools", Tree))
+                if isinstance(node.data, SidebarTreeItem) and node.data.kind == "tool"
+            }
             assert "write_tool" in chat
             assert "call_tool" not in chat
             assert "hello" in chat
@@ -4033,7 +4049,7 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
             assert hello.detail_widget.styles.border.top[0] == "round"
             await pilot.click(hello)
             assert hello.collapsed is False
-            assert "hello  v1" in tools
+            assert "hello" in tools
             assert "1 user" in str(app.query_one("#model-info", Static).render())
 
             await submit(pilot, "/tools")
@@ -4490,11 +4506,16 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
                 )
                 == "beta"
             )
-            sidebar = "\n".join(
-                line.text for line in app.query_one("#tools", RichLog).lines
-            )
-            assert "identity  v1  [beta]" in sidebar
-            assert "beta + alpha" in str(app.query_one("#model-info", Static).render())
+            tree = app.query_one("#tools", Tree)
+            tools = {
+                node.data.value
+                for node in sidebar_tree_nodes(tree)
+                if isinstance(node.data, SidebarTreeItem) and node.data.kind == "tool"
+            }
+            assert "identity" in tools
+            picker = app.query_one("#sidebar-toolbox", Select)
+            assert str(picker.query_one("#label", Static).render()) == "beta + alpha"
+            assert "beta" not in str(app.query_one("#model-info", Static).render())
             await submit(pilot, "/toolbox list")
             chat = chat_text(app)
             assert "toolboxes" in chat
@@ -4583,7 +4604,7 @@ def test_tool_manager_switches_blanks_and_renames_namespaces(tmp_path: Path) -> 
     asyncio.run(exercise())
 
 
-def test_tui_toolbox_is_roomy_themed_and_sorted_by_recent_usage(
+def test_tui_toolbox_is_roomy_themed_and_grouped_by_namespace(
     tmp_path: Path,
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
@@ -4594,15 +4615,107 @@ def test_tui_toolbox_is_roomy_themed_and_sorted_by_recent_usage(
     async def exercise() -> None:
         async with app.run_test(size=(80, 30)):
             sidebar = app.query_one("#sidebar")
-            tools = app.query_one("#tools", RichLog)
-            rendered = "\n".join(line.text for line in tools.lines)
+            tools = app.query_one("#tools", Tree)
+            nodes = sidebar_tree_nodes(tools)
+            rendered = [node.label.plain for node in nodes]
 
             assert sidebar.outer_size.width == 42
             assert tools.styles.background.a == 0
-            assert tools.min_width == 1
             assert tools.virtual_size.width <= tools.size.width
-            assert rendered.index("search_tools  v1") < rendered.index("help  v1")
-            assert rendered.index("help  v1") < rendered.index("call_tool  v1")
+            assert rendered[0] == "core"
+            assert "search_tools" in rendered
+            assert "help" in rendered
+            assert "call_tool" in rendered
+            assert not any(" v1" in label for label in rendered)
+            assert not any("[" in label for label in rendered)
+
+    asyncio.run(exercise())
+
+
+def test_sidebar_toggles_navigates_namespaces_opens_tools_and_swaps_toolbox(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    kernel.create_toolbox("beta")
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+    session_id = app.conversation.session_id
+    initial_toolbox = kernel.active_toolboxes(session_id)[0]["name"]
+    kernel.write_tool(
+        name="python_helper",
+        description="This description belongs in tool details only.",
+        input_schema={"type": "object"},
+        source="async def main(input, ctx):\n    return 'ok'\n",
+        session_id=session_id,
+        namespaces=["development/python", "shared"],
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(100, 34)) as pilot:
+            sidebar = app.query_one("#sidebar")
+            assert sidebar.display is True
+            await pilot.press("ctrl+b")
+            assert sidebar.display is False
+            await pilot.press("ctrl+b")
+            assert sidebar.display is True
+
+            picker = app.query_one("#sidebar-toolbox", Select)
+            assert str(picker.query_one("#label", Static).render()) == initial_toolbox
+            assert initial_toolbox not in str(
+                app.query_one("#model-info", Static).render()
+            )
+
+            tree = app.query_one("#tools", Tree)
+            nodes = sidebar_tree_nodes(tree)
+            namespaces = {
+                node.data.value: node
+                for node in nodes
+                if isinstance(node.data, SidebarTreeItem)
+                and node.data.kind == "namespace"
+            }
+            assert {"development", "development/python", "shared"} <= namespaces.keys()
+            tool_nodes = [
+                node
+                for node in nodes
+                if node.data == SidebarTreeItem("tool", "python_helper")
+            ]
+            assert len(tool_nodes) == 2
+            labels = [node.label.plain for node in nodes]
+            assert "This description belongs in tool details only." not in labels
+            assert not any("v1" in label for label in labels)
+
+            namespaces["development"].collapse()
+            await pilot.pause()
+            app._refresh_sidebar()
+            development = next(
+                node
+                for node in sidebar_tree_nodes(tree)
+                if node.data == SidebarTreeItem("namespace", "development")
+            )
+            assert development.is_expanded is False
+
+            shared_tool = next(
+                node
+                for node in sidebar_tree_nodes(tree)
+                if node.data == SidebarTreeItem("tool", "python_helper")
+                and node.parent is not None
+                and node.parent.data == SidebarTreeItem("namespace", "shared")
+            )
+            tree.select_node(shared_tool)
+            await pilot.pause()
+            assert isinstance(app.screen, ToolManagerScreen)
+            assert app.screen.selected_name == "python_helper"
+            app.pop_screen()
+            await pilot.pause()
+
+            picker.value = "beta"
+            await pilot.pause()
+            assert [
+                toolbox["name"] for toolbox in kernel.active_toolboxes(session_id)
+            ] == ["beta"]
+            assert str(picker.query_one("#label", Static).render()) == "beta"
+            assert SidebarTreeItem("tool", "python_helper") not in {
+                node.data for node in sidebar_tree_nodes(tree)
+            }
 
     asyncio.run(exercise())
 

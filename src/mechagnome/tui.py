@@ -37,12 +37,13 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
-    RichLog,
     Select,
     Static,
     TabbedContent,
     TabPane,
+    Tree,
 )
+from textual.widgets.tree import TreeNode
 from textual_image.widget import Image as TerminalImage
 
 from mechagnome.harness import AgentEvent, Conversation, Harness, Model, RunCancelled
@@ -565,6 +566,22 @@ class SessionTab:
     ignored_detached_jobs: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class SidebarTreeItem:
+    """Semantic data attached to a toolbox sidebar tree node."""
+
+    kind: str
+    value: str
+
+
+@dataclass
+class SidebarNamespace:
+    """One namespace branch while constructing the toolbox tree."""
+
+    children: dict[str, SidebarNamespace] = field(default_factory=dict)
+    tools: dict[str, str] = field(default_factory=dict)
+
+
 class DeleteToolScreen(ModalScreen[bool]):
     """Require an explicit confirmation before removing an active binding."""
 
@@ -1053,6 +1070,7 @@ class ToolManagerScreen(Screen[None]):
         *,
         session_id: str,
         on_toolbox_changed: Any,
+        selected_name: str | None = None,
     ) -> None:
         super().__init__()
         self.kernel = kernel
@@ -1062,7 +1080,10 @@ class ToolManagerScreen(Screen[None]):
             "name"
         ]
         self.inventory = self._inventory()
-        self.selected_name = self.inventory[0]["name"]
+        available = {item["name"] for item in self.inventory}
+        self.selected_name = (
+            selected_name if selected_name in available else self.inventory[0]["name"]
+        )
         self.history = self.kernel.tool_history(
             self.selected_name, session_id=self.session_id
         )
@@ -1451,6 +1472,7 @@ class ToolboxApp(App[None]):
         Binding("tab", "next_session", "Next session", show=False, priority=True),
         Binding("up", "previous_prompt", "Previous prompt", show=False),
         Binding("down", "next_prompt", "Next prompt", show=False),
+        Binding("ctrl+b", "toggle_sidebar", "Sidebar", priority=True),
         ("ctrl+t", "manage_tools", "Manage tools"),
         ("f1", "show_help", "Help"),
     ]
@@ -1576,14 +1598,19 @@ class ToolboxApp(App[None]):
     }
 
     #model-info {
-        height: 5;
+        height: 4;
         padding: 0 1;
         color: #a8b8c8;
     }
 
+    #sidebar-toolbox {
+        height: 3;
+        margin: 0 1 1 1;
+    }
+
     #tools {
         height: 1fr;
-        padding: 1 2;
+        padding: 0 1;
         background: transparent;
         color: #d7e0ea;
         overflow-x: hidden;
@@ -1674,6 +1701,7 @@ class ToolboxApp(App[None]):
         self.session_tabs = [initial]
         self._active_pane_id = initial.pane_id
         self.model_options: list[OpenRouterModelOption] = []
+        self._collapsed_sidebar_namespaces: dict[tuple[str, ...], set[str]] = {}
 
     def _make_session_tab(
         self, *, conversation: Conversation | None = None
@@ -1723,7 +1751,18 @@ class ToolboxApp(App[None]):
                 yield Static("MODEL", classes="sidebar-title")
                 yield Static(id="model-info")
                 yield Static("TOOLBOX", classes="sidebar-title")
-                yield RichLog(id="tools", wrap=True, markup=False, min_width=1)
+                toolbox_options, toolbox_value = self._sidebar_toolbox_options()
+                yield Select(
+                    toolbox_options,
+                    value=toolbox_value,
+                    allow_blank=False,
+                    id="sidebar-toolbox",
+                )
+                tree = Tree[SidebarTreeItem]("tools", id="tools")
+                tree.show_root = False
+                tree.guide_depth = 2
+                tree.root.expand()
+                yield tree
         with Horizontal(id="status"):
             yield Static(id="status-message")
             yield Static("·", classes="status-separator")
@@ -2420,16 +2459,28 @@ class ToolboxApp(App[None]):
             )
         self.chat.write(Panel(table, title="active toolbox", border_style="blue"))
 
+    def action_toggle_sidebar(self) -> None:
+        """Show or hide the toolbox sidebar."""
+        sidebar = self.query_one("#sidebar")
+        sidebar.display = not sidebar.display
+        if not sidebar.display and len(self.screen_stack) == 1:
+            self.query_one("#prompt", Input).focus()
+
     def action_manage_tools(self) -> None:
         """Toggle the source, history, usage, and deletion manager."""
         if isinstance(self.screen, ToolManagerScreen):
             self.pop_screen()
             return
+        self._open_tool_manager()
+
+    def _open_tool_manager(self, selected_name: str | None = None) -> None:
+        """Open tool management, optionally focused on one sidebar tool."""
         self.push_screen(
             ToolManagerScreen(
                 self.kernel,
                 session_id=self.conversation.session_id,
                 on_toolbox_changed=self._refresh_sidebar,
+                selected_name=selected_name,
             )
         )
 
@@ -2440,6 +2491,7 @@ class ToolboxApp(App[None]):
                 Markdown(
                     "**Commands**\n\n"
                     "- `Esc` — stop the active tab's rollout\n"
+                    "- `Ctrl+B` — toggle the toolbox sidebar\n"
                     "- `Ctrl+N` or `/new` — open a new session tab\n"
                     "- `TAB` or click — switch session tabs\n"
                     "- `/compact` — continue in a child session in this tab\n"
@@ -2511,44 +2563,129 @@ class ToolboxApp(App[None]):
         self._set_status("error", state)
 
     def _refresh_sidebar(self) -> None:
-        bindings = self.kernel.bindings(
-            recent_first=True,
-            session_id=self.conversation.session_id,
-            include_origin=True,
-        )
+        catalog = self.kernel.catalog(session_id=self.conversation.session_id)
         selected = self.kernel.active_toolboxes(self.conversation.session_id)
-        core_count = sum(binding["kind"] == "core" for binding in bindings)
-        user_count = len(bindings) - core_count
-        selection = " + ".join(item["name"] for item in selected)
+        core_count = sum(tool["kind"] == "core" for tool in catalog)
+        user_count = len(catalog) - core_count
         self.query_one("#model-info", Static).update(
             f"{self._active_model_name}\n"
             f"session {self.conversation.session_id[:10]}\n"
-            f"{selection}\n"
             f"{core_count} core · {user_count} user"
         )
-        toolbox = self.query_one("#tools", RichLog)
-        toolbox.clear()
-        for index, binding in enumerate(bindings):
-            style = "cyan" if binding["kind"] == "core" else "green"
-            toolbox.write(
-                Text(
-                    f"{binding['name']}  v{binding['active_version']}  "
-                    f"[{binding['toolbox']}]",
-                    style=style,
-                    overflow="fold",
-                    no_wrap=False,
+        options, value = self._sidebar_toolbox_options(selected)
+        picker = self.query_one("#sidebar-toolbox", Select)
+        with self.prevent(Select.Changed):
+            picker.set_options(options)
+            picker.value = value
+        self._populate_tool_tree(catalog, selected)
+
+    def _sidebar_toolbox_options(
+        self, selected: list[dict[str, Any]] | None = None
+    ) -> tuple[list[tuple[str, str]], str]:
+        """Build toolbox choices while faithfully representing an active stack."""
+        selected = selected or self.kernel.active_toolboxes(
+            self.conversation.session_id
+        )
+        options = [
+            (item["name"], item["name"]) for item in self.kernel.list_toolboxes()
+        ]
+        if len(selected) == 1:
+            return options, str(selected[0]["name"])
+        stack_name = " + ".join(str(item["name"]) for item in selected)
+        stack_value = "active:" + ":".join(str(item["id"]) for item in selected)
+        return [(stack_name, stack_value), *options], stack_value
+
+    def _populate_tool_tree(
+        self,
+        catalog: list[dict[str, Any]],
+        selected: list[dict[str, Any]],
+    ) -> None:
+        """Render tools under their hierarchical discovery namespaces."""
+        toolbox_key = self._toolbox_stack_key(selected)
+        collapsed = self._collapsed_sidebar_namespaces.setdefault(toolbox_key, set())
+        namespace_tree = SidebarNamespace()
+        for tool in catalog:
+            for namespace in tool["namespaces"]:
+                branch = namespace_tree
+                for segment in str(namespace).split("/"):
+                    branch = branch.children.setdefault(segment, SidebarNamespace())
+                branch.tools[str(tool["name"])] = str(tool["kind"])
+
+        tree = self.query_one("#tools", Tree)
+        tree.clear()
+
+        def add_branch(
+            parent: TreeNode[SidebarTreeItem],
+            branch: SidebarNamespace,
+            prefix: str = "",
+        ) -> None:
+            for segment, child in sorted(branch.children.items()):
+                path = f"{prefix}/{segment}" if prefix else segment
+                node = parent.add(
+                    Text(segment, style="bold #7dd3fc"),
+                    SidebarTreeItem("namespace", path),
+                    expand=path not in collapsed,
                 )
-            )
-            toolbox.write(
-                Text(
-                    binding["description"],
-                    style="dim",
-                    overflow="fold",
-                    no_wrap=False,
+                add_branch(node, child, path)
+            for name, kind in sorted(branch.tools.items()):
+                parent.add_leaf(
+                    Text(name, style="cyan" if kind == "core" else "green"),
+                    SidebarTreeItem("tool", name),
                 )
+
+        add_branch(tree.root, namespace_tree)
+        tree.root.expand()
+
+    @on(Select.Changed, "#sidebar-toolbox")
+    def select_sidebar_toolbox(self, event: Select.Changed) -> None:
+        """Replace the active toolbox stack from the sidebar selector."""
+        if event.value is Select.NULL or str(event.value).startswith("active:"):
+            return
+        name = str(event.value)
+        selected = self.kernel.active_toolboxes(self.conversation.session_id)
+        if len(selected) == 1 and selected[0]["name"] == name:
+            return
+        try:
+            self.kernel.select_toolboxes(
+                self.conversation.session_id, [name], mode="use"
             )
-            if index < len(bindings) - 1:
-                toolbox.write("")
+        except Exception as error:
+            self._set_status(f"toolbox change failed: {error}")
+        else:
+            self._set_status(f"toolbox → {name}")
+        self._refresh_sidebar()
+
+    @on(Tree.NodeSelected, "#tools")
+    def select_sidebar_tree_node(self, event: Tree.NodeSelected) -> None:
+        """Open the existing information display for a selected tool leaf."""
+        item = event.node.data
+        if isinstance(item, SidebarTreeItem) and item.kind == "tool":
+            self._open_tool_manager(item.value)
+
+    @on(Tree.NodeCollapsed, "#tools")
+    def collapse_sidebar_namespace(self, event: Tree.NodeCollapsed) -> None:
+        """Remember collapsed namespaces when dynamic tool events refresh the tree."""
+        item = event.node.data
+        if isinstance(item, SidebarTreeItem) and item.kind == "namespace":
+            selected = self.kernel.active_toolboxes(self.conversation.session_id)
+            key = self._toolbox_stack_key(selected)
+            self._collapsed_sidebar_namespaces.setdefault(key, set()).add(item.value)
+
+    @on(Tree.NodeExpanded, "#tools")
+    def expand_sidebar_namespace(self, event: Tree.NodeExpanded) -> None:
+        """Remember expanded namespaces when dynamic tool events refresh the tree."""
+        item = event.node.data
+        if isinstance(item, SidebarTreeItem) and item.kind == "namespace":
+            selected = self.kernel.active_toolboxes(self.conversation.session_id)
+            key = self._toolbox_stack_key(selected)
+            self._collapsed_sidebar_namespaces.setdefault(key, set()).discard(
+                item.value
+            )
+
+    @staticmethod
+    def _toolbox_stack_key(selected: list[dict[str, Any]]) -> tuple[str, ...]:
+        """Return the ordered toolbox identity used for sidebar-local state."""
+        return tuple(str(toolbox["id"]) for toolbox in selected)
 
     def _refresh_model_controls(self) -> None:
         selector = self.query_one("#model-selector", Button)

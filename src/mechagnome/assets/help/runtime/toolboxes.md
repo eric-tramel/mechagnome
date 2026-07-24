@@ -9,9 +9,11 @@ ordered idempotent union, remove toolboxes, or reset the session to its cwd
 default. A top-level call snapshots the active stack for its complete nested
 call tree, so a hot swap affects the next call rather than an in-flight call.
 
-In the TUI, `/tools` or `Ctrl+T` opens tool management. Its toolbox picker
-switches the session to another registered toolbox. **Blank** creates and
-selects a new core-only toolbox, while **Save as…** renames the current toolbox
+In the TUI, the open-by-default sidebar has a toolbox picker that replaces the
+active stack with another registered toolbox. `Ctrl+B` toggles the sidebar.
+Selecting a tool in its namespace tree opens that tool directly in management.
+`/tools` or `Ctrl+T` also opens tool management, where **Blank** creates and
+selects a new core-only toolbox and **Save as…** renames the current toolbox
 without changing its tools, history, or cwd association.
 
 Cwd associations select defaults and preserve the session execution directory.

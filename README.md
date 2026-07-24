@@ -68,8 +68,9 @@ uv run mechagnome
 
 That opens the terminal UI with `z-ai/glm-5.2` as the default model. Responses
 appear incrementally as OpenRouter streams them; fragmented tool calls are
-assembled before execution. The main pane is the saved multi-turn conversation,
-and the sidebar updates as the agent creates or replaces tools. State defaults to
+assembled before execution. The main pane is the saved multi-turn conversation.
+The sidebar groups tool names into collapsible namespace trees and updates as the
+agent creates or replaces tools. State defaults to
 `~/.local/share/mechagnome/toolbox.db`, which holds toolbox routing, namespace
 assignments, tools, and sessions. A fresh working directory receives its own
 default toolbox; an existing session retains its saved ordered stack when resumed.
@@ -83,6 +84,9 @@ those effort levels.
 TUI commands:
 
 - `Esc` stops the active tab's model stream or tool rollout.
+- `Ctrl+B` toggles the sidebar, which starts open. Its toolbox picker replaces
+  the active stack with another registered toolbox; selecting a tool name opens
+  that tool directly in tool management.
 - `Ctrl+N` or `/new` opens a fresh saved conversation in a new tab without
   clearing tools. Use `TAB` or click a session tab to switch conversations.
 - `/compact` replaces the active conversation with a durable child session in
