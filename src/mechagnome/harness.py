@@ -537,6 +537,14 @@ def _agent_failure(error: Exception) -> ToolboxError:
     return ToolboxError("model_provider_failed", "model provider request failed")
 
 
+def _parent_session_message(parent_session_id: str) -> dict[str, Any]:
+    """System message informing a child agent of its parent session."""
+    return {
+        "role": "system",
+        "content": f"Parent session ID: {parent_session_id}.",
+    }
+
+
 class Conversation:
     """A durable, multi-prompt model conversation over one toolbox session."""
 
@@ -556,7 +564,12 @@ class Conversation:
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner
         self._agent_coordinator = _agent_coordinator
-        self.messages = messages or []
+        self.messages = list(messages or [])
+        parent_session_id = self.kernel.session_metadata(self.session_id)[
+            "parent_session_id"
+        ]
+        if parent_session_id is not None:
+            self.messages.insert(0, _parent_session_message(parent_session_id))
         self._run_lock = Lock()
         self._current_token: _CancellationToken | None = None
         self._current_agent_budget: _AgentLaunchBudget | None = None
