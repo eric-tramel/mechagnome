@@ -1636,6 +1636,11 @@ class ToolboxApp(App[None]):
         scrollbar-background: transparent;
     }
 
+    #agent-sessions > .tree--root {
+        color: #7dd3fc;
+        text-style: bold;
+    }
+
     #agent-sessions-title {
         color: #8fa5ba;
         text-style: bold;
@@ -1794,7 +1799,7 @@ class ToolboxApp(App[None]):
                     "AGENTS", id="agent-sessions-title", classes="sidebar-title"
                 )
                 agent_tree = Tree[SidebarTreeItem]("agents", id="agent-sessions")
-                agent_tree.show_root = False
+                agent_tree.show_root = True
                 agent_tree.guide_depth = 2
                 agent_tree.root.expand()
                 yield agent_tree
@@ -2681,7 +2686,7 @@ class ToolboxApp(App[None]):
         tree.root.expand()
 
     def _populate_agent_tree(self) -> None:
-        """Render child and detached agent sessions under the active session."""
+        """Render the active session as root with child agent sessions below."""
         active_session_id = self.conversation.session_id
         all_sessions: list[dict[str, Any]] = []
         cursor = 0
@@ -2707,14 +2712,6 @@ class ToolboxApp(App[None]):
         tree = self.query_one("#agent-sessions", Tree)
         tree.clear()
 
-        if not descendants:
-            tree.root.add_leaf(
-                Text("(no child sessions)", style="dim #8fa5ba"),
-                SidebarTreeItem("agent_session", ""),
-            )
-            tree.root.expand()
-            return
-
         # Track which sessions are running (have matching tabs that are running).
         running_sessions: set[str] = set()
         for state in self.session_tabs:
@@ -2735,31 +2732,21 @@ class ToolboxApp(App[None]):
         # Build a set of session IDs that have completed and haven't been viewed.
         completed_unviewed: set[str] = set()
 
-        def add_session_node(
-            parent: TreeNode[SidebarTreeItem],
-            session: dict[str, Any],
-        ) -> None:
+        def _session_label(session: dict[str, Any]) -> Text:
             session_id = str(session["id"])
             is_running = session_id in running_sessions
-
-            # Determine notification badge.
             badge = ""
             if not is_running:
-                # Check if this is a completed session awaiting user attention.
                 if (
                     session_id not in self._viewed_agent_sessions
                     and session_id not in self._notified_agent_sessions
                 ):
-                    # Mark for notification.
                     completed_unviewed.add(session_id)
                 if session_id in self._notified_agent_sessions:
                     badge = " !"
-
-            # Build the label.
             kind = str(session.get("kind", "agent"))
             short_id = session_id[:8]
             event_count = session.get("event_count", 0)
-
             if is_running:
                 label = Text(f"{spinner_frame} ", style="yellow")
                 label.append(
@@ -2772,17 +2759,51 @@ class ToolboxApp(App[None]):
                     label.append(badge, style="bold yellow")
                 else:
                     label = Text(f"{kind} {short_id} ({event_count})", style="#7890a6")
+            return label
 
-            node = parent.add(
-                label,
-                SidebarTreeItem("agent_session", session_id),
-                expand=True,
+        def add_session_node(
+            parent: TreeNode[SidebarTreeItem],
+            session: dict[str, Any],
+        ) -> None:
+            session_id = str(session["id"])
+            label = _session_label(session)
+            session_children = children_by_parent.get(session_id, [])
+            if session_children:
+                node = parent.add(
+                    label,
+                    SidebarTreeItem("agent_session", session_id),
+                    expand=True,
+                )
+                for child in session_children:
+                    add_session_node(node, child)
+            else:
+                parent.add_leaf(
+                    label,
+                    SidebarTreeItem("agent_session", session_id),
+                )
+
+        # Bug 1: Show the active (root) session as the tree root node.
+        active_session_data = {
+            "id": active_session_id,
+            "kind": "conversation",
+            "event_count": 0,
+        }
+        # Try to find the active session in all_sessions for richer metadata.
+        for session in all_sessions:
+            if str(session["id"]) == active_session_id:
+                active_session_data = session
+                break
+        tree.root.set_label(_session_label(active_session_data))
+        tree.root.data = SidebarTreeItem("agent_session", active_session_id)
+
+        if not descendants:
+            tree.root.add_leaf(
+                Text("(no child sessions)", style="dim #8fa5ba"),
+                SidebarTreeItem("agent_session", ""),
             )
-            for child in children_by_parent.get(session_id, []):
-                add_session_node(node, child)
-
-        for child in children_by_parent.get(active_session_id, []):
-            add_session_node(tree.root, child)
+        else:
+            for child in children_by_parent.get(active_session_id, []):
+                add_session_node(tree.root, child)
 
         tree.root.expand()
 
@@ -2799,7 +2820,7 @@ class ToolboxApp(App[None]):
 
     @on(Tree.NodeSelected, "#agent-sessions")
     def select_agent_session_node(self, event: Tree.NodeSelected) -> None:
-        """Switch to the tab for a selected agent session, if one exists."""
+        """Display the selected agent session's events in the conversation viewer."""
         item = event.node.data
         if not isinstance(item, SidebarTreeItem) or item.kind != "agent_session":
             return
@@ -2809,17 +2830,126 @@ class ToolboxApp(App[None]):
         # Mark as viewed.
         self._viewed_agent_sessions.add(session_id)
         self._notified_agent_sessions.discard(session_id)
+        self._populate_agent_tree()
+
+        # If this is the active session, just ensure we're on its tab.
+        active_session_id = self.conversation.session_id
+        if session_id == active_session_id:
+            self._set_status(f"viewing active session {session_id[:8]}")
+            return
 
         # Find an existing tab for this session.
         for state in self.session_tabs:
             if state.conversation.session_id == session_id:
                 self.query_one("#session-tabs", TabbedContent).active = state.pane_id
                 self._set_status(f"switched to {session_id[:8]}", state)
-                self._populate_agent_tree()
                 return
 
-        # No existing tab — show a status message.
-        self._set_status(f"session {session_id[:8]} has no open tab")
+        # No existing tab — render the session's events into the active chat feed.
+        self._render_session_events(session_id)
+        self._set_status(f"viewing session {session_id[:8]}")
+
+    def _render_session_events(self, session_id: str) -> None:
+        """Render a read-only view of a session's events into the active chat feed."""
+        state = self.active_session
+        state.chat.clear()
+        state.chat.write(
+            Panel(
+                Text(
+                    f"session {session_id[:12]}\n"
+                    "read-only view \u2014 type a new prompt to return to the live",
+                    " conversation",
+                    style="dim",
+                ),
+                title="session viewer",
+                border_style="blue",
+            )
+        )
+        after = 0
+        events: list[dict[str, Any]] = []
+        while True:
+            page = self.kernel.read_session(session_id, after=after, limit=100)
+            events.extend(page["events"])
+            if page["next_after"] is None:
+                break
+            after = page["next_after"]
+        for event in events:
+            kind = event.get("kind")
+            payload = event.get("payload", {})
+            if kind == "user":
+                content = str(payload.get("content", ""))[:2000]
+                if content:
+                    state.chat.write(
+                        Panel(
+                            Markdown(content),
+                            title="you",
+                            title_align="left",
+                            border_style="yellow",
+                        )
+                    )
+            elif kind == "model":
+                text = str(payload.get("text") or "")
+                calls = payload.get("calls") or []
+                if text:
+                    state.chat.write(
+                        Panel(
+                            Markdown(text),
+                            title=self._active_model_name,
+                            title_align="left",
+                            border_style="bright_magenta",
+                        )
+                    )
+                for call in calls:
+                    if isinstance(call, dict):
+                        call_name = str(call.get("name", "tool"))
+                        call_args = call.get("args")
+                        state.chat.write_tool(
+                            "call",
+                            call_name,
+                            self._compact(call_args),
+                            self._argument_summary(call_args),
+                        )
+            elif kind == "call_started":
+                tool_name = str(event.get("tool_name") or "tool")
+                args = payload.get("args")
+                state.chat.write_tool(
+                    "call",
+                    tool_name,
+                    self._compact(args),
+                    self._argument_summary(args),
+                )
+            elif kind == "call_succeeded":
+                tool_name = str(event.get("tool_name") or "tool")
+                result = payload.get("result", payload)
+                state.chat.write_tool(
+                    "response",
+                    tool_name,
+                    self._compact(_summarize_tool_images(result)),
+                    outcome_summary=" \u00b7 completed",
+                )
+            elif kind == "call_failed":
+                tool_name = str(event.get("tool_name") or "tool")
+                error = payload.get("error", payload)
+                state.chat.write_tool(
+                    "error",
+                    tool_name,
+                    self._compact(error),
+                    outcome_summary=" · failed",
+                )
+            elif kind == "final":
+                content = str(payload.get("content", ""))[:4000]
+                if content:
+                    state.chat.write(
+                        Panel(
+                            Markdown(content),
+                            title=f"{self._active_model_name} · final",
+                            title_align="left",
+                            border_style="green",
+                        )
+                    )
+            elif kind == "model_failed":
+                error = str(payload.get("message") or payload)
+                state.chat.write(Panel(Text(error), title="error", border_style="red"))
 
     @on(Select.Changed, "#sidebar-toolbox")
     def select_sidebar_toolbox(self, event: Select.Changed) -> None:
