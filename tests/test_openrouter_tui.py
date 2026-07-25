@@ -4071,7 +4071,6 @@ def test_tui_shows_tool_activity_refreshes_sidebar_and_runs_commands(
             await pilot.click(hello)
             assert hello.collapsed is False
             assert "hello" in tools
-            assert "1 user" in str(app.query_one("#model-info", Static).render())
 
             await submit(pilot, "/tools")
             assert isinstance(app.screen, ToolManagerScreen)
@@ -4536,7 +4535,6 @@ def test_tui_creates_and_composes_toolbox_namespaces(tmp_path: Path) -> None:
             assert "identity" in tools
             picker = app.query_one("#sidebar-toolbox", Select)
             assert str(picker.query_one("#label", Static).render()) == "beta + alpha"
-            assert "beta" not in str(app.query_one("#model-info", Static).render())
             await submit(pilot, "/toolbox list")
             chat = chat_text(app)
             assert "toolboxes" in chat
@@ -4681,9 +4679,11 @@ def test_sidebar_toggles_navigates_namespaces_opens_tools_and_swaps_toolbox(
 
             picker = app.query_one("#sidebar-toolbox", Select)
             assert str(picker.query_one("#label", Static).render()) == initial_toolbox
-            assert initial_toolbox not in str(
-                app.query_one("#model-info", Static).render()
-            )
+            assert len(app.query("#model-info")) == 0
+            sidebar_titles = [
+                str(title.render()) for title in sidebar.query(".sidebar-title")
+            ]
+            assert sidebar_titles == ["AGENTS"]
 
             tree = app.query_one("#tools", Tree)
             nodes = sidebar_tree_nodes(tree)

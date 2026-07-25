@@ -1600,12 +1600,6 @@ class ToolboxApp(App[None]):
         text-style: bold;
     }
 
-    #model-info {
-        height: 4;
-        padding: 0 1;
-        color: #a8b8c8;
-    }
-
     #sidebar-toolbox {
         height: 3;
         margin: 0 1 1 1;
@@ -1780,9 +1774,6 @@ class ToolboxApp(App[None]):
                 with TabPane(initial.label, id=initial.pane_id):
                     yield initial.chat
             with Vertical(id="sidebar"):
-                yield Static("MODEL", classes="sidebar-title")
-                yield Static(id="model-info")
-                yield Static("TOOLBOX", classes="sidebar-title")
                 toolbox_options, toolbox_value = self._sidebar_toolbox_options()
                 yield Select(
                     toolbox_options,
@@ -2613,13 +2604,6 @@ class ToolboxApp(App[None]):
         # catalog intentionally contains only tools that remain callable.
         active_tools = self.kernel.catalog(session_id=self.conversation.session_id)
         selected = self.kernel.active_toolboxes(self.conversation.session_id)
-        core_count = sum(tool["kind"] == "core" for tool in active_tools)
-        user_count = len(active_tools) - core_count
-        self.query_one("#model-info", Static).update(
-            f"{self._active_model_name}\n"
-            f"session {self.conversation.session_id[:10]}\n"
-            f"{core_count} core · {user_count} user"
-        )
         options, value = self._sidebar_toolbox_options(selected)
         picker = self.query_one("#sidebar-toolbox", Select)
         with self.prevent(Select.Changed):
