@@ -360,6 +360,7 @@ class OpenRouterModel:
             "input": self._wire_input(messages),
             "tools": [self._wire_tool(tool) for tool in tools],
             "parallel_tool_calls": True,
+            "max_output_tokens": 8192,
             "store": False,
             "stream": True,
         }
@@ -802,18 +803,9 @@ class OpenRouterModel:
                         dict(item)
                         for item in response_items
                         if isinstance(item, Mapping)
+                        and item.get("type") != "reasoning"
                     )
                     continue
-                details = message.get("reasoning_details")
-                if isinstance(details, Sequence) and not isinstance(
-                    details, (str, bytes)
-                ):
-                    wired.extend(
-                        dict(detail)
-                        for detail in details
-                        if isinstance(detail, Mapping)
-                        and detail.get("type") == "reasoning"
-                    )
                 calls = message.get("tool_calls") or ()
                 wired.extend(
                     {
