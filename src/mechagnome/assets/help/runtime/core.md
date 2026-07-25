@@ -26,6 +26,11 @@ A host-only rollback command can recover a broken core binding.
 disappears from catalog/search/listings, while retaining its lineage and
 version history. Core tools cannot be deleted.
 
+The optional `version` parameter targets a specific version row instead of
+the whole binding. Deleting the active version rolls the binding back to the
+next-highest remaining version. The last remaining version of a lineage
+cannot be removed.
+
 ## Agent action
 
 `run_agent` is a host action rather than an editable core tool. Every root,

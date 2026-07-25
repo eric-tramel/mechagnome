@@ -366,7 +366,7 @@ logical slot in which they run:
 | `search_tools` | `ctx.kernel.catalog(include_core=True)` |
 | `view_tool` | `ctx.kernel.view_tool(name, version=None)` |
 | `write_tool` | `ctx.kernel.write_tool(...)` |
-| `delete_tool` | `ctx.kernel.delete_tool(name)` |
+| `delete_tool` | `ctx.kernel.delete_tool(name, version=None)` |
 | `call_tool` | `await ctx.kernel.execute(name, args, version=None)` |
 
 For example, a replacement `search_tools` implementation can inspect the
