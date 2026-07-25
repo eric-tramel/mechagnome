@@ -1,7 +1,7 @@
 # Sessions
 
-Every tool receives bounded, read-only access to durable session history through
-`ctx.sessions` (`SessionAccess`). The context is scoped to the session that
+Every tool receives bounded access to durable session history and conversation
+prompting through `ctx.sessions` (`SessionAccess`). The context is scoped to the session that
 started the current call tree:
 
 ```python
@@ -17,8 +17,11 @@ the same durable session ID. A model completion requested by one of those tools
 is different: it becomes its own durable child session. A model session bound
 under that child can create grandchildren in the same way.
 
-Sessions have immutable `kind`, `parent_session_id`, and `origin_call_id`
-metadata. Kinds are `generic` for host/tool-only history, `conversation` for
+Sessions have immutable lineage and context metadata. `parent_session_id`
+identifies the session tree, while `origin_session_id` and `origin_call_id`
+identify the tool call that created a child. Forks additionally record
+`context_source_session_id` and `context_through_seq`, an immutable snapshot
+boundary. Kinds are `generic` for host/tool-only history, `conversation` for
 every root or recursively launched agent, and `completion` for one accepted text-only
 `await ctx.model_provider.complete(...)` call. `root_session_id` is derived by
 walking the parent chain rather than stored separately.
@@ -31,6 +34,66 @@ walking the parent chain rather than stored separately.
   creation order.
 - `ctx.sessions.metadata(session_id=None)` returns identity and lineage for the
   current or named session.
+- `ctx.sessions.get(session_id=None)` returns a `ToolSession` handle.
+- `await ctx.sessions.inspect(job_id)` inspects a detached prompt job.
+
+A `ToolSession` exposes `id`, `kind`, `parent_id`, `root_id`, `title`,
+`description`, `origin_session_id`, `origin_call_id`, `metadata`, `read()`,
+`update_metadata()`, and async `prompt()`. Prompting has three explicit modes:
+
+```python
+async def main(input, ctx):
+    session = ctx.sessions.get(input.get("session_id"))
+    return await session.prompt(
+        input["prompt"],
+        mode=input.get("mode", "continue"),
+        detach=input.get("detach", False),
+    )
+```
+
+- `continue` appends the userspace prompt to the same idle conversation.
+- `spawn` creates a fresh child conversation with inherited lineage and toolbox
+  scope but no inherited transcript.
+- `fork` creates a child whose initial context is the source conversation
+  through its latest completed turn.
+
+Pair the returned session identity with metadata updates to make spawned or
+forked work easy to recognize later:
+
+```python
+async def main(input, ctx):
+    source = ctx.sessions.get(input.get("session_id"))
+    outcome = await source.prompt(input["prompt"], mode="spawn")
+    spawned = ctx.sessions.get(outcome["session_id"])
+    metadata = spawned.update_metadata(
+        title="Dependency investigation",
+        description="Checks whether the proposed upgrade breaks callers.",
+    )
+    return {"outcome": outcome, "metadata": metadata}
+```
+
+`update_metadata()` accepts `title` and `description`; either may be cleared
+with `None`. Updates are restricted to the caller's session tree. The returned
+metadata and the handle's `title`, `description`, and `metadata` snapshot reflect
+the update immediately.
+
+When the labels are known before work starts, apply them atomically with the
+prompt so invalid metadata cannot launch an unlabeled session:
+
+```python
+outcome = await source.prompt(
+    input["prompt"],
+    mode="spawn",
+    metadata={"title": "Dependency investigation", "description": input["goal"]},
+)
+```
+
+Foreground calls return `session_id`, `status`, and `result`. Detached calls
+return `job_id`, `session_id`, and `status`; inspect the job later through
+`ctx.sessions.inspect(job_id)`. A session cannot continue itself from one of
+its active tool calls and returns `conversation_busy`. Spawn remains valid from
+an active tool call because it prompts a different child session. Forks exclude
+an unfinished active turn and snapshot the latest completed boundary.
 
 `current` and `read` return this shape:
 
@@ -42,7 +105,12 @@ walking the parent chain rather than stored separately.
     "parent_session_id": null,
     "root_session_id": "...",
     "kind": "conversation",
+    "origin_session_id": null,
     "origin_call_id": null,
+    "context_source_session_id": null,
+    "context_through_seq": null,
+    "title": "Dependency investigation",
+    "description": "Checks whether the proposed upgrade breaks callers.",
     "cwd": "/workspace",
     "created_at": "..."
   },
@@ -66,7 +134,12 @@ events in that page. Limits are clamped to the range 1 through 100.
       "parent_session_id": null,
       "root_session_id": "...",
       "kind": "conversation",
+      "origin_session_id": null,
       "origin_call_id": null,
+      "context_source_session_id": null,
+      "context_through_seq": null,
+      "title": "Dependency investigation",
+      "description": "Checks whether the proposed upgrade breaks callers.",
       "created_at": "...",
       "event_count": 12
     }
@@ -161,6 +234,7 @@ attributes that sample to the resolved version. Nested durations are inclusive,
 so parent and child durations must not be summed. Calls interrupted by timeout,
 cancellation, or worker failure may have no terminal event or duration sample.
 
-Session access is read-only but not an authorization boundary: a tool can list
-saved sessions and read one when it knows the ID. Do not store secrets in
-session payloads that authored code should not inspect.
+Session reads are not an authorization boundary: a tool can list saved sessions
+and read one when it knows the ID. Prompt mutation is restricted to the current
+session tree. Do not store secrets in session payloads that authored code should
+not inspect or send to the configured model provider.

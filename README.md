@@ -28,7 +28,7 @@
 </p>
 <p align="center"><sub><strong>Reuse tools across sessions.</strong> A fresh conversation calls the persisted tool directly—no regeneration or provider-side magic.</sub></p>
 
-A small proof of a metaprogrammable agent toolbox. The model sees seven editable
+A small proof of a metaprogrammable agent toolbox. The model sees nine editable
 toolbox operations:
 
 - `help`
@@ -38,18 +38,20 @@ toolbox operations:
 - `view_tool`
 - `write_tool`
 - `call_tool`
+- `delete_tool`
+- `run_agent`
 
-It also sees the host-owned `run_agent` action. Every agent session—root or
-recursively launched—receives this same eight-action surface.
+Every agent session—root or recursively launched—receives this same nine-tool
+surface.
 
 It begins with no user-authored tools. During a session, an agent can write a
 Python tool, call it immediately, find it again later, compose it from other
-tools, and inspect current or historical sessions. The seven core operations are
+tools, and inspect current or historical sessions. The nine core operations are
 also readable and replaceable through `write_tool`; their code-shipped version 1
 defaults track the installed library, while persisted version 2 and later
 implementations are immutable. Each working directory has a default toolbox,
 and sessions may compose an ordered toolbox stack without changing the
-provider-facing seven-tool surface. Inside a toolbox, tools belong to one or more
+provider-facing nine-tool surface. Inside a toolbox, tools belong to one or more
 hierarchical discovery namespaces such as `development/python`. Search results
 expose those namespaces alongside each matching tool, while the tool manager
 summarizes passive call, outcome, duration, and session metrics.
@@ -274,6 +276,24 @@ async def main(input, ctx):
     }
 ```
 
+Session handles also expose mutable human-facing metadata. This makes it
+possible to compose a session transition with naming and describing the result:
+
+```python
+async def main(input, ctx):
+    source = ctx.sessions.get(input.get("session_id"))
+    outcome = await source.prompt(input["prompt"], mode="spawn")
+    spawned = ctx.sessions.get(outcome["session_id"])
+    spawned.update_metadata(
+        title=input["title"],
+        description=input["description"],
+    )
+    return outcome
+```
+
+Pass `None` to clear either field. Metadata changes are limited to sessions in
+the caller's session tree.
+
 A `call_started` event is committed before the source runs, so a tool reading
 the current session sees its own in-progress call. Events use a stable
 per-session sequence and include nested parent call IDs and resolved versions.
@@ -297,21 +317,26 @@ eight attempts; requests and responses are size-bounded. Every accepted call
 implicitly creates a logged `completion` session whose parent is the tool's
 current session and whose origin is the actual nested tool call ID.
 
-Agents delegate directly with `run_agent({"prompt": "..."})`. The provider
-creates a logged `conversation` child first, and that agent receives the same
-actions, so delegation can recurse without a separate subagent capability set.
-Set `detach=true` to receive a process-lifetime child-session `job_id`, continue
-other work, and inspect that ID through `run_agent` later. Existing authored
-tools may still use `await ctx.model_provider.run_agent(prompt)` as a
-foreground-only compatibility API.
+Agents delegate directly with the `run_agent` core tool. Its shipped source is
+an ordinary wrapper over `ctx.sessions`, the same capability every authored tool
+receives. A session handle can `continue` the same idle conversation, `spawn` a
+fresh child without transcript inheritance, or `fork` a child from the source's
+latest completed context. Spawn is the default and preserves the original
+`run_agent({"prompt": "..."})` behavior. `run_agent` also accepts optional
+`title` and `description` fields and applies them to the prompted session. Set
+`detach=true` to receive distinct
+process-lifetime `job_id` and durable `session_id` values, continue other work,
+and inspect the job through `run_agent` later. Existing authored tools may still
+use `await ctx.model_provider.run_agent(prompt)` as a foreground-only spawn
+compatibility API.
 
 ## Model adapter boundary
 
 The TUI wraps the bundled streaming `OpenRouterModel` in a host-owned
 `ModelProvider`. The provider creates/binds durable sessions and is the sole
 route from the harness to raw model transport. A transport adapter receives the
-accumulated messages and the same seven editable operation definitions plus the
-host `run_agent` definition on every turn, then returns a `ModelTurn`:
+accumulated messages and the same nine editable tool definitions on every turn,
+then returns a `ModelTurn`:
 
 ```python
 from mechagnome import Harness, Kernel, ModelProvider, ModelTurn, ToolCall
@@ -352,7 +377,7 @@ context remaining; the indicator stays hidden when either value is unavailable.
 After a successful rollout reaches 25% remaining, the TUI automatically continues
 in a compacted child session.
 
-The harness rejects calls outside its six model actions. Dynamic tools never
+The harness rejects calls outside its nine core tools. Dynamic tools never
 need to be registered with the inference provider; they are reached through the
 stable `call_tool(name, args, version=None)` envelope.
 
@@ -380,15 +405,16 @@ across each top-level rollout and all of its recursive descendants. They also
 have a separate detached pool with the same four-running and 64-terminal
 retention limits. Start one with
 `{"prompt": "...", "detach": true}` and inspect it with
-`{"job_id": "..."}`. The job ID is the durable child conversation ID. A
-successful inspection includes its final text as `result`; a failure includes a
-structured `error`. The creator conversation and its ancestors may inspect the
-handle, while unrelated and sibling sessions may not. Foreground cancellation
-does not stop detached agents; `Harness.close()` does.
+`{"job_id": "..."}`. Detached starts return both a process-lifetime job ID and
+the durable prompted session ID. A successful inspection includes its final
+text as `result`; a failure includes a structured `error`. The creator
+conversation and its ancestors may inspect the handle, while unrelated and
+sibling sessions may not. Foreground cancellation does not stop detached
+prompts; `Harness.close()` does.
 
 ## Metacircular core
 
-The outer names and schemas of the seven editable operations are pinned so a
+The outer names and schemas of the nine editable tools are pinned so a
 provider can keep one stable toolbox surface. Their version 1 descriptions, source, and behavior
 are code-shipped defaults refreshed from the installed library at startup.
 Persisted version 2 and later implementations can override those defaults like
@@ -407,6 +433,8 @@ suffix before the new core slot is installed.
 | `view_tool` | view stored source, metadata, and schemas |
 | `write_tool` | compile, store, and bind versions |
 | `call_tool` | resolve and execute a version |
+| `delete_tool` | remove bindings or versions while retaining lineage |
+| `run_agent` | continue, spawn, fork, or inspect conversation prompts |
 
 Copying the source of `search_tools` into a user tool does not give that copy
 the catalog capability. Activating the same source in the `search_tools` slot

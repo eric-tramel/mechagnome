@@ -37,7 +37,7 @@ keyword ranking.
 The TUI sidebar presents these paths as a collapsible tree. Tool leaves show only
 their callable names; selecting one opens its source, history, and usage details.
 
-Namespaces do not affect `call_tool` resolution, the fixed seven core operation
+Namespaces do not affect `call_tool` resolution, the fixed nine core tool
 slots, capabilities, or filesystem access. They are organization metadata, not
 security boundaries. Use `help(topic="toolboxes")` for the separate ordered
 toolbox-stack and working-directory routing behavior.

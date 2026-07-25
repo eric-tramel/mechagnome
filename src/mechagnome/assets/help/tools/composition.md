@@ -19,10 +19,11 @@ call, while event tracing records distinct call IDs and their parent-child
 relationship. They also share the host-bound `ctx.model_provider` capability and
 its limit of eight delegated-model attempts per top-level call tree. Each
 accepted provider completion is logged in a new child session whose origin is
-the nested tool that requested it. `run_agent()` similarly creates a full
-`conversation` child, and recursive delegation creates grandchildren under the
-agent that made each call. Ordinary nested tool calls themselves remain in the
-shared parent session.
+the nested tool that requested it. The default `run_agent()` spawn mode creates
+a fresh `conversation` child, while continue and fork modes target existing
+conversation state explicitly. Recursive delegation creates grandchildren
+under the agent that made each call. Ordinary nested tool calls themselves
+remain in the shared parent session.
 
 ## Active and pinned calls
 
@@ -105,9 +106,13 @@ Nested failures propagate to the caller unless authored source catches the
 exception. Catch only failures the tool can handle meaningfully; otherwise let
 the failed call and its trace remain visible.
 
-Long-running work requested directly by the model may use the host's detached
+Long-running work requested directly by the model may use the detached
 `call_tool` mode described in `help({"topic": "core"})`. Authored
 `ctx.call_tool` composition remains an awaited foreground call: a tool cannot
-detach one of its own nested calls. Models can run full agents directly in
-foreground or detached mode through the host `run_agent` action described in
-the same help topic.
+detach one of its own nested calls. Models can prompt full conversations in
+foreground or detached mode through the `run_agent` core tool described in the
+same help topic. Authored tools receive its underlying generic
+`ctx.sessions.get(...).prompt(...)` API with `continue`, `spawn`, and `fork`
+modes. Because prompt outcomes include the durable `session_id`, a tool can
+immediately retrieve that handle and call
+`update_metadata(title=..., description=...)` to label the resulting work.

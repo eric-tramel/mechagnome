@@ -1,9 +1,8 @@
 # Mechagnome help
 
-Mechagnome begins with seven editable core operations, the host-owned
-`run_agent` action, and no domain-specific user tools. Every recursively launched
-agent receives the same actions. Use these topics as you grow and reuse the
-toolbox:
+Mechagnome begins with nine editable core operations and no domain-specific
+user tools. Every recursively launched agent receives the same tools. Use these
+topics as you grow and reuse the toolbox:
 
 - `quickstart` — the write/call loop
 - `authoring` — the Python tool ABI
@@ -12,7 +11,7 @@ toolbox:
 - `namespaces` — hierarchical tool discovery and organization
 - `toolboxes` — ordered session toolbox composition and cwd routing
 - `versioning` — immutable versions, activation, and rollback
-- `core` — editing the seven base operations
+- `core` — editing the nine base operations
 
 Call `help` again with one of those names as the `topic` to read the complete
 Markdown document.

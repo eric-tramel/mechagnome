@@ -98,7 +98,7 @@ not data to save or return. Its public interface is:
 
 - `await ctx.call_tool(name, args, version=None)` — invoke another tool.
 - `ctx.caller_session_id` — the durable session ID for this call tree.
-- `ctx.sessions` — a bounded, read-only `SessionAccess` object.
+- `ctx.sessions` — bounded session discovery, history, and prompting handles.
 - `ctx.model_provider` — a bounded text-completion capability supplied by the
   host.
 - `ctx.kernel` — a narrow capability available only to the matching core slot.
@@ -211,27 +211,40 @@ The capability can raise
 failures are deliberately sanitized, so authored source should not depend on
 provider-specific exception details.
 
-### Foreground agent compatibility
+### Prompting durable sessions
 
-Models normally delegate through their direct host-owned `run_agent` action.
-Authored tools may use `ctx.model_provider.run_agent(prompt)` when a tool needs
-one foreground agent answer before it can return:
+Use `ctx.sessions.get()` to obtain the current session or pass a saved session
+ID. The returned handle can continue that idle conversation, spawn a fresh
+child, or fork a child from the latest completed context:
 
 ```python
 async def main(input, ctx):
-    answer = await ctx.model_provider.run_agent(
-        f"Investigate this task and return a concise answer: {input['task']}"
+    source = ctx.sessions.get(input.get("session_id"))
+    outcome = await source.prompt(
+        input["prompt"],
+        mode=input.get("mode", "spawn"),
+        detach=input.get("detach", False),
     )
-    return {"answer": answer}
+    prompted = ctx.sessions.get(outcome["session_id"])
+    metadata = prompted.update_metadata(
+        title=input.get("title", "Delegated work"),
+        description=input.get("description"),
+    )
+    return {"outcome": outcome, "metadata": metadata}
 ```
 
-The call is asynchronous and returns the agent's final text when awaited; it
-does not expose the host action's detached mode.
-Before any model traffic, the provider creates a durable `conversation` session
-parented to the caller's session and attributed to the current tool call. Child
-agents receive the same model action surface, so they can launch further agents
-directly. All model and tool events are recorded under the conversation session
-in which they actually occur.
+`continue` retains the same session ID and transcript, `spawn` creates a fresh
+child without transcript inheritance, and `fork` snapshots the source through
+its latest completed turn. Foreground outcomes contain `session_id`, `status`,
+and `result`; detached outcomes also contain a process-lifetime `job_id` that is
+inspected with `await ctx.sessions.inspect(job_id)`. Use the returned
+`session_id` to retrieve the prompted handle and pair the transition with
+`update_metadata(title=..., description=...)`. Passing `None` clears a field;
+metadata updates are limited to the caller's session tree.
+
+`await ctx.model_provider.run_agent(prompt)` remains a foreground-only
+compatibility facade. It is equivalent to prompting the current session with
+`mode="spawn"` and returning only the result text.
 
 These failures raise `mechagnome.ToolboxError`; inspect its stable `code` only
 when the tool has a meaningful fallback, and re-raise everything else:
@@ -271,13 +284,15 @@ message is sent to the configured provider, and authored code can place data
 read from files or saved sessions into those messages. Do not pass sensitive
 data to `complete()` unless disclosure to that provider is explicitly intended.
 
-### Reading the current session
+### Working with session handles
 
 `ctx.sessions` is a `SessionAccess` object scoped to the caller's durable
 session. `ctx.sessions.id` and `ctx.caller_session_id` are the same ID.
-`ctx.sessions.metadata()` returns that session's kind, direct parent, derived
-root, origin call, cwd, and creation time. Pass another saved ID to inspect its
-lineage.
+`ctx.sessions.metadata()` returns that session's lineage and fork context.
+`ctx.sessions.get()` returns a richer handle with `id`, `kind`, `parent_id`,
+`root_id`, `title`, `description`, `origin_session_id`, `origin_call_id`,
+`metadata`, `read()`, `update_metadata()`, and `prompt()`. Pass another saved ID
+to inspect or prompt a session in the current tree.
 
 ```python
 async def main(input, ctx):

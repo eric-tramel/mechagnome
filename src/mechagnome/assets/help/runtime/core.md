@@ -1,6 +1,6 @@
-# Core operations
+# Core tools
 
-The eight base operations are ordinary readable tool versions:
+The nine base tools are ordinary readable tool versions:
 
 - `help`
 - `list_tools`
@@ -10,6 +10,7 @@ The eight base operations are ordinary readable tool versions:
 - `write_tool`
 - `call_tool`
 - `delete_tool`
+- `run_agent`
 
 Their names and outer schemas are fixed, but their descriptions, source, and
 behavior are editable. Privilege follows the active logical core slot, not
@@ -31,15 +32,42 @@ the whole binding. Deleting the active version rolls the binding back to the
 next-highest remaining version. The last remaining version of a lineage
 cannot be removed.
 
-## Agent action
+## Agent tool
 
-`run_agent` is a host action rather than an editable core tool. Every root,
-child, and grandchild conversation receives it alongside the eight operations
-above. Run another full agent in the foreground with:
+`run_agent` is an editable core tool like the others above. Its shipped source
+is an ordinary wrapper over the same `ctx.sessions` handles available to every
+authored tool; it receives no slot-specific agent capability. Every root, child,
+and grandchild conversation receives the active tool version. Spawn a fresh
+child agent in the foreground with:
 
 ```json
-{"prompt": "Investigate the failing tests and summarize the cause."}
+{
+  "prompt": "Investigate the failing tests and summarize the cause.",
+  "title": "Test failure investigation",
+  "description": "Delegated analysis of the current failing test suite."
+}
 ```
+
+`title` and `description` are optional. The ordinary `run_agent` source passes
+them through the generic session prompt request, which validates and applies
+them before the rollout starts. Every authored tool can also retrieve a prompt
+result's `session_id` and call
+`ctx.sessions.get(session_id).update_metadata(...)` afterward.
+
+Target a saved conversation and choose an explicit prompting mode:
+
+```json
+{"session_id": "...", "prompt": "Follow up.", "mode": "continue"}
+```
+
+```json
+{"session_id": "...", "prompt": "Try another approach.", "mode": "fork"}
+```
+
+The default mode is `spawn`. `continue` appends to the same idle conversation;
+`spawn` creates a fresh child without transcript inheritance; and `fork`
+creates a child with context snapshotted through the source's latest completed
+turn.
 
 Set `detach` when the agent should continue independently:
 
@@ -47,10 +75,11 @@ Set `detach` when the agent should continue independently:
 {"prompt": "Run the long analysis and return the result.", "detach": true}
 ```
 
-The immediate response is `{"job_id": "...", "status": "running"}`. The job
-ID is the child conversation's durable session ID. Inspect it later through the
-same action with `{"job_id": "..."}`. Successful terminal snapshots include
-`result`; failures include a structured `error`.
+The immediate response contains `job_id`, the prompted `session_id`, and
+`status`. Job and session identities are distinct so the same conversation may
+be continued by multiple detached prompts over its lifetime. Inspect the job
+later through the same tool with `{"job_id": "..."}`. Successful terminal
+snapshots include `result`; failures include a structured `error`.
 
 Foreground agents share a 16-active limit. Each top-level rollout and all of
 its recursive descendants also share a cumulative 64-agent launch budget.

@@ -27,7 +27,7 @@ from mechagnome.bootstrap import CORE_NAMES, CORE_SCHEMAS, HELP_SOURCE
 from mechagnome.harness import (
     MODEL_ACTION_NAMES,
     Conversation,
-    _parse_run_agent_request,
+    _parse_session_prompt_request,
 )
 from mechagnome.isolation import IsolatedToolRunner
 from mechagnome.model_provider import ModelTransportError
@@ -129,6 +129,11 @@ def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
     assert tuple(item["name"] for item in kernel.tool_definitions()) == CORE_NAMES
     assert {item["name"] for item in kernel.bindings()} == set(CORE_NAMES)
     assert all(item["kind"] == "core" for item in kernel.bindings())
+    run_agent = kernel.view_tool("run_agent")
+    assert "ctx.sessions.get" in run_agent["source"]
+    assert "ctx.sessions.inspect" in run_agent["source"]
+    assert "ctx.kernel.run_agent" not in run_agent["source"]
+    assert not hasattr(kernel_module._KernelCapability, "run_agent")
 
     reopened = kernel_at(tmp_path)
     assert reopened.bindings() == kernel.bindings()
@@ -221,7 +226,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "namespaces": "# Hierarchical tool namespaces\n",
         "toolboxes": "# Toolbox stacks\n",
         "versioning": "# Versioning\n",
-        "core": "# Core operations\n",
+        "core": "# Core tools\n",
     }
     for topic, heading in headings.items():
         document = kernel.call("help", {"topic": topic})
@@ -763,7 +768,7 @@ def test_schema_two_database_migrates_without_feedback_storage(tmp_path: Path) -
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 9
+    assert version == 12
     assert table is None
 
 
@@ -791,7 +796,7 @@ def test_schema_five_database_removes_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 9
+    assert version == 12
     assert table is None
 
 
@@ -940,7 +945,14 @@ def test_schema_three_database_migrates_real_pre_lineage_sessions(
             "SELECT 1 FROM sqlite_master "
             "WHERE type = 'trigger' AND name = 'sessions_lineage_immutable'"
         ).fetchone()
-    assert {"parent_session_id", "kind", "origin_call_id"} <= columns
+    assert {
+        "parent_session_id",
+        "kind",
+        "origin_session_id",
+        "origin_call_id",
+        "context_source_session_id",
+        "context_through_seq",
+    } <= columns
     assert index is not None
     assert trigger is not None
     with (
@@ -953,6 +965,110 @@ def test_schema_three_database_migrates_real_pre_lineage_sessions(
 
     reopened_again = kernel_at(tmp_path)
     assert reopened_again.session_metadata(root) == metadata
+
+
+def test_schema_nine_reserves_and_seeds_run_agent_core_slot(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    toolbox_id = kernel.active_toolboxes(session_id)[0]["id"]
+    with closing(kernel._connect()) as connection, connection:
+        lineage = connection.execute(
+            "SELECT id FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+            (toolbox_id, "run_agent"),
+        ).fetchone()
+        assert lineage is not None
+        lineage_id = int(lineage["id"])
+        connection.execute(
+            "DELETE FROM bindings WHERE toolbox_id = ? AND name = 'run_agent'",
+            (toolbox_id,),
+        )
+        connection.execute(
+            "DELETE FROM tool_namespaces WHERE lineage_id = ?", (lineage_id,)
+        )
+        connection.execute(
+            "DELETE FROM tool_versions WHERE lineage_id = ?", (lineage_id,)
+        )
+        connection.execute("DELETE FROM tool_lineages WHERE id = ?", (lineage_id,))
+        legacy_lineage = connection.execute(
+            "INSERT INTO tool_lineages (toolbox_id, name, created_at) "
+            "VALUES (?, 'run_agent', 'legacy')",
+            (toolbox_id,),
+        )
+        legacy_version = connection.execute(
+            "INSERT INTO tool_versions ("
+            "lineage_id, version, description, schema_json, source, created_at"
+            ") VALUES (?, 1, 'legacy agent', '{}', "
+            "'async def main(input, ctx): return null', 'legacy')",
+            (int(legacy_lineage.lastrowid),),
+        )
+        connection.execute(
+            "INSERT INTO bindings (toolbox_id, name, tool_version_id) "
+            "VALUES (?, 'run_agent', ?)",
+            (toolbox_id, int(legacy_version.lastrowid)),
+        )
+        connection.execute(
+            "INSERT INTO tool_namespaces (lineage_id, path) VALUES (?, 'legacy')",
+            (int(legacy_lineage.lastrowid),),
+        )
+        connection.execute("PRAGMA user_version = 9")
+
+    reopened = kernel_at(tmp_path)
+
+    assert reopened.view_tool("run_agent")["kind"] == "core"
+    assert reopened.view_tool("run_agent")["version"] == 1
+    assert reopened.view_tool("run_agent_legacy")["description"] == "legacy agent"
+    assert reopened.view_tool("run_agent_legacy")["namespaces"] == ["legacy"]
+
+
+def test_schema_ten_backfills_session_prompt_origin_and_rebuilds_trigger(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    root = kernel.create_session(kind="conversation")
+    child = kernel.create_child_session(
+        kernel.snapshot_scope(root),
+        kind="conversation",
+    )
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute("DROP TRIGGER sessions_lineage_immutable")
+        connection.execute(
+            "UPDATE sessions SET origin_call_id = 'legacy-call' WHERE id = ?",
+            (child,),
+        )
+        connection.execute("PRAGMA user_version = 10")
+
+    reopened = kernel_at(tmp_path)
+    metadata = reopened.session_metadata(child)
+
+    assert metadata["origin_session_id"] == root
+    assert metadata["origin_call_id"] == "legacy-call"
+    assert metadata["context_source_session_id"] is None
+    assert metadata["context_through_seq"] is None
+    with closing(reopened._connect()) as connection:
+        trigger = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'sessions_lineage_immutable'"
+        ).fetchone()
+    assert trigger is not None
+
+
+def test_schema_eleven_adds_mutable_session_display_metadata(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session(kind="conversation")
+    with closing(kernel._connect()) as connection, connection:
+        connection.execute("ALTER TABLE sessions DROP COLUMN title")
+        connection.execute("ALTER TABLE sessions DROP COLUMN description")
+        connection.execute("PRAGMA user_version = 11")
+
+    reopened = kernel_at(tmp_path)
+
+    assert reopened.session_metadata(session_id)["title"] is None
+    assert reopened.session_metadata(session_id)["description"] is None
+    with closing(reopened._connect()) as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+    assert {"title", "description"} <= columns
 
 
 def test_schema_four_database_renames_view_core_slot(tmp_path: Path) -> None:
@@ -1481,6 +1597,59 @@ def test_child_sessions_inherit_frozen_scope_and_expose_lineage(
         connection.execute(
             "UPDATE sessions SET parent_session_id = NULL WHERE id = ?", (child,)
         )
+    with (
+        closing(kernel._connect()) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="invalid session context"),
+    ):
+        connection.execute(
+            "INSERT INTO sessions ("
+            "id, cwd, parent_session_id, kind, context_source_session_id, "
+            "context_through_seq, created_at"
+            ") VALUES ('invalid-fork', NULL, ?, 'conversation', ?, 0, 'now')",
+            (root, child),
+        )
+
+
+def test_session_display_metadata_is_mutable_within_one_session_tree(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    root = kernel.create_session(kind="conversation")
+    child = kernel.create_child_session(
+        kernel.snapshot_scope(root),
+        kind="conversation",
+    )
+    foreign = kernel.create_session(kind="conversation")
+
+    handle = kernel_module.ToolSession(
+        kernel,
+        None,  # type: ignore[arg-type]
+        kernel.session_metadata(child),
+        root,
+    )
+    updated = handle.update_metadata(
+        title="Research branch",
+        description="Investigate option B.",
+    )
+
+    assert updated["title"] == "Research branch"
+    assert updated["description"] == "Investigate option B."
+    listed = {item["id"]: item for item in kernel.list_sessions(limit=100)["sessions"]}
+    assert listed[child]["title"] == "Research branch"
+    assert listed[child]["description"] == "Investigate option B."
+    assert handle.update_metadata(title=None)["title"] is None
+    foreign_handle = kernel_module.ToolSession(
+        kernel,
+        None,  # type: ignore[arg-type]
+        kernel.session_metadata(child),
+        foreign,
+    )
+    with pytest.raises(ToolboxError) as denied:
+        foreign_handle.update_metadata(title="foreign edit")
+    assert denied.value.code == "session_access_denied"
+    with pytest.raises(ToolboxError) as invalid:
+        handle.update_metadata(status="done")
+    assert invalid.value.code == "invalid_session_metadata"
 
 
 def test_nested_tool_completion_records_inner_origin_and_child_log(
@@ -1676,6 +1845,182 @@ def test_isolated_tools_can_run_recursive_first_class_agents(tmp_path: Path) -> 
     ] == ["user", "model", "final"]
 
 
+class SessionPromptTransport:
+    def __init__(self) -> None:
+        self.target_id: str | None = None
+        self.observations: dict[str, dict[str, Any]] = {}
+        self.prompt_messages: dict[str, list[dict[str, Any]]] = {}
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        if prompt in {"seed", "continued", "spawned", "forked", "local followup"}:
+            self.prompt_messages[prompt] = list(messages)
+            return ModelTurn(text=f"{prompt} answer")
+        if prompt == "root ready":
+            return ModelTurn(text="ready")
+
+        observations = [message for message in messages if message["role"] == "tool"]
+        if messages[-1]["role"] == "user":
+            assert self.target_id is not None
+            mode = {
+                "continue target": "continue",
+                "spawn target": "spawn",
+                "spawn labeled": "spawn",
+                "fork target": "fork",
+                "continue current": "continue",
+            }[prompt]
+            nested_prompt = {
+                "continue": "continued",
+                "spawn": "spawned",
+                "fork": "forked",
+            }[mode]
+            if prompt == "spawn labeled":
+                nested_prompt = "spawned"
+            target = self.target_id if prompt != "continue current" else None
+            args: dict[str, Any] = {
+                "name": "session_prompt",
+                "args": {"prompt": nested_prompt, "mode": mode},
+            }
+            if target is not None:
+                args["args"]["session_id"] = target
+            if prompt == "spawn labeled":
+                args["args"].update(
+                    {
+                        "title": "Metadata worker",
+                        "description": "Spawned to demonstrate session metadata.",
+                    }
+                )
+            return ModelTurn(calls=(ToolCall("call_tool", args, f"{mode}-call"),))
+
+        observation = observations[-1]["content"]
+        self.observations[prompt] = observation
+        return ModelTurn(text=f"{prompt} complete")
+
+    def complete(self, messages: Any) -> str:
+        return "unused"
+
+    def cancel_current(self) -> None:
+        pass
+
+    def reset_cancellation(self) -> None:
+        pass
+
+
+def test_tool_session_handles_continue_spawn_and_fork_conversations(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "session_prompt",
+        "async def main(input, ctx):\n"
+        "    session = ctx.sessions.get(input.get('session_id'))\n"
+        "    handle = {\n"
+        "        'id': session.id,\n"
+        "        'kind': session.kind,\n"
+        "        'parent_id': session.parent_id,\n"
+        "        'root_id': session.root_id,\n"
+        "        'origin_session_id': session.origin_session_id,\n"
+        "        'origin_call_id': session.origin_call_id,\n"
+        "    }\n"
+        "    outcome = await session.prompt(\n"
+        "        input['prompt'], mode=input['mode'], detach=False\n"
+        "    )\n"
+        "    updated = None\n"
+        "    if 'title' in input:\n"
+        "        child = ctx.sessions.get(outcome['session_id'])\n"
+        "        updated = child.update_metadata(\n"
+        "            title=input['title'], description=input['description']\n"
+        "        )\n"
+        "    return {'handle': handle, 'outcome': outcome, 'updated': updated}\n",
+    )
+    transport = SessionPromptTransport()
+    harness = Harness(kernel)
+    provider = ModelProvider(kernel, transport)
+    root = harness.start(provider)
+    assert root.send("root ready").answer == "ready"
+    target = harness.start_child(root)
+    assert target.send("seed").answer == "seed answer"
+    target_id = target.session_id
+    transport.target_id = target_id
+
+    assert root.send("continue target").answer == "continue target complete"
+    continued = transport.observations["continue target"]
+    assert continued["handle"]["id"] == target_id
+    assert continued["handle"]["kind"] == "conversation"
+    assert continued["handle"]["root_id"] == root.session_id
+    assert continued["outcome"] == {
+        "session_id": target_id,
+        "status": "succeeded",
+        "result": "continued answer",
+    }
+    assert [
+        message["content"]
+        for message in transport.prompt_messages["continued"]
+        if message["role"] == "user"
+    ] == ["seed", "continued"]
+
+    assert root.send("spawn target").answer == "spawn target complete"
+    spawned = transport.observations["spawn target"]["outcome"]
+    spawned_metadata = kernel.session_metadata(spawned["session_id"])
+    assert spawned_metadata["parent_session_id"] == target_id
+    assert spawned_metadata["origin_session_id"] == root.session_id
+    assert spawned_metadata["context_source_session_id"] is None
+    assert [
+        message["content"]
+        for message in transport.prompt_messages["spawned"]
+        if message["role"] == "user"
+    ] == ["spawned"]
+
+    assert root.send("spawn labeled").answer == "spawn labeled complete"
+    labeled = transport.observations["spawn labeled"]
+    assert labeled["updated"]["id"] == labeled["outcome"]["session_id"]
+    assert labeled["updated"]["title"] == "Metadata worker"
+    assert labeled["updated"]["description"] == (
+        "Spawned to demonstrate session metadata."
+    )
+
+    fork_boundary = kernel.latest_completed_sequence(target_id)
+    assert root.send("fork target").answer == "fork target complete"
+    forked = transport.observations["fork target"]["outcome"]
+    forked_metadata = kernel.session_metadata(forked["session_id"])
+    assert forked_metadata["parent_session_id"] == target_id
+    assert forked_metadata["origin_session_id"] == root.session_id
+    assert forked_metadata["context_source_session_id"] == target_id
+    assert forked_metadata["context_through_seq"] == fork_boundary
+    assert [
+        message["content"]
+        for message in transport.prompt_messages["forked"]
+        if message["role"] == "user"
+    ] == ["seed", "continued", "forked"]
+    kernel.append_event(target_id, "user", {"content": "late source prompt"})
+    kernel.append_event(target_id, "model", {"text": "late answer", "calls": []})
+    kernel.append_event(target_id, "final", {"content": "late answer"})
+    assert [
+        message["content"]
+        for message in harness_module._session_messages(kernel, forked["session_id"])
+        if message["role"] == "user"
+    ] == ["seed", "continued", "forked"]
+
+    assert target.send("local followup").answer == "local followup answer"
+    assert [
+        message["content"]
+        for message in transport.prompt_messages["local followup"]
+        if message["role"] == "user"
+    ] == ["seed", "continued", "late source prompt", "local followup"]
+
+    assert root.send("continue current").answer == "continue current complete"
+    busy = transport.observations["continue current"]
+    assert busy["error"]["code"] == "conversation_busy"
+    target.close()
+    root.close()
+    harness.close()
+
+
 class UniformAgentTransport:
     """Session-bound transport that exercises direct recursive agent actions."""
 
@@ -1718,7 +2063,17 @@ class UniformBoundAgentTransport:
         observations = [message for message in messages if message["role"] == "tool"]
         if prompt == "root" and not observations:
             return ModelTurn(
-                calls=(ToolCall("run_agent", {"prompt": "child"}, "agent"),)
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {
+                            "prompt": "child",
+                            "title": "Child investigator",
+                            "description": "Delegated from the root conversation.",
+                        },
+                        "agent",
+                    ),
+                )
             )
         if prompt == "child" and not observations:
             return ModelTurn(calls=(ToolCall("help", {"topic": "toc"}, "help"),))
@@ -1755,8 +2110,15 @@ def test_direct_agents_share_one_conversation_action_surface_and_lineage(
         and session["kind"] == "conversation"
     )
     assert result.answer == "root answer"
-    assert child["origin_call_id"] is None
+    run_agent_call = next(
+        event
+        for event in kernel.read_session(result.session_id, limit=100)["events"]
+        if event["kind"] == "call_started" and event["tool_name"] == "run_agent"
+    )
+    assert child["origin_call_id"] == run_agent_call["call_id"]
     assert child["root_session_id"] == result.session_id
+    assert child["title"] == "Child investigator"
+    assert child["description"] == "Delegated from the root conversation."
     assert transport.action_names == {
         result.session_id: MODEL_ACTION_NAMES,
         child["id"]: MODEL_ACTION_NAMES,
@@ -1924,11 +2286,17 @@ def test_recursive_agent_can_detach_and_ancestor_can_inspect(tmp_path: Path) -> 
         for session in sessions
         if session["parent_session_id"] == conversation.session_id
     )
-    assert kernel.session_metadata(transport.job_id)["parent_session_id"] == child["id"]
+    detached = harness._agent_coordinator.inspect(
+        transport.job_id, session_id=conversation.session_id
+    )
+    assert (
+        kernel.session_metadata(detached["session_id"])["parent_session_id"]
+        == (child["id"])
+    )
     assert transport.action_names == {
         conversation.session_id: MODEL_ACTION_NAMES,
         child["id"]: MODEL_ACTION_NAMES,
-        transport.job_id: MODEL_ACTION_NAMES,
+        detached["session_id"]: MODEL_ACTION_NAMES,
     }
     harness.close()
 
@@ -1939,16 +2307,48 @@ def test_recursive_agent_can_detach_and_ancestor_can_inspect(tmp_path: Path) -> 
         {},
         {"prompt": ""},
         {"prompt": "work", "detach": 1},
+        {"prompt": "work", "mode": []},
         {"prompt": "work", "extra": True},
         {"job_id": ""},
         {"job_id": "job", "prompt": "mixed"},
         {"prompt": "x" * (256 * 1024 + 1)},
     ),
 )
-def test_run_agent_request_validation_is_strict(args: dict[str, Any]) -> None:
+def test_session_prompt_request_validation_is_strict(args: dict[str, Any]) -> None:
     with pytest.raises(ToolboxError) as error:
-        _parse_run_agent_request(args)
-    assert error.value.code == "invalid_run_agent_request"
+        _parse_session_prompt_request(args)
+    assert error.value.code == "invalid_session_prompt"
+
+
+def test_session_prompt_metadata_is_validated_before_launch() -> None:
+    with pytest.raises(ToolboxError) as error:
+        _parse_session_prompt_request(
+            {"prompt": "work", "metadata": {"title": "x" * 257}}
+        )
+    assert error.value.code == "invalid_session_metadata"
+
+
+def test_run_agent_wrapper_rejects_mixed_inspection_envelopes(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+
+    class MixedEnvelopeModel:
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            if messages[-1]["role"] == "user":
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "run_agent",
+                            {"job_id": "missing", "prompt": "mixed"},
+                            "mixed",
+                        ),
+                    )
+                )
+            assert messages[-1]["content"]["error"]["code"] == (
+                "invalid_session_prompt"
+            )
+            return ModelTurn(text="rejected")
+
+    assert Harness(kernel).run(MixedEnvelopeModel(), "validate").answer == "rejected"
 
 
 def test_raw_transport_cannot_implicitly_authorize_direct_agent_runs(
@@ -2056,11 +2456,15 @@ def test_detached_agent_continues_and_is_inspectable_by_parent(tmp_path: Path) -
     running = harness._agent_coordinator.inspect(
         transport.job_id, session_id=conversation.session_id
     )
-    assert running == {"job_id": transport.job_id, "status": "running"}
-    child = kernel.session_metadata(transport.job_id)
+    assert running["job_id"] == transport.job_id
+    assert running["status"] == "running"
+    assert kernel.session_metadata(running["session_id"])["parent_session_id"] == (
+        conversation.session_id
+    )
+    child = kernel.session_metadata(running["session_id"])
     assert child["kind"] == "conversation"
     assert child["parent_session_id"] == conversation.session_id
-    assert transport.action_names[transport.job_id] == MODEL_ACTION_NAMES
+    assert transport.action_names[running["session_id"]] == MODEL_ACTION_NAMES
 
     transport.release.set()
     completed = wait_for_agent(
@@ -2090,6 +2494,7 @@ def test_detached_agent_handle_is_visible_to_ancestors_but_not_siblings(
     handle = harness._agent_coordinator.start_detached(
         child, "detached descendant", sink=None
     )
+    assert handle["job_id"] != handle["session_id"]
     assert transport.started.wait(timeout=2)
 
     assert (
@@ -2160,7 +2565,11 @@ class FailingBoundAgentTransport(UniformBoundAgentTransport):
             self.parent.detached_job_id = observations[-1]["content"]["job_id"]
             return ModelTurn(text="detached failure started")
         if prompt == "fail foreground":
-            raise RuntimeError("FOREGROUND_SENTINEL_SECRET")
+            raise ToolboxError(
+                "provider_internal",
+                "FOREGROUND_SENTINEL_SECRET",
+                token="TOOLBOX_ERROR_SENTINEL_SECRET",
+            )
         raise ModelTransportError(
             "provider_internal",
             "DETACHED_SENTINEL_SECRET",
@@ -2393,6 +2802,58 @@ class BoundaryBoundAgentTransport(UniformBoundAgentTransport):
         return ModelTurn(text=f"answer:{prompt}")
 
 
+class InspectBoundaryAgentTransport(UniformAgentTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.job_id: str | None = None
+
+    def for_session(self, session_id: str) -> InspectBoundaryBoundAgentTransport:
+        self.bound_keys.append(session_id)
+        return InspectBoundaryBoundAgentTransport(self, session_id)
+
+
+class InspectBoundaryBoundAgentTransport(UniformBoundAgentTransport):
+    parent: InspectBoundaryAgentTransport
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        observations = [message for message in messages if message["role"] == "tool"]
+        if prompt == "start boundary" and messages[-1]["role"] == "user":
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"prompt": "boundary", "detach": True},
+                        "start-boundary",
+                    ),
+                )
+            )
+        if prompt == "start boundary":
+            self.parent.job_id = observations[-1]["content"]["job_id"]
+            return ModelTurn(text="boundary started")
+        if prompt == "boundary":
+            return ModelTurn(text="x" * (1024 * 1024 - 2))
+        if prompt == "inspect boundary" and messages[-1]["role"] == "user":
+            assert self.parent.job_id is not None
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "run_agent",
+                        {"job_id": self.parent.job_id},
+                        "inspect-boundary",
+                    ),
+                )
+            )
+        snapshot = observations[-1]["content"]
+        assert snapshot["status"] == "succeeded"
+        assert len(snapshot["result"]) == 1024 * 1024 - 2
+        return ModelTurn(text="boundary inspected")
+
+
 def test_detached_agent_result_limit_and_unicode_are_terminal(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     harness = Harness(kernel)
@@ -2419,6 +2880,26 @@ def test_detached_agent_result_limit_and_unicode_are_terminal(tmp_path: Path) ->
         status="succeeded",
     )
     assert success["result"] == "\ud800"
+    harness.close()
+
+
+def test_largest_retained_detached_agent_result_is_inspectable(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = InspectBoundaryAgentTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("start boundary").answer == "boundary started"
+    assert transport.job_id is not None
+    wait_for_agent(
+        harness,
+        transport.job_id,
+        conversation.session_id,
+        status="succeeded",
+    )
+    assert conversation.send("inspect boundary").answer == "boundary inspected"
     harness.close()
 
 
@@ -2488,6 +2969,155 @@ def test_parent_cancellation_cascades_to_foreground_agent(tmp_path: Path) -> Non
     assert len(failure) == 1
     assert conversation.session_id in transport.cancelled_keys
     assert child["id"] in transport.cancelled_keys
+    harness.close()
+
+
+def test_run_agent_tool_timeout_cancels_foreground_child(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = CancellationDomainTransport()
+    runner = IsolatedToolRunner(kernel, timeout=0.5)
+    harness = Harness(kernel, tool_runner=runner)
+    conversation = harness.start(ModelProvider(kernel, transport))
+    outcomes: list[harness_module.RunResult | Exception] = []
+
+    def send() -> None:
+        try:
+            outcomes.append(conversation.send("start foreground"))
+        except Exception as error:
+            outcomes.append(error)
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    assert transport.foreground_started.wait(timeout=2)
+    thread.join(timeout=3)
+
+    child = next(
+        session
+        for session in kernel.list_sessions(limit=100)["sessions"]
+        if session["parent_session_id"] == conversation.session_id
+    )
+    assert not thread.is_alive()
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], harness_module.RunResult)
+    assert outcomes[0].answer == "unexpected"
+    assert child["id"] in transport.cancelled_keys
+    assert harness._agent_coordinator._active_foreground == 0
+    assert not conversation._foreground_children
+    harness.close()
+
+
+def test_tool_agent_cancellation_is_scoped_to_origin_call(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    harness = Harness(kernel)
+    conversation = harness.start(UniformAgentTransport())
+
+    class Child:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    timed_out = Child()
+    sibling = Child()
+    conversation._start_tool_session_prompt("timed-out")
+    conversation._start_tool_session_prompt("sibling")
+    conversation._register_foreground_child(timed_out, "timed-out")  # type: ignore[arg-type]
+    conversation._register_foreground_child(sibling, "sibling")  # type: ignore[arg-type]
+
+    conversation._cancel_tool_session_prompts(
+        kernel.snapshot_scope(conversation.session_id),
+        "timed-out",
+    )
+
+    assert timed_out.closed is True
+    assert sibling.closed is False
+    conversation._unregister_foreground_child(timed_out, "timed-out")  # type: ignore[arg-type]
+    conversation._unregister_foreground_child(sibling, "sibling")  # type: ignore[arg-type]
+    conversation._finish_tool_session_prompt("timed-out")
+    conversation._finish_tool_session_prompt("sibling")
+    harness.close()
+
+
+def test_tool_agent_cancellation_survives_child_registration_race(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    harness = Harness(kernel)
+    conversation = harness.start(UniformAgentTransport())
+
+    class Child:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    child = Child()
+    conversation._start_tool_session_prompt("late-child")
+    conversation._cancel_tool_session_prompts(
+        kernel.snapshot_scope(conversation.session_id),
+        "late-child",
+    )
+
+    with pytest.raises(harness_module.RunCancelled):
+        conversation._register_foreground_child(  # type: ignore[arg-type]
+            child,
+            "late-child",
+        )
+
+    assert child.closed is True
+    assert "late-child" in conversation._cancelled_tool_prompt_origins
+    assert not conversation._foreground_children
+    conversation._finish_tool_session_prompt("late-child")
+    assert "late-child" not in conversation._cancelled_tool_prompt_origins
+    harness.close()
+
+
+def test_tool_agent_cancellation_covers_all_same_origin_actions(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    harness = Harness(kernel)
+    conversation = harness.start(UniformAgentTransport())
+
+    class Child:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    registered = Child()
+    still_creating = Child()
+    conversation._start_tool_session_prompt("shared-origin")
+    conversation._start_tool_session_prompt("shared-origin")
+    conversation._register_foreground_child(  # type: ignore[arg-type]
+        registered,
+        "shared-origin",
+    )
+
+    conversation._cancel_tool_session_prompts(
+        kernel.snapshot_scope(conversation.session_id),
+        "shared-origin",
+    )
+    conversation._unregister_foreground_child(  # type: ignore[arg-type]
+        registered,
+        "shared-origin",
+    )
+    conversation._finish_tool_session_prompt("shared-origin")
+
+    assert registered.closed is True
+    assert "shared-origin" in conversation._cancelled_tool_prompt_origins
+    with pytest.raises(harness_module.RunCancelled):
+        conversation._register_foreground_child(  # type: ignore[arg-type]
+            still_creating,
+            "shared-origin",
+        )
+    assert still_creating.closed is True
+
+    conversation._finish_tool_session_prompt("shared-origin")
+    assert "shared-origin" not in conversation._cancelled_tool_prompt_origins
     harness.close()
 
 
@@ -3246,6 +3876,30 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
         ),
     )
     connection.execute("INSERT INTO bindings VALUES ('legacy_tool', 1)")
+    connection.executemany(
+        "INSERT INTO tool_versions VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            (
+                2,
+                "run_agent",
+                1,
+                "Legacy agent v1.",
+                json.dumps({"type": "object"}),
+                "def main(input, ctx):\n    return 'legacy-agent-v1'\n",
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                3,
+                "run_agent",
+                2,
+                "Legacy agent v2.",
+                json.dumps({"type": "object"}),
+                "def main(input, ctx):\n    return 'legacy-agent-v2'\n",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        ),
+    )
+    connection.execute("INSERT INTO bindings VALUES ('run_agent', 3)")
     connection.execute(
         "INSERT INTO sessions VALUES ('old-session', '2026-01-01T00:00:00+00:00')"
     )
@@ -3268,10 +3922,15 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
         "legacy"
     ]
     assert kernel.call("legacy_tool", {}, session_id="old-session") == "legacy"
+    assert kernel.view_tool("run_agent")["kind"] == "core"
+    assert kernel.view_tool("run_agent")["version"] == 1
+    assert kernel.call("run_agent_legacy", {}, session_id="old-session") == (
+        "legacy-agent-v2"
+    )
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 12
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -4204,7 +4863,7 @@ def test_parallel_isolated_tools_emit_each_durable_event_once(tmp_path: Path) ->
     assert not any(event.kind == "call_failed" for event in tool_events)
 
 
-def test_harness_exposes_core_operations_plus_run_agent_and_saves_everything(
+def test_harness_exposes_core_operations_and_saves_everything(
     tmp_path: Path,
 ) -> None:
     kernel = kernel_at(tmp_path)
@@ -4227,6 +4886,45 @@ def test_harness_exposes_core_operations_plus_run_agent_and_saves_everything(
     assert kinds[0] == "user"
     assert "binding_changed" in kinds
     assert kinds[-1] == "final"
+
+
+def test_harness_executes_active_run_agent_core_version(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "run_agent",
+        "async def main(input, ctx):\n    return {'overridden': input['prompt']}\n",
+        input_schema=CORE_SCHEMAS["run_agent"],
+        base_version=1,
+    )
+
+    class RunAgentOverrideModel:
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            assert tuple(tool["name"] for tool in tools) == CORE_NAMES
+            observations = [
+                message for message in messages if message["role"] == "tool"
+            ]
+            if not observations:
+                return ModelTurn(
+                    calls=(ToolCall("run_agent", {"prompt": "child"}, "agent"),)
+                )
+            assert observations[-1]["content"] == {"overridden": "child"}
+            return ModelTurn(text="used active run_agent")
+
+    result = Harness(kernel).run(RunAgentOverrideModel(), "root")
+
+    assert result.answer == "used active run_agent"
+    assert all(
+        session["parent_session_id"] is None
+        for session in kernel.list_sessions(limit=100)["sessions"]
+    )
+    calls = [
+        event
+        for event in kernel.read_session(result.session_id, limit=100)["events"]
+        if event["kind"] == "call_succeeded" and event["tool_name"] == "run_agent"
+    ]
+    assert len(calls) == 1
+    assert calls[0]["tool_version"] == 2
 
 
 def test_harness_does_not_limit_model_turns(tmp_path: Path) -> None:
