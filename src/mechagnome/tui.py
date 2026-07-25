@@ -548,6 +548,7 @@ class SessionTab:
     pane_id: str
     label: str
     chat: ChatFeed
+    session_view: ChatFeed
     draft: str = ""
     user_history: list[str] = field(default_factory=list)
     history_index: int | None = None
@@ -1734,11 +1735,14 @@ class ToolboxApp(App[None]):
     ) -> SessionTab:
         self._tab_counter += 1
         number = self._tab_counter
+        session_view = ChatFeed(id=f"session-view-{number}", classes="session-chat")
+        session_view.display = False
         return SessionTab(
             conversation=conversation or self.harness.start(self.model_provider),
             pane_id=f"session-{number}",
             label=f"Session {number}",
             chat=ChatFeed(id=f"chat-{number}", classes="session-chat"),
+            session_view=session_view,
         )
 
     @property
@@ -1773,6 +1777,7 @@ class ToolboxApp(App[None]):
             with TabbedContent(id="session-tabs", initial=initial.pane_id):
                 with TabPane(initial.label, id=initial.pane_id):
                     yield initial.chat
+                    yield initial.session_view
             with Vertical(id="sidebar"):
                 toolbox_options, toolbox_value = self._sidebar_toolbox_options()
                 yield Select(
@@ -1968,6 +1973,7 @@ class ToolboxApp(App[None]):
         state = self.active_session
         if not prompt or state.running:
             return
+        self._show_live_session(state)
         state.user_history.append(prompt)
         state.history_index = None
         state.history_draft = ""
@@ -2342,7 +2348,12 @@ class ToolboxApp(App[None]):
         self.session_tabs.append(state)
         tabs = self.query_one("#session-tabs", TabbedContent)
         await tabs.add_pane(
-            TabPane(state.label, state.chat, id=state.pane_id),
+            TabPane(
+                state.label,
+                state.chat,
+                state.session_view,
+                id=state.pane_id,
+            ),
             after=self.session_tabs[-2].pane_id,
         )
         tabs.active = state.pane_id
@@ -2816,15 +2827,17 @@ class ToolboxApp(App[None]):
         self._notified_agent_sessions.discard(session_id)
         self._populate_agent_tree()
 
-        # If this is the active session, just ensure we're on its tab.
+        # If this is the active session, restore its preserved live chat.
         active_session_id = self.conversation.session_id
         if session_id == active_session_id:
+            self._show_live_session(self.active_session)
             self._set_status(f"viewing active session {session_id[:8]}")
             return
 
         # Find an existing tab for this session.
         for state in self.session_tabs:
             if state.conversation.session_id == session_id:
+                self._show_live_session(state)
                 self.query_one("#session-tabs", TabbedContent).active = state.pane_id
                 self._set_status(f"switched to {session_id[:8]}", state)
                 return
@@ -2834,10 +2847,12 @@ class ToolboxApp(App[None]):
         self._set_status(f"viewing session {session_id[:8]}")
 
     def _render_session_events(self, session_id: str) -> None:
-        """Render a read-only view of a session's events into the active chat feed."""
+        """Render a read-only view without replacing the active live chat."""
         state = self.active_session
-        state.chat.clear()
-        state.chat.write(
+        state.session_view.clear()
+        state.chat.display = False
+        state.session_view.display = True
+        state.session_view.write(
             Panel(
                 Text(
                     f"session {session_id[:12]}\n"
@@ -2863,7 +2878,7 @@ class ToolboxApp(App[None]):
             if kind == "user":
                 content = str(payload.get("content", ""))[:2000]
                 if content:
-                    state.chat.write(
+                    state.session_view.write(
                         Panel(
                             Markdown(content),
                             title="you",
@@ -2875,7 +2890,7 @@ class ToolboxApp(App[None]):
                 text = str(payload.get("text") or "")
                 calls = payload.get("calls") or []
                 if text:
-                    state.chat.write(
+                    state.session_view.write(
                         Panel(
                             Markdown(text),
                             title=self._active_model_name,
@@ -2887,7 +2902,7 @@ class ToolboxApp(App[None]):
                     if isinstance(call, dict):
                         call_name = str(call.get("name", "tool"))
                         call_args = call.get("args")
-                        state.chat.write_tool(
+                        state.session_view.write_tool(
                             "call",
                             call_name,
                             self._compact(call_args),
@@ -2896,7 +2911,7 @@ class ToolboxApp(App[None]):
             elif kind == "call_started":
                 tool_name = str(event.get("tool_name") or "tool")
                 args = payload.get("args")
-                state.chat.write_tool(
+                state.session_view.write_tool(
                     "call",
                     tool_name,
                     self._compact(args),
@@ -2905,7 +2920,7 @@ class ToolboxApp(App[None]):
             elif kind == "call_succeeded":
                 tool_name = str(event.get("tool_name") or "tool")
                 result = payload.get("result", payload)
-                state.chat.write_tool(
+                state.session_view.write_tool(
                     "response",
                     tool_name,
                     self._compact(_summarize_tool_images(result)),
@@ -2914,7 +2929,7 @@ class ToolboxApp(App[None]):
             elif kind == "call_failed":
                 tool_name = str(event.get("tool_name") or "tool")
                 error = payload.get("error", payload)
-                state.chat.write_tool(
+                state.session_view.write_tool(
                     "error",
                     tool_name,
                     self._compact(error),
@@ -2923,7 +2938,7 @@ class ToolboxApp(App[None]):
             elif kind == "final":
                 content = str(payload.get("content", ""))[:4000]
                 if content:
-                    state.chat.write(
+                    state.session_view.write(
                         Panel(
                             Markdown(content),
                             title=f"{self._active_model_name} · final",
@@ -2933,7 +2948,15 @@ class ToolboxApp(App[None]):
                     )
             elif kind == "model_failed":
                 error = str(payload.get("message") or payload)
-                state.chat.write(Panel(Text(error), title="error", border_style="red"))
+                state.session_view.write(
+                    Panel(Text(error), title="error", border_style="red")
+                )
+
+    @staticmethod
+    def _show_live_session(state: SessionTab) -> None:
+        """Show a tab's live chat after inspecting another session."""
+        state.session_view.display = False
+        state.chat.display = True
 
     @on(Select.Changed, "#sidebar-toolbox")
     def select_sidebar_toolbox(self, event: Select.Changed) -> None:
@@ -3112,6 +3135,8 @@ class ToolboxApp(App[None]):
     def _reset_session_ui(self, state: SessionTab) -> None:
         self._reset_stream_state(state)
         self._stop_active_tool_events(state)
+        self._show_live_session(state)
+        state.session_view.clear()
         state.stream_entry = None
         state.forwarded_targets.clear()
         state.forwarded_events.clear()
