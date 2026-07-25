@@ -567,6 +567,9 @@ class SessionTab:
     active_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
     detached_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
     ignored_detached_jobs: set[str] = field(default_factory=set)
+    viewed_session_id: str | None = None
+    viewed_session_after: int = 0
+    viewed_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1977,6 +1980,7 @@ class ToolboxApp(App[None]):
         if prompt.startswith("/") and await self._command(prompt):
             return
         state.auto_compact_suppressed = False
+        self._stop_session_view(state)
         self._write_user(prompt, state)
         self._start_rollout(state)
         self.run_agent(prompt, state)
@@ -2801,6 +2805,7 @@ class ToolboxApp(App[None]):
         )
         if self.is_mounted:
             self._populate_agent_tree()
+            self._refresh_session_view(self.active_session)
 
     @on(Tree.NodeSelected, "#agent-sessions")
     def select_agent_session_node(self, event: Tree.NodeSelected) -> None:
@@ -2819,6 +2824,7 @@ class ToolboxApp(App[None]):
         # If this is the active session, just ensure we're on its tab.
         active_session_id = self.conversation.session_id
         if session_id == active_session_id:
+            self._stop_session_view(self.active_session)
             self._set_status(f"viewing active session {session_id[:8]}")
             return
 
@@ -2836,6 +2842,7 @@ class ToolboxApp(App[None]):
     def _render_session_events(self, session_id: str) -> None:
         """Render a read-only view of a session's events into the active chat feed."""
         state = self.active_session
+        self._stop_session_view(state)
         state.chat.clear()
         state.chat.write(
             Panel(
@@ -2849,91 +2856,126 @@ class ToolboxApp(App[None]):
                 border_style="blue",
             )
         )
-        after = 0
-        events: list[dict[str, Any]] = []
+        state.viewed_session_id = session_id
+        self._refresh_session_view(state)
+
+    def _refresh_session_view(self, state: SessionTab) -> None:
+        """Append newly committed events to an open read-only session view."""
+        session_id = state.viewed_session_id
+        if session_id is None:
+            return
         while True:
-            page = self.kernel.read_session(session_id, after=after, limit=100)
-            events.extend(page["events"])
+            page = self.kernel.read_session(
+                session_id,
+                after=state.viewed_session_after,
+                limit=100,
+            )
+            events = page["events"]
+            for event in events:
+                self._append_session_event(state, event)
+            if events:
+                state.viewed_session_after = int(events[-1]["seq"])
             if page["next_after"] is None:
                 break
-            after = page["next_after"]
-        for event in events:
-            kind = event.get("kind")
-            payload = event.get("payload", {})
-            if kind == "user":
-                content = str(payload.get("content", ""))[:2000]
-                if content:
-                    state.chat.write(
-                        Panel(
-                            Markdown(content),
-                            title="you",
-                            title_align="left",
-                            border_style="yellow",
-                        )
+
+    def _append_session_event(
+        self,
+        state: SessionTab,
+        event: dict[str, Any],
+    ) -> None:
+        """Render one durable event while retaining active tool row identity."""
+        kind = event.get("kind")
+        payload = event.get("payload", {})
+        if kind == "user":
+            content = str(payload.get("content", ""))[:2000]
+            if content:
+                state.chat.write(
+                    Panel(
+                        Markdown(content),
+                        title="you",
+                        title_align="left",
+                        border_style="yellow",
                     )
-            elif kind == "model":
-                text = str(payload.get("text") or "")
-                calls = payload.get("calls") or []
-                if text:
-                    state.chat.write(
-                        Panel(
-                            Markdown(text),
-                            title=self._active_model_name,
-                            title_align="left",
-                            border_style="bright_magenta",
-                        )
+                )
+        elif kind == "model":
+            text = str(payload.get("text") or "")
+            if text:
+                state.chat.write(
+                    Panel(
+                        Markdown(text),
+                        title=self._active_model_name,
+                        title_align="left",
+                        border_style="bright_magenta",
                     )
-                for call in calls:
-                    if isinstance(call, dict):
-                        call_name = str(call.get("name", "tool"))
-                        call_args = call.get("args")
-                        state.chat.write_tool(
-                            "call",
-                            call_name,
-                            self._compact(call_args),
-                            self._argument_summary(call_args),
-                        )
-            elif kind == "call_started":
-                tool_name = str(event.get("tool_name") or "tool")
-                args = payload.get("args")
-                state.chat.write_tool(
-                    "call",
-                    tool_name,
-                    self._compact(args),
-                    self._argument_summary(args),
                 )
-            elif kind == "call_succeeded":
-                tool_name = str(event.get("tool_name") or "tool")
-                result = payload.get("result", payload)
+        elif kind == "call_started":
+            tool_name = str(event.get("tool_name") or "tool")
+            args = payload.get("args")
+            displayed = state.chat.write_tool(
+                "call",
+                tool_name,
+                self._compact(args),
+                self._argument_summary(args),
+            )
+            call_id = event.get("call_id")
+            if isinstance(call_id, str):
+                state.viewed_tool_events[call_id] = displayed
+        elif kind in {"call_succeeded", "call_failed"}:
+            succeeded = kind == "call_succeeded"
+            tool_name = str(event.get("tool_name") or "tool")
+            value = (
+                payload.get("result", payload)
+                if succeeded
+                else payload.get("error", payload)
+            )
+            detail = self._compact(
+                _summarize_tool_images(value) if succeeded else value
+            )
+            call_id = event.get("call_id")
+            active = (
+                state.viewed_tool_events.pop(call_id, None)
+                if isinstance(call_id, str)
+                else None
+            )
+            result_kind = "response" if succeeded else "error"
+            outcome_summary = " · completed" if succeeded else " · failed"
+            if active is None:
                 state.chat.write_tool(
-                    "response",
+                    result_kind,
                     tool_name,
-                    self._compact(_summarize_tool_images(result)),
-                    outcome_summary=" \u00b7 completed",
+                    detail,
+                    outcome_summary=outcome_summary,
                 )
-            elif kind == "call_failed":
-                tool_name = str(event.get("tool_name") or "tool")
-                error = payload.get("error", payload)
-                state.chat.write_tool(
-                    "error",
+            else:
+                active.finish(
+                    result_kind,
                     tool_name,
-                    self._compact(error),
-                    outcome_summary=" · failed",
+                    detail,
+                    outcome_summary=outcome_summary,
                 )
-            elif kind == "final":
-                content = str(payload.get("content", ""))[:4000]
-                if content:
-                    state.chat.write(
-                        Panel(
-                            Markdown(content),
-                            title=f"{self._active_model_name} · final",
-                            title_align="left",
-                            border_style="green",
-                        )
+        elif kind == "final":
+            content = str(payload.get("content", ""))[:4000]
+            if content:
+                state.chat.write(
+                    Panel(
+                        Markdown(content),
+                        title=f"{self._active_model_name} · final",
+                        title_align="left",
+                        border_style="green",
                     )
-            elif kind == "model_failed":
-                error = str(payload.get("message") or payload)
-                state.chat.write(Panel(Text(error), title="error", border_style="red"))
+                )
+        elif kind == "model_failed":
+            error = str(payload.get("message") or payload)
+            state.chat.write(Panel(Text(error), title="error", border_style="red"))
+
+    @staticmethod
+    def _stop_session_view(state: SessionTab) -> None:
+        """Stop polling and finalize animations owned by a read-only view."""
+        for tool_event in state.viewed_tool_events.values():
+            tool_event.stop_spinner()
+        state.viewed_tool_events.clear()
+        state.viewed_session_id = None
+        state.viewed_session_after = 0
 
     @on(Select.Changed, "#sidebar-toolbox")
     def select_sidebar_toolbox(self, event: Select.Changed) -> None:
@@ -3112,6 +3154,7 @@ class ToolboxApp(App[None]):
     def _reset_session_ui(self, state: SessionTab) -> None:
         self._reset_stream_state(state)
         self._stop_active_tool_events(state)
+        self._stop_session_view(state)
         state.stream_entry = None
         state.forwarded_targets.clear()
         state.forwarded_events.clear()

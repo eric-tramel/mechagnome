@@ -4773,6 +4773,79 @@ def test_selecting_agent_session_renders_read_only_event_view(tmp_path: Path) ->
     asyncio.run(exercise())
 
 
+def test_agent_session_view_finishes_tool_rows_in_place(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+    child_session_id = kernel.create_child_session(
+        kernel.snapshot_scope(app.conversation.session_id),
+        kind="conversation",
+    )
+    kernel.append_event(
+        child_session_id,
+        "model",
+        {
+            "text": "Checking the available tools.",
+            "calls": [
+                {"id": "model-call", "name": "list_tools", "args": {"cursor": 10}},
+                {"id": "failed-model-call", "name": "view_tool", "args": {}},
+            ],
+        },
+    )
+    kernel.append_event(
+        child_session_id,
+        "call_started",
+        {"args": {"cursor": 10}},
+        call_id="runtime-call",
+        tool_name="list_tools",
+    )
+    kernel.append_event(
+        child_session_id,
+        "call_started",
+        {"args": {}},
+        call_id="failed-runtime-call",
+        tool_name="view_tool",
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(100, 34)) as pilot:
+            app._render_session_events(child_session_id)
+            await pilot.pause()
+
+            tool_rows = list(app.query(ToolEvent))
+            assert len(tool_rows) == 2
+            assert all(row.kind == "call" for row in tool_rows)
+            assert all(row.processing for row in tool_rows)
+
+            kernel.append_event(
+                child_session_id,
+                "call_succeeded",
+                {"result": {"tools": []}},
+                call_id="runtime-call",
+                tool_name="list_tools",
+            )
+            kernel.append_event(
+                child_session_id,
+                "call_failed",
+                {"error": {"code": "missing_name"}},
+                call_id="failed-runtime-call",
+                tool_name="view_tool",
+            )
+            app._refresh_agent_tree()
+            await pilot.pause()
+
+            assert [row.kind for row in tool_rows] == ["response", "error"]
+            assert all(row.processing is False for row in tool_rows)
+            assert all(row._spinner_timer is None for row in tool_rows)
+            assert tool_title_text(tool_rows[0]) == (
+                "✓ list_tools [cursor=10] · completed"
+            )
+            assert tool_title_text(tool_rows[1]) == "✕ view_tool · failed"
+            assert '"tools": []' in tool_rows[0].detail
+            assert '"code": "missing_name"' in tool_rows[1].detail
+
+    asyncio.run(exercise())
+
+
 def test_tool_manager_deletes_tool_and_removes_it_from_sidebar(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     creator = kernel.create_session()
