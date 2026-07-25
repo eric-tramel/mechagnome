@@ -48,6 +48,7 @@ class ModelTurn:
     calls: tuple[ToolCall, ...] = field(default_factory=tuple)
     reasoning: str | None = None
     reasoning_details: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    response_items: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     total_tokens: int | None = None
 
 
@@ -531,6 +532,8 @@ def _model_payload(turn: ModelTurn) -> dict[str, Any]:
         payload["reasoning"] = turn.reasoning
     if turn.reasoning_details:
         payload["reasoning_details"] = list(turn.reasoning_details)
+    if turn.response_items:
+        payload["response_items"] = list(turn.response_items)
     if turn.total_tokens is not None:
         payload["total_tokens"] = turn.total_tokens
     return payload

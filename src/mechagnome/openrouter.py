@@ -44,7 +44,7 @@ _PUBLIC_ERROR_MESSAGES = {
 }
 
 # Open-ended nested objects are not represented consistently by every model or
-# provider behind an OpenAI-compatible tool-calling endpoint. Keep the kernel's
+# provider behind a Responses-compatible tool-calling endpoint. Keep the kernel's
 # object-based ABI and use explicit JSON strings only at this transport boundary.
 JSON_OBJECT_ARGUMENTS = {
     "write_tool": {
@@ -130,7 +130,7 @@ class _ActiveSession:
 
 
 class OpenRouterModel:
-    """Streaming OpenRouter Chat Completions model adapter."""
+    """Streaming adapter for OpenRouter's stateless Responses API."""
 
     def __init__(
         self,
@@ -313,8 +313,9 @@ class OpenRouterModel:
             )
         body: dict[str, Any] = {
             "model": self.model,
-            "messages": [dict(message) for message in messages],
-            "max_tokens": MAX_COMPLETION_TOKENS,
+            "input": self._wire_input(messages),
+            "max_output_tokens": MAX_COMPLETION_TOKENS,
+            "store": False,
             "stream": False,
         }
         try:
@@ -355,12 +356,11 @@ class OpenRouterModel:
             )
         body: dict[str, Any] = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                *self._wire_messages(messages),
-            ],
+            "instructions": self.system_prompt,
+            "input": self._wire_input(messages),
             "tools": [self._wire_tool(tool) for tool in tools],
             "parallel_tool_calls": True,
+            "store": False,
             "stream": True,
         }
         if self.reasoning_effort is not None:
@@ -389,10 +389,11 @@ class OpenRouterModel:
     ) -> Iterator[ModelStreamEvent]:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
-        reasoning_details: list[dict[str, Any]] = []
-        tool_calls: dict[int, dict[str, Any]] = {}
-        finish_reason: str | None = None
+        output_items: dict[int, dict[str, Any]] = {}
         total_tokens: int | None = None
+        terminal_status: str | None = None
+        terminal_finish_reason: str | None = None
+        incomplete_reason: str | None = None
         saw_done = False
         stream_bytes = 0
         line_buffer = bytearray()
@@ -400,7 +401,7 @@ class OpenRouterModel:
         with (
             client.stream(
                 "POST",
-                f"{self.base_url}/chat/completions",
+                f"{self.base_url}/responses",
                 headers={
                     **self._headers(),
                     "Accept": "text/event-stream",
@@ -450,88 +451,111 @@ class OpenRouterModel:
                             raise TypeError("stream event is not an object")
                         if payload.get("error") is not None:
                             raise self._stream_error(payload["error"])
-                        usage = payload.get("usage")
-                        if isinstance(usage, Mapping):
-                            reported_total = _positive_int(usage.get("total_tokens"))
-                            if reported_total is not None:
-                                total_tokens = reported_total
-                        choices = payload.get("choices")
-                        if choices == []:
-                            continue
-                        if not isinstance(choices, list) or len(choices) != 1:
-                            raise TypeError("stream choices are invalid")
-                        choice = choices[0]
-                        if not isinstance(choice, Mapping):
-                            raise TypeError("stream choice is not an object")
-                        delta = choice["delta"]
-                        if not isinstance(delta, Mapping):
-                            raise TypeError("stream delta is not an object")
-                        reason = choice.get("finish_reason")
-                        if reason is not None and not isinstance(reason, str):
-                            raise TypeError("finish reason is not a string")
-                    except OpenRouterError:
-                        raise
-                    except (KeyError, IndexError, TypeError, ValueError) as error:
-                        raise OpenRouterError(
-                            "openrouter_response",
-                            "OpenRouter returned an invalid stream event",
-                        ) from error
-                    text = self._text_content(delta.get("content"))
-                    raw_reasoning = delta.get("reasoning")
-                    if raw_reasoning is None:
-                        reasoning = ""
-                    elif isinstance(raw_reasoning, str):
-                        reasoning = raw_reasoning
-                    else:
-                        raise OpenRouterError(
-                            "openrouter_response",
-                            "model returned invalid reasoning text",
-                        )
-                    raw_reasoning_details = delta.get("reasoning_details")
-                    if raw_reasoning_details is None:
-                        detail_deltas: list[dict[str, Any]] = []
-                    elif isinstance(raw_reasoning_details, list) and all(
-                        isinstance(detail, Mapping) for detail in raw_reasoning_details
-                    ):
-                        detail_deltas = [
-                            dict(detail) for detail in raw_reasoning_details
-                        ]
-                    else:
-                        raise OpenRouterError(
-                            "openrouter_response",
-                            "model returned invalid reasoning details",
-                        )
-                    raw_tool_deltas = delta.get("tool_calls")
-                    if raw_tool_deltas is None:
-                        tool_deltas = []
-                    elif isinstance(raw_tool_deltas, list):
-                        tool_deltas = raw_tool_deltas
-                    else:
-                        raise OpenRouterError(
-                            "openrouter_tool_call",
-                            "model returned invalid tool-call deltas",
-                        )
-                    if finish_reason is not None:
-                        if text or reasoning or detail_deltas or tool_deltas:
+                        event_type = payload.get("type")
+                        if not isinstance(event_type, str):
+                            raise TypeError("stream event type is invalid")
+                        if terminal_status is not None and event_type not in {
+                            "response.completed",
+                            "response.done",
+                        }:
                             raise OpenRouterError(
                                 "openrouter_response",
                                 "OpenRouter sent model data after stream completion",
                             )
-                        if reason not in {None, finish_reason}:
+                    except OpenRouterError:
+                        raise
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise OpenRouterError(
+                            "openrouter_response",
+                            "OpenRouter returned an invalid stream event",
+                        ) from error
+                    if event_type in {
+                        "response.content_part.delta",
+                        "response.output_text.delta",
+                    }:
+                        delta = payload.get("delta")
+                        if not isinstance(delta, str):
                             raise OpenRouterError(
                                 "openrouter_response",
-                                "OpenRouter changed the terminal finish reason",
+                                "model returned invalid text delta",
                             )
-                        continue
-                    if text:
-                        text_parts.append(text)
-                        yield ModelStreamEvent(text_delta=text)
-                    if reasoning:
-                        reasoning_parts.append(reasoning)
-                    reasoning_details.extend(detail_deltas)
-                    self._merge_tool_deltas(tool_calls, tool_deltas)
-                    if reason is not None:
-                        finish_reason = reason
+                        if delta:
+                            text_parts.append(delta)
+                            yield ModelStreamEvent(text_delta=delta)
+                    elif event_type == "response.reasoning.delta":
+                        delta = payload.get("delta")
+                        if not isinstance(delta, str):
+                            raise OpenRouterError(
+                                "openrouter_response",
+                                "model returned invalid reasoning text",
+                            )
+                        reasoning_parts.append(delta)
+                    elif event_type == "response.output_item.done":
+                        output_index = payload.get("output_index")
+                        item = payload.get("item")
+                        if not isinstance(output_index, int) or not isinstance(
+                            item, Mapping
+                        ):
+                            raise OpenRouterError(
+                                "openrouter_response",
+                                "OpenRouter returned an invalid output item",
+                            )
+                        item = dict(item)
+                        if item.get("type") not in {
+                            "function_call",
+                            "reasoning",
+                            "message",
+                        }:
+                            raise OpenRouterError(
+                                "openrouter_response",
+                                "OpenRouter returned an unsupported output item",
+                            )
+                        output_items[output_index] = item
+                    elif event_type in {
+                        "response.completed",
+                        "response.done",
+                        "response.failed",
+                    }:
+                        response_payload = payload.get("response")
+                        if not isinstance(response_payload, Mapping):
+                            raise OpenRouterError(
+                                "openrouter_response",
+                                "OpenRouter returned an invalid terminal response",
+                            )
+                        status = response_payload.get("status")
+                        if not isinstance(status, str):
+                            raise OpenRouterError(
+                                "openrouter_response",
+                                "OpenRouter returned an invalid response status",
+                            )
+                        if terminal_status is not None and status != terminal_status:
+                            raise OpenRouterError(
+                                "openrouter_response",
+                                "OpenRouter changed the terminal response status",
+                            )
+                        terminal_status = status
+                        error = response_payload.get("error")
+                        if error is not None:
+                            raise self._stream_error(error)
+                        finish_reason = response_payload.get("finish_reason")
+                        if finish_reason is not None and not isinstance(
+                            finish_reason, str
+                        ):
+                            raise OpenRouterError(
+                                "openrouter_response",
+                                "OpenRouter returned an invalid finish reason",
+                            )
+                        terminal_finish_reason = finish_reason
+                        details = response_payload.get("incomplete_details")
+                        if isinstance(details, Mapping) and isinstance(
+                            details.get("reason"), str
+                        ):
+                            incomplete_reason = details["reason"]
+                        usage = response_payload.get("usage")
+                        if isinstance(usage, Mapping):
+                            reported_total = _positive_int(usage.get("total_tokens"))
+                            if reported_total is not None:
+                                total_tokens = reported_total
                 if saw_done:
                     break
 
@@ -539,38 +563,57 @@ class OpenRouterModel:
             raise OpenRouterError(
                 "openrouter_truncated", "OpenRouter stream ended before [DONE]"
             )
-        expected_reason = "tool_calls" if tool_calls else "stop"
-        if finish_reason != expected_reason:
+        if terminal_status != "completed" or terminal_finish_reason not in {
+            None,
+            "stop",
+            "tool_calls",
+        }:
             raise OpenRouterError(
                 "openrouter_finish_reason",
                 (
-                    f"OpenRouter stream ended with {finish_reason!r}, "
-                    f"expected {expected_reason!r}"
+                    f"OpenRouter response ended with {terminal_status!r}"
+                    + (
+                        f": {incomplete_reason or terminal_finish_reason}"
+                        if incomplete_reason or terminal_finish_reason
+                        else ""
+                    )
                 ),
-                finish_reason=finish_reason,
+                finish_reason=(
+                    incomplete_reason or terminal_finish_reason or terminal_status
+                ),
             )
+        ordered_items = tuple(item for _, item in sorted(output_items.items()))
         calls = tuple(
-            self._tool_call(
-                {
-                    "id": item.get("id"),
-                    "function": {
-                        "name": item.get("name"),
-                        "arguments": item.get("arguments") or "{}",
-                    },
-                }
-            )
-            for _, item in sorted(tool_calls.items())
+            self._tool_call(item)
+            for item in ordered_items
+            if item.get("type") == "function_call"
         )
         reasoning = "".join(reasoning_parts) or None
-        preserved_details = tuple(reasoning_details)
-        if self._details_duplicate_reasoning(reasoning, preserved_details):
-            preserved_details = ()
+        message_items = [
+            item for item in ordered_items if item.get("type") == "message"
+        ]
+        if not text_parts and message_items:
+            try:
+                completed_text = "".join(
+                    self._response_message_text(item) for item in message_items
+                )
+            except TypeError as error:
+                raise OpenRouterError(
+                    "openrouter_response",
+                    "OpenRouter returned an invalid response message",
+                ) from error
+            if completed_text:
+                text_parts.append(completed_text)
+        preserved_details = tuple(
+            item for item in ordered_items if item.get("type") == "reasoning"
+        )
         yield ModelStreamEvent(
             turn=ModelTurn(
                 text="".join(text_parts) or None,
                 calls=calls,
                 reasoning=reasoning,
                 reasoning_details=preserved_details,
+                response_items=ordered_items,
                 total_tokens=total_tokens,
             )
         )
@@ -583,7 +626,7 @@ class OpenRouterModel:
         with (
             client.stream(
                 "POST",
-                f"{self.base_url}/chat/completions",
+                f"{self.base_url}/responses",
                 headers={**self._headers(), "Accept": "application/json"},
                 json=body,
             ) as response,
@@ -609,22 +652,27 @@ class OpenRouterModel:
             payload = json.loads(response_bytes)
             if not isinstance(payload, Mapping):
                 raise TypeError("response is not an object")
-            choices = payload.get("choices")
-            if not isinstance(choices, list) or len(choices) != 1:
-                raise TypeError("response choices are invalid")
-            choice = choices[0]
-            if not isinstance(choice, Mapping):
-                raise TypeError("response choice is not an object")
-            if choice.get("finish_reason") not in {None, "stop"}:
-                raise TypeError("completion did not stop normally")
-            message = choice.get("message")
-            if not isinstance(message, Mapping):
-                raise TypeError("response message is not an object")
-            if message.get("tool_calls"):
-                raise TypeError("completion returned tool calls")
-            content = message.get("content")
-            if not isinstance(content, str):
-                raise TypeError("completion content is not text")
+            if payload.get("error") is not None:
+                raise self._stream_error(payload["error"])
+            if payload.get("status") != "completed" or payload.get(
+                "finish_reason"
+            ) not in {None, "stop"}:
+                raise TypeError("completion did not complete normally")
+            output = payload.get("output")
+            if not isinstance(output, list):
+                raise TypeError("response output is invalid")
+            messages = []
+            for item in output:
+                if not isinstance(item, Mapping):
+                    raise TypeError("response output item is invalid")
+                if item.get("type") == "reasoning":
+                    continue
+                if item.get("type") != "message":
+                    raise TypeError("completion returned non-text output")
+                messages.append(item)
+            if len(messages) != 1:
+                raise TypeError("completion response message is invalid")
+            content = self._response_message_text(messages[0])
         except (TypeError, ValueError) as error:
             raise OpenRouterError(
                 "openrouter_response",
@@ -686,37 +734,6 @@ class OpenRouterModel:
                         self._active_sessions.pop(session_key, None)
 
     @staticmethod
-    def _merge_tool_deltas(accumulated: dict[int, dict[str, Any]], deltas: Any) -> None:
-        if not isinstance(deltas, list):
-            raise OpenRouterError(
-                "openrouter_tool_call", "model returned invalid tool-call deltas"
-            )
-        for delta in deltas:
-            if not isinstance(delta, Mapping) or not isinstance(
-                delta.get("index"), int
-            ):
-                raise OpenRouterError(
-                    "openrouter_tool_call", "model returned an invalid tool-call delta"
-                )
-            item = accumulated.setdefault(
-                delta["index"], {"id": "", "name": "", "arguments": ""}
-            )
-            identifier = delta.get("id")
-            if identifier:
-                item["id"] += str(identifier)
-            function = delta.get("function")
-            if function is None:
-                continue
-            if not isinstance(function, Mapping):
-                raise OpenRouterError(
-                    "openrouter_tool_call", "model returned an invalid tool-call delta"
-                )
-            if function.get("name"):
-                item["name"] += str(function["name"])
-            if function.get("arguments"):
-                item["arguments"] += str(function["arguments"])
-
-    @staticmethod
     def _stream_error(error: Any) -> OpenRouterError:
         message = error.get("message") if isinstance(error, Mapping) else None
         return OpenRouterError(
@@ -739,11 +756,9 @@ class OpenRouterModel:
             parameters["properties"] = properties
         return {
             "type": "function",
-            "function": {
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": parameters,
-            },
+            "name": tool["name"],
+            "description": tool["description"],
+            "parameters": parameters,
         }
 
     @staticmethod
@@ -771,100 +786,116 @@ class OpenRouterModel:
         return decoded
 
     @staticmethod
-    def _wire_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        wired = []
-        for message in messages:
+    def _wire_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Translate complete local history into stateless Responses input items."""
+        wired: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
             role = message["role"]
             if role == "assistant":
-                item: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": message.get("content"),
-                }
+                response_items = message.get("response_items")
+                if (
+                    isinstance(response_items, Sequence)
+                    and not isinstance(response_items, (str, bytes))
+                    and response_items
+                ):
+                    wired.extend(
+                        dict(item)
+                        for item in response_items
+                        if isinstance(item, Mapping)
+                    )
+                    continue
+                details = message.get("reasoning_details")
+                if isinstance(details, Sequence) and not isinstance(
+                    details, (str, bytes)
+                ):
+                    wired.extend(
+                        dict(detail)
+                        for detail in details
+                        if isinstance(detail, Mapping)
+                        and detail.get("type") == "reasoning"
+                    )
                 calls = message.get("tool_calls") or ()
-                if calls:
-                    item["tool_calls"] = [
-                        {
-                            "id": call["id"],
-                            "type": "function",
-                            "function": {
-                                "name": call["name"],
-                                "arguments": json.dumps(
-                                    OpenRouterModel._to_wire_args(
-                                        call["name"], call["args"]
-                                    )
-                                ),
-                            },
-                        }
-                        for call in calls
-                    ]
-                reasoning = message.get("reasoning")
-                reasoning_details = message.get("reasoning_details")
-                details_duplicate_text = OpenRouterModel._details_duplicate_reasoning(
-                    reasoning, reasoning_details
+                wired.extend(
+                    {
+                        "type": "function_call",
+                        "id": OpenRouterModel._item_id("fc", index, call),
+                        "call_id": call["id"],
+                        "name": call["name"],
+                        "arguments": json.dumps(
+                            OpenRouterModel._to_wire_args(call["name"], call["args"])
+                        ),
+                    }
+                    for call in calls
                 )
-                if reasoning_details and not details_duplicate_text:
-                    item["reasoning_details"] = reasoning_details
-                elif isinstance(reasoning, str) and reasoning:
-                    item["reasoning"] = reasoning
-                wired.append(item)
+                content = message.get("content")
+                if isinstance(content, str) and content:
+                    wired.append(
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "id": OpenRouterModel._item_id("msg", index, message),
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": content,
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    )
             elif role == "tool":
                 content = message.get("content")
                 wired.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": message["tool_call_id"],
-                        "name": message.get("name"),
-                        "content": (
+                        "type": "function_call_output",
+                        "call_id": message["tool_call_id"],
+                        "output": (
                             content if isinstance(content, str) else json.dumps(content)
                         ),
                     }
                 )
             else:
-                wired.append({"role": role, "content": message.get("content", "")})
+                content = message.get("content", "")
+                wired.append(
+                    {
+                        "type": "message",
+                        "role": role,
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    content
+                                    if isinstance(content, str)
+                                    else json.dumps(content)
+                                ),
+                            }
+                        ],
+                    }
+                )
         return wired
 
     @staticmethod
-    def _details_duplicate_reasoning(
-        reasoning: Any,
-        details: Any,
-    ) -> bool:
-        """Whether details exactly duplicate the assembled plaintext reasoning."""
-        return (
-            isinstance(reasoning, str)
-            and bool(reasoning)
-            and isinstance(details, Sequence)
-            and not isinstance(details, (str, bytes))
-            and bool(details)
-            and all(
-                isinstance(detail, Mapping)
-                and detail.get("type") == "reasoning.text"
-                and isinstance(detail.get("text"), str)
-                and not any(
-                    detail.get(field)
-                    for field in ("data", "id", "signature", "summary")
-                )
-                for detail in details
-            )
-            and "".join(detail["text"] for detail in details) == reasoning
-        )
+    def _item_id(prefix: str, index: int, item: Mapping[str, Any]) -> str:
+        seed = json.dumps([index, item], sort_keys=True, default=str)
+        return f"{prefix}_{uuid.uuid5(uuid.NAMESPACE_URL, seed).hex}"
 
     @staticmethod
     def _tool_call(item: Any) -> ToolCall:
         try:
             if not isinstance(item, Mapping):
                 raise TypeError("tool call is not an object")
-            function = item["function"]
-            if not isinstance(function, Mapping):
-                raise TypeError("tool function is not an object")
-            arguments = function.get("arguments") or "{}"
+            if item.get("type") not in {None, "function_call"}:
+                raise TypeError("output item is not a function call")
+            arguments = item.get("arguments") or "{}"
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
             if not isinstance(args, dict):
                 raise TypeError("tool arguments are not an object")
-            name = function["name"]
+            name = item["name"]
             return ToolCall(
                 name=name,
                 args=OpenRouterModel._from_wire_args(name, args),
-                id=item.get("id") or uuid.uuid4().hex,
+                id=item.get("call_id") or item.get("id") or uuid.uuid4().hex,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise OpenRouterError(
@@ -872,17 +903,22 @@ class OpenRouterModel:
             ) from error
 
     @staticmethod
-    def _text_content(content: Any) -> str | None:
-        if content is None or isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = [
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
-            return "".join(parts) or None
-        return str(content)
+    def _response_message_text(item: Mapping[str, Any]) -> str:
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            raise TypeError("response item is not an assistant message")
+        content = item.get("content")
+        if not isinstance(content, list):
+            raise TypeError("response message content is invalid")
+        parts: list[str] = []
+        for part in content:
+            if (
+                not isinstance(part, Mapping)
+                or part.get("type") != "output_text"
+                or not isinstance(part.get("text"), str)
+            ):
+                raise TypeError("response message content is not text")
+            parts.append(part["text"])
+        return "".join(parts)
 
     @staticmethod
     def _http_error(response: httpx.Response) -> OpenRouterError:

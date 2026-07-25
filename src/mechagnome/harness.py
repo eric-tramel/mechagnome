@@ -694,6 +694,8 @@ class Conversation:
             if turn.reasoning_details:
                 details = list(turn.reasoning_details)
                 assistant_message["reasoning_details"] = details
+            if turn.response_items:
+                assistant_message["response_items"] = list(turn.response_items)
             self.messages.append(assistant_message)
             if not turn.calls:
                 answer = turn.text or ""
@@ -1042,6 +1044,8 @@ class Harness:
                         assistant_message["reasoning_details"] = payload[
                             "reasoning_details"
                         ]
+                    if payload.get("response_items"):
+                        assistant_message["response_items"] = payload["response_items"]
                     messages.append(assistant_message)
                 elif event["kind"] == "tool_observation":
                     call_id = payload["model_call_id"]

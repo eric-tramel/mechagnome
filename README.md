@@ -129,8 +129,9 @@ uv run mechagnome \
 The recognized environment variables are `OPENROUTER_API_KEY`,
 `MECHAGNOME_MODEL`, and `MECHAGNOME_DB`. The provider endpoint and
 credential name are deliberately pinned to OpenRouter. OpenRouter uses its
-normalized Chat Completions tool-calling interface; the request is identified
-as `mechagnome` through `X-OpenRouter-Title`.
+stateless Responses API; Mechagnome sends the complete locally stored history
+on every turn with `store: false`, and identifies requests as `mechagnome`
+through `X-OpenRouter-Title`.
 
 Mechagnome explicitly allows a model to request several independent operations
 in one turn. Operations are returned to the model in request order; an

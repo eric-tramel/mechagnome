@@ -166,19 +166,28 @@ class StaticProvider:
 
 def sse_response(
     *payloads: dict[str, Any],
-    finish_reason: str = "stop",
+    status: str = "completed",
+    finish_reason: str | None = None,
+    incomplete_reason: str | None = None,
+    usage: Any = None,
     post_terminal: tuple[dict[str, Any], ...] = (),
     done: bool = True,
 ) -> httpx.Response:
     """Build a deterministic OpenRouter-style event stream."""
     content = "".join(f"data: {json.dumps(payload)}\n\n" for payload in payloads)
+    response: dict[str, Any] = {"id": "resp-test", "status": status}
+    if finish_reason is not None:
+        response["finish_reason"] = finish_reason
+    if incomplete_reason is not None:
+        response["incomplete_details"] = {"reason": incomplete_reason}
+    if usage is not None:
+        response["usage"] = usage
     content += (
         "data: "
         + json.dumps(
             {
-                "choices": [
-                    {"delta": {}, "finish_reason": finish_reason},
-                ]
+                "type": "response.done",
+                "response": response,
             }
         )
         + "\n\n"
@@ -278,38 +287,16 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
         captured["body"] = json.loads(request.content)
         return sse_response(
             {
-                "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "tool-1",
-                                    "function": {
-                                        "name": "help",
-                                        "arguments": '{"topic":',
-                                    },
-                                }
-                            ]
-                        }
-                    }
-                ]
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-1",
+                    "call_id": "tool-1",
+                    "name": "help",
+                    "arguments": '{"topic":"quickstart"}',
+                },
             },
-            {
-                "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "function": {"arguments": '"quickstart"}'},
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-            finish_reason="tool_calls",
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -321,19 +308,17 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     )
 
     assert model.model == DEFAULT_MODEL
-    assert captured["url"] == f"{DEFAULT_BASE_URL}/chat/completions"
+    assert captured["url"] == f"{DEFAULT_BASE_URL}/responses"
     assert captured["authorization"] == "Bearer test-key"
     assert captured["title"] == "mechagnome"
     assert captured["body"]["model"] == "z-ai/glm-5.2"
     assert captured["body"]["parallel_tool_calls"] is True
+    assert captured["body"]["store"] is False
     assert captured["body"]["stream"] is True
-    assert captured["body"]["messages"][0]["role"] == "system"
-    system_prompt = captured["body"]["messages"][0]["content"]
+    system_prompt = captured["body"]["instructions"]
     assert "async def main(input, ctx)" in system_prompt
     assert "Await ctx.call_tool" in " ".join(system_prompt.split())
-    tools = {
-        tool["function"]["name"]: tool["function"] for tool in captured["body"]["tools"]
-    }
+    tools = {tool["name"]: tool for tool in captured["body"]["tools"]}
     assert list(tools) == [
         "help",
         "list_tools",
@@ -370,12 +355,17 @@ def test_openrouter_completion_is_text_only_and_omits_agent_surface() -> None:
         return httpx.Response(
             200,
             json={
-                "choices": [
+                "id": "resp-test",
+                "status": "completed",
+                "output": [
                     {
-                        "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": "Nested."},
+                        "type": "message",
+                        "id": "msg-test",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Nested."}],
                     }
-                ]
+                ],
             },
         )
 
@@ -392,8 +382,20 @@ def test_openrouter_completion_is_text_only_and_omits_agent_surface() -> None:
     assert captured["authorization"] == "Bearer test-key"
     assert captured["body"] == {
         "model": DEFAULT_MODEL,
-        "messages": messages,
-        "max_tokens": 2048,
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "Be brief."}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Answer."}],
+            },
+        ],
+        "max_output_tokens": 2048,
+        "store": False,
         "stream": False,
     }
 
@@ -404,18 +406,28 @@ def test_openrouter_completion_rejects_tool_calls_and_invalid_content() -> None:
             httpx.Response(
                 200,
                 json={
-                    "choices": [
+                    "status": "completed",
+                    "output": [
                         {
-                            "finish_reason": "tool_calls",
-                            "message": {"content": None, "tool_calls": [{}]},
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "help",
+                            "arguments": "{}",
                         }
-                    ]
+                    ],
                 },
             ),
             httpx.Response(
                 200,
                 json={
-                    "choices": [{"finish_reason": "stop", "message": {"content": []}}]
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "refusal", "refusal": "no"}],
+                        }
+                    ],
                 },
             ),
         ]
@@ -432,18 +444,46 @@ def test_openrouter_completion_rejects_tool_calls_and_invalid_content() -> None:
             model.complete([{"role": "user", "content": "hello"}])
 
 
+@pytest.mark.parametrize("content", [[], [{"type": "output_text", "text": ""}]])
+def test_openrouter_completion_allows_empty_text(content: list[dict[str, Any]]) -> None:
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": content,
+                            }
+                        ],
+                    },
+                )
+            )
+        ),
+    )
+
+    assert model.complete([{"role": "user", "content": "hello"}]) == ""
+
+
 def test_openrouter_completion_reuses_borrowed_client_after_cancellation() -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: httpx.Response(
                 200,
                 json={
-                    "choices": [
+                    "status": "completed",
+                    "output": [
                         {
-                            "finish_reason": "stop",
-                            "message": {"content": "reused"},
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "reused"}],
                         }
-                    ]
+                    ],
                 },
             )
         )
@@ -595,7 +635,7 @@ def test_openrouter_adapter_sends_configured_reasoning_effort(
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
-        return sse_response({"choices": [{"delta": {"content": "Ready."}}]})
+        return sse_response({"type": "response.content_part.delta", "delta": "Ready."})
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     model = OpenRouterModel(
@@ -617,21 +657,23 @@ def test_openrouter_adapter_serializes_prior_tool_results(tmp_path: Path) -> Non
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assistant = body["messages"][-2]
-        observation = body["messages"][-1]
-        assert assistant["tool_calls"][0]["function"] == {
+        assistant = body["input"][-2]
+        observation = body["input"][-1]
+        assert assistant == {
+            "type": "function_call",
+            "id": assistant["id"],
+            "call_id": "tool-1",
             "name": "help",
             "arguments": '{"topic": "quickstart"}',
         }
         assert observation == {
-            "role": "tool",
-            "tool_call_id": "tool-1",
-            "name": "help",
-            "content": '{"topic": "quickstart"}',
+            "type": "function_call_output",
+            "call_id": "tool-1",
+            "output": '{"topic": "quickstart"}',
         }
         return sse_response(
-            {"choices": [{"delta": {"content": "Rea"}}]},
-            {"choices": [{"delta": {"content": "dy."}}]},
+            {"type": "response.content_part.delta", "delta": "Rea"},
+            {"type": "response.content_part.delta", "delta": "dy."},
         )
 
     model = OpenRouterModel(
@@ -663,11 +705,17 @@ def test_openrouter_preserves_reasoning_across_tool_continuation(
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     detail = {
-        "type": "reasoning.encrypted",
-        "data": "opaque-provider-payload",
+        "type": "reasoning",
+        "encrypted_content": "opaque-provider-payload",
         "id": "reasoning-1",
-        "format": "anthropic-claude-v1",
-        "index": 0,
+        "summary": [],
+    }
+    response_call = {
+        "type": "function_call",
+        "id": "fc-reason-call",
+        "call_id": "reason-call",
+        "name": "help",
+        "arguments": '{"topic":"quickstart"}',
     }
     requests: list[dict[str, Any]] = []
 
@@ -677,32 +725,29 @@ def test_openrouter_preserves_reasoning_across_tool_continuation(
         if len(requests) == 1:
             return sse_response(
                 {
-                    "choices": [
-                        {
-                            "delta": {
-                                "reasoning": "I should inspect the help topic.",
-                                "reasoning_details": [detail],
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": "reason-call",
-                                        "function": {
-                                            "name": "help",
-                                            "arguments": '{"topic":"quickstart"}',
-                                        },
-                                    }
-                                ],
-                            }
-                        }
-                    ]
+                    "type": "response.reasoning.delta",
+                    "delta": "I should inspect the help topic.",
                 },
-                finish_reason="tool_calls",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": detail,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": response_call,
+                },
             )
-        assistant = body["messages"][-2]
-        assert "reasoning" not in assistant
-        assert assistant["reasoning_details"] == [detail]
+        assert body["input"][-3] == detail
+        assert body["input"][-2] == response_call
         assert body["reasoning"] == {"effort": "high"}
-        return sse_response({"choices": [{"delta": {"content": "Ready with help."}}]})
+        return sse_response(
+            {
+                "type": "response.content_part.delta",
+                "delta": "Ready with help.",
+            }
+        )
 
     model = OpenRouterModel(
         api_key="test-key",
@@ -719,9 +764,10 @@ def test_openrouter_preserves_reasoning_across_tool_continuation(
         if event["kind"] == "model"
     )
     assert first_model_event["payload"]["reasoning_details"] == [detail]
+    assert first_model_event["payload"]["response_items"] == [detail, response_call]
 
 
-def test_openrouter_compacts_plaintext_reasoning_details(
+def test_openrouter_keeps_plaintext_reasoning_out_of_response_input(
     tmp_path: Path,
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
@@ -733,55 +779,27 @@ def test_openrouter_compacts_plaintext_reasoning_details(
         if len(requests) == 1:
             return sse_response(
                 {
-                    "choices": [
-                        {
-                            "delta": {
-                                "reasoning": "Inspect",
-                                "reasoning_details": [
-                                    {
-                                        "type": "reasoning.text",
-                                        "text": "Inspect",
-                                        "format": "unknown",
-                                        "index": 0,
-                                    }
-                                ],
-                            }
-                        }
-                    ]
+                    "type": "response.reasoning.delta",
+                    "delta": "Inspect",
                 },
                 {
-                    "choices": [
-                        {
-                            "delta": {
-                                "reasoning": " help.",
-                                "reasoning_details": [
-                                    {
-                                        "type": "reasoning.text",
-                                        "text": " help.",
-                                        "format": "unknown",
-                                        "index": 0,
-                                    }
-                                ],
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": "reason-call",
-                                        "function": {
-                                            "name": "help",
-                                            "arguments": '{"topic":"quickstart"}',
-                                        },
-                                    }
-                                ],
-                            }
-                        }
-                    ]
+                    "type": "response.reasoning.delta",
+                    "delta": " help.",
                 },
-                finish_reason="tool_calls",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc-reason-call",
+                        "call_id": "reason-call",
+                        "name": "help",
+                        "arguments": '{"topic":"quickstart"}',
+                    },
+                },
             )
-        assistant = body["messages"][-2]
-        assert assistant["reasoning"] == "Inspect help."
-        assert "reasoning_details" not in assistant
-        return sse_response({"choices": [{"delta": {"content": "Ready."}}]})
+        assert all(item.get("type") != "reasoning" for item in body["input"])
+        return sse_response({"type": "response.content_part.delta", "delta": "Ready."})
 
     model = OpenRouterModel(
         api_key="test-key",
@@ -799,37 +817,6 @@ def test_openrouter_compacts_plaintext_reasoning_details(
     assert first_model_event["payload"]["reasoning"] == "Inspect help."
     assert "reasoning_details" not in first_model_event["payload"]
 
-    legacy_message = {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [],
-        "reasoning": "Inspect help.",
-        "reasoning_details": [
-            {
-                "type": "reasoning.text",
-                "text": "Inspect help.",
-                "format": "unknown",
-                "index": 0,
-            }
-        ],
-    }
-    assert OpenRouterModel._wire_messages([legacy_message]) == [
-        {
-            "role": "assistant",
-            "content": None,
-            "reasoning": "Inspect help.",
-        }
-    ]
-
-    legacy_message["reasoning"] = "A different summary."
-    assert OpenRouterModel._wire_messages([legacy_message]) == [
-        {
-            "role": "assistant",
-            "content": None,
-            "reasoning_details": legacy_message["reasoning_details"],
-        }
-    ]
-
 
 def test_openrouter_adapter_round_trips_objects_and_keeps_parallel_calls(
     tmp_path: Path,
@@ -844,42 +831,37 @@ def test_openrouter_adapter_round_trips_objects_and_keeps_parallel_calls(
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        prior_call = body["messages"][-1]["tool_calls"][0]["function"]
+        prior_call = body["input"][-1]
         prior_args = json.loads(prior_call["arguments"])
         assert json.loads(prior_args["input_schema"]) == input_schema
         return sse_response(
             {
-                "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "tool-2",
-                                    "function": {
-                                        "name": "call_tool",
-                                        "arguments": json.dumps(
-                                            {
-                                                "name": "search",
-                                                "args": json.dumps({"query": "gnomes"}),
-                                            }
-                                        ),
-                                    },
-                                },
-                                {
-                                    "index": 1,
-                                    "id": "tool-3",
-                                    "function": {
-                                        "name": "help",
-                                        "arguments": '{"topic":"composition"}',
-                                    },
-                                },
-                            ]
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-tool-2",
+                    "call_id": "tool-2",
+                    "name": "call_tool",
+                    "arguments": json.dumps(
+                        {
+                            "name": "search",
+                            "args": json.dumps({"query": "gnomes"}),
                         }
-                    }
-                ]
+                    ),
+                },
             },
-            finish_reason="tool_calls",
+            {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-tool-3",
+                    "call_id": "tool-3",
+                    "name": "help",
+                    "arguments": '{"topic":"composition"}',
+                },
+            },
         )
 
     model = OpenRouterModel(
@@ -924,11 +906,10 @@ def test_openrouter_adapter_round_trips_objects_and_keeps_parallel_calls(
 def test_openrouter_adapter_preserves_malformed_json_for_tool_repair() -> None:
     call = OpenRouterModel._tool_call(
         {
-            "id": "tool-1",
-            "function": {
-                "name": "write_tool",
-                "arguments": '{"input_schema":""}',
-            },
+            "type": "function_call",
+            "call_id": "tool-1",
+            "name": "write_tool",
+            "arguments": '{"input_schema":""}',
         }
     )
 
@@ -938,15 +919,11 @@ def test_openrouter_adapter_preserves_malformed_json_for_tool_repair() -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"choices": [{"delta": []}]},
+        {"type": "response.content_part.delta", "delta": []},
         {
-            "choices": [
-                {
-                    "delta": {
-                        "tool_calls": [{"index": 0, "function": "not-an-object"}],
-                    }
-                }
-            ]
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": "not-an-object",
         },
     ],
 )
@@ -1018,7 +995,9 @@ def test_conversation_records_openrouter_transport_failure(tmp_path: Path) -> No
                 200,
                 headers={"Content-Type": "text/event-stream"},
                 content=(
-                    'data: {"error":{"message":"sentinel-provider-secret"}}\n\n'
+                    'data: {"type":"response.failed","response":'
+                    '{"id":"resp-test","status":"failed","error":'
+                    '{"message":"sentinel-provider-secret"}}}\n\n'
                     "data: [DONE]\n\n"
                 ),
             ),
@@ -1155,7 +1134,7 @@ def test_openrouter_adapter_rejects_truncated_stream(tmp_path: Path) -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "partial"}}]},
+                {"type": "response.content_part.delta", "delta": "partial"},
                 done=False,
             )
         )
@@ -1166,12 +1145,13 @@ def test_openrouter_adapter_rejects_truncated_stream(tmp_path: Path) -> None:
         model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
 
 
-def test_openrouter_adapter_rejects_non_success_finish_reason(tmp_path: Path) -> None:
+def test_openrouter_adapter_rejects_successful_length_response(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "partial"}}]},
+                {"type": "response.content_part.delta", "delta": "partial"},
+                status="completed",
                 finish_reason="length",
             )
         )
@@ -1182,22 +1162,44 @@ def test_openrouter_adapter_rejects_non_success_finish_reason(tmp_path: Path) ->
         model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
 
 
-def test_openrouter_adapter_allows_usage_metadata_after_finish(tmp_path: Path) -> None:
+def test_openrouter_completion_rejects_successful_length_response() -> None:
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "status": "completed",
+                        "finish_reason": "length",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "partial"}],
+                            }
+                        ],
+                    },
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(OpenRouterError, match="invalid completion"):
+        model.complete([{"role": "user", "content": "hello"}])
+
+
+def test_openrouter_adapter_reads_terminal_usage_metadata(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "Ready."}}]},
-                post_terminal=(
-                    {
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": 10,
-                            "completion_tokens": 2,
-                            "total_tokens": 12,
-                        },
-                    },
-                ),
+                {"type": "response.content_part.delta", "delta": "Ready."},
+                usage={
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                },
             )
         )
     )
@@ -1242,8 +1244,8 @@ def test_openrouter_adapter_ignores_invalid_usage_metadata(
         client=httpx.Client(
             transport=httpx.MockTransport(
                 lambda request: sse_response(
-                    {"choices": [{"delta": {"content": "Ready."}}]},
-                    post_terminal=({"choices": [], "usage": usage},),
+                    {"type": "response.content_part.delta", "delta": "Ready."},
+                    usage=usage,
                 )
             )
         ),
@@ -1263,12 +1265,11 @@ def test_openrouter_adapter_rejects_model_data_after_finish(tmp_path: Path) -> N
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "Ready."}}]},
+                {"type": "response.content_part.delta", "delta": "Ready."},
                 post_terminal=(
                     {
-                        "choices": [
-                            {"delta": {"content": "late"}, "finish_reason": None}
-                        ]
+                        "type": "response.content_part.delta",
+                        "delta": "late",
                     },
                 ),
             )
@@ -1280,17 +1281,20 @@ def test_openrouter_adapter_rejects_model_data_after_finish(tmp_path: Path) -> N
         model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
 
 
-@pytest.mark.parametrize("repeated_reason", [None, "stop"])
+@pytest.mark.parametrize("terminal_type", ["response.done", "response.completed"])
 def test_openrouter_adapter_allows_empty_terminal_metadata(
-    tmp_path: Path, repeated_reason: str | None
+    tmp_path: Path, terminal_type: str
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "Ready."}}]},
+                {"type": "response.content_part.delta", "delta": "Ready."},
                 post_terminal=(
-                    {"choices": [{"delta": {}, "finish_reason": repeated_reason}]},
+                    {
+                        "type": terminal_type,
+                        "response": {"id": "resp-test", "status": "completed"},
+                    },
                 ),
             )
         )
@@ -1306,34 +1310,34 @@ def test_openrouter_adapter_allows_empty_terminal_metadata(
 
 
 @pytest.mark.parametrize(
-    ("late_delta", "message"),
+    ("payload", "message"),
     [
         (
             {
-                "tool_calls": [
-                    {
-                        "index": 0,
-                        "id": "late",
-                        "function": {"name": "help", "arguments": "{}"},
-                    }
-                ]
+                "type": "response.output_item.done",
+                "output_index": "zero",
+                "item": {},
             },
-            "model data after",
+            "invalid output item",
         ),
-        ({"tool_calls": {}}, "invalid tool-call deltas"),
+        (
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "image_generation_call"},
+            },
+            "unsupported output item",
+        ),
     ],
 )
-def test_openrouter_adapter_rejects_late_tool_call_shapes(
-    tmp_path: Path, late_delta: dict[str, Any], message: str
+def test_openrouter_adapter_rejects_invalid_output_items(
+    tmp_path: Path, payload: dict[str, Any], message: str
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "Ready."}}]},
-                post_terminal=(
-                    {"choices": [{"delta": late_delta, "finish_reason": None}]},
-                ),
+                payload,
             )
         )
     )
@@ -1343,14 +1347,17 @@ def test_openrouter_adapter_rejects_late_tool_call_shapes(
         model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
 
 
-def test_openrouter_adapter_rejects_changed_terminal_reason(tmp_path: Path) -> None:
+def test_openrouter_adapter_rejects_changed_terminal_status(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "Ready."}}]},
+                {"type": "response.content_part.delta", "delta": "Ready."},
                 post_terminal=(
-                    {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                    {
+                        "type": "response.done",
+                        "response": {"id": "resp-test", "status": "failed"},
+                    },
                 ),
             )
         )
@@ -1369,7 +1376,7 @@ def test_openrouter_adapter_bounds_stream_size(
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: sse_response(
-                {"choices": [{"delta": {"content": "too large"}}]},
+                {"type": "response.content_part.delta", "delta": "too large"},
             )
         )
     )
@@ -1388,12 +1395,13 @@ class PausingSSEStream(httpx.SyncByteStream):
         self.closed = False
 
     def __iter__(self) -> Any:
-        yield b'data: {"choices":[{"delta":{"content":"Partial"}}]}\n\n'
+        yield b'data: {"type":"response.content_part.delta","delta":"Partial"}\n\n'
         self.started.set()
         self.release.wait(timeout=3)
         if not self.closed:
             yield (
-                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                b'data: {"type":"response.done","response":'
+                b'{"id":"resp-test","status":"completed"}}\n\n'
                 b"data: [DONE]\n\n"
             )
 
@@ -1411,7 +1419,9 @@ def test_openrouter_latches_cancellation_until_stream_registration(
     def response(request: httpx.Request) -> httpx.Response:
         nonlocal requests
         requests += 1
-        return sse_response({"choices": [{"delta": {"content": "too late"}}]})
+        return sse_response(
+            {"type": "response.content_part.delta", "delta": "too late"}
+        )
 
     client = httpx.Client(transport=httpx.MockTransport(response))
     model = OpenRouterModel(api_key="test-key", client=client)
@@ -1475,7 +1485,7 @@ def test_openrouter_cancellation_is_isolated_between_root_sessions(
 
     def response(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        prompt = body["messages"][-1]["content"]
+        prompt = body["input"][-1]["content"][0]["text"]
         return httpx.Response(
             200,
             headers={"Content-Type": "text/event-stream"},
@@ -1528,9 +1538,9 @@ def test_openrouter_pre_registration_cancellation_is_root_local() -> None:
 
     def response(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        prompt = body["messages"][-1]["content"]
+        prompt = body["input"][-1]["content"][0]["text"]
         requests.append(prompt)
-        return sse_response({"choices": [{"delta": {"content": prompt}}]})
+        return sse_response({"type": "response.content_part.delta", "delta": prompt})
 
     model = OpenRouterModel(
         api_key="test-key",
@@ -1753,12 +1763,14 @@ def test_isolated_tool_uses_host_authenticated_model_provider(
         return httpx.Response(
             200,
             json={
-                "choices": [
+                "status": "completed",
+                "output": [
                     {
-                        "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": "brokered"},
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "brokered"}],
                     }
-                ]
+                ],
             },
         )
 
@@ -1821,8 +1833,15 @@ def test_isolated_tool_uses_host_authenticated_model_provider(
     assert captured["authorization"] == f"Bearer {secret}"
     assert captured["body"] == {
         "model": DEFAULT_MODEL,
-        "messages": [{"role": "user", "content": "nested"}],
-        "max_tokens": 2048,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "nested"}],
+            }
+        ],
+        "max_output_tokens": 2048,
+        "store": False,
         "stream": False,
     }
     events = kernel.read_session(session_id, limit=100)["events"]
