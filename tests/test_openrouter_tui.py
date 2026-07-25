@@ -4741,6 +4741,38 @@ def test_sidebar_toggles_navigates_namespaces_opens_tools_and_swaps_toolbox(
     asyncio.run(exercise())
 
 
+def test_selecting_agent_session_renders_read_only_event_view(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    app = ToolboxApp(kernel, FinalModel(), model_name="test/model")
+    child_session_id = kernel.create_child_session(
+        kernel.snapshot_scope(app.conversation.session_id),
+        kind="conversation",
+    )
+    kernel.append_event(child_session_id, "user", {"content": "inspect this"})
+    kernel.append_event(child_session_id, "final", {"content": "inspection done"})
+
+    async def exercise() -> None:
+        async with app.run_test(size=(100, 34)) as pilot:
+            app._populate_agent_tree()
+            tree = app.query_one("#agent-sessions", Tree)
+            child_node = next(
+                node
+                for node in sidebar_tree_nodes(tree)
+                if node.data == SidebarTreeItem("agent_session", child_session_id)
+            )
+
+            tree.select_node(child_node)
+            await pilot.pause()
+
+            rendered = chat_text(app)
+            assert f"session {child_session_id[:12]}" in rendered
+            assert "read-only view" in rendered
+            assert "inspect this" in rendered
+            assert "inspection done" in rendered
+
+    asyncio.run(exercise())
+
+
 def test_tool_manager_deletes_tool_and_removes_it_from_sidebar(tmp_path: Path) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     creator = kernel.create_session()

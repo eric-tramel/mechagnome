@@ -2857,7 +2857,7 @@ class ToolboxApp(App[None]):
             Panel(
                 Text(
                     f"session {session_id[:12]}\n"
-                    "read-only view \u2014 type a new prompt to return to the live",
+                    "read-only view \u2014 type a new prompt to return to the live"
                     " conversation",
                     style="dim",
                 ),
