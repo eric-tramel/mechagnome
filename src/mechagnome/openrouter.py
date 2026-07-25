@@ -78,8 +78,8 @@ For a long-running independent call_tool invocation, set detach=true, continue
 other work with the returned job_id, and inspect it later with call_tool.
 Run delegated work directly with run_agent. Set detach=true when it should
 continue independently, and inspect the returned job_id with run_agent later.
-Tools may call other tools through ctx.call_tool, read current or historical
-sessions through ctx.sessions, and use the ordinary Linux/Python environment.
+Tools may call other tools through ctx.call_tool, read or annotate current and
+historical sessions through ctx.sessions, and use the ordinary Linux/Python environment.
 Source passed to write_tool must define async def main(input, ctx). Await
 ctx.call_tool and async ctx.model_provider operations; the call_tool core slot
 must also await ctx.kernel.execute.

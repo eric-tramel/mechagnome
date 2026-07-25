@@ -34,8 +34,9 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
+_SESSION_ANNOTATION_FIELDS = frozenset({"title", "description"})
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 _NAMESPACE_PATH = re.compile(NAMESPACE_PATH_PATTERN)
@@ -115,10 +116,11 @@ def _json(value: Any) -> str:
 
 
 class SessionAccess:
-    """Bounded read-only session access exposed to every tool."""
+    """Bounded session access exposed to every tool."""
 
-    def __init__(self, kernel: Kernel, session_id: str) -> None:
+    def __init__(self, kernel: Kernel, session_id: str, call_id: str) -> None:
         self._kernel = kernel
+        self._call_id = call_id
         self.id = session_id
 
     def list(self, limit: int = 20, cursor: int = 0) -> dict[str, Any]:
@@ -139,6 +141,40 @@ class SessionAccess:
             self.id if session_id is None else session_id
         )
 
+    def set_title(
+        self,
+        title: str | None,
+        *,
+        session_id: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Set or clear one saved session's title."""
+        return self._kernel._set_session_annotation(
+            self.id if session_id is None else session_id,
+            field="title",
+            value=title,
+            expected_revision=expected_revision,
+            actor_session_id=self.id,
+            actor_call_id=self._call_id,
+        )
+
+    def set_description(
+        self,
+        description: str | None,
+        *,
+        session_id: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Set or clear one saved session's description."""
+        return self._kernel._set_session_annotation(
+            self.id if session_id is None else session_id,
+            field="description",
+            value=description,
+            expected_revision=expected_revision,
+            actor_session_id=self.id,
+            actor_call_id=self._call_id,
+        )
+
 
 class ToolContext:
     """The functional interface supplied to authored tools."""
@@ -157,7 +193,7 @@ class ToolContext:
         self._depth = depth
         self._logical_slot = logical_slot
         self.caller_session_id = state.session_id
-        self.sessions = SessionAccess(kernel, state.session_id)
+        self.sessions = SessionAccess(kernel, state.session_id, call_id)
         from mechagnome.model_provider import ToolModelProvider
 
         self.model_provider = ToolModelProvider(
@@ -396,6 +432,15 @@ class Kernel:
         return connection
 
     @staticmethod
+    def _is_sqlite_contention(error: sqlite3.OperationalError) -> bool:
+        """Return whether an SQLite failure is a busy/locked contention result."""
+        code = getattr(error, "sqlite_errorcode", None)
+        if not isinstance(code, int):
+            return False
+        primary_code = code & 0xFF
+        return primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+    @staticmethod
     def _tables(connection: sqlite3.Connection) -> set[str]:
         return {
             str(row["name"])
@@ -438,6 +483,9 @@ class Kernel:
                     if version == 8:
                         self._migrate_v8(connection)
                         version = 9
+                    if version == 9:
+                        self._migrate_v9(connection)
+                        version = 10
                     if version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -537,6 +585,24 @@ class Kernel:
         self._reserve_new_core_names(connection, ("delete_tool",))
         for row in connection.execute("SELECT id FROM toolboxes").fetchall():
             self._seed_missing_core(connection, str(row["id"]))
+
+    @staticmethod
+    def _migrate_v9(connection: sqlite3.Connection) -> None:
+        """Add mutable, revisioned annotations to durable sessions."""
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        if "title" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+        if "description" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN description TEXT")
+        if "annotation_revision" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN annotation_revision INTEGER NOT NULL "
+                "DEFAULT 0 CHECK(typeof(annotation_revision) = 'integer' "
+                "AND annotation_revision >= 0)"
+            )
 
     @staticmethod
     def _reserve_new_core_names(
@@ -700,6 +766,11 @@ class Kernel:
                 kind TEXT NOT NULL DEFAULT 'generic'
                     CHECK(kind IN ('generic', 'conversation', 'completion')),
                 origin_call_id TEXT,
+                title TEXT,
+                description TEXT,
+                annotation_revision INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(annotation_revision) = 'integer'
+                        AND annotation_revision >= 0),
                 created_at TEXT NOT NULL
             )
             """,
@@ -1446,7 +1517,9 @@ class Kernel:
             rows = connection.execute(
                 """
                 SELECT sessions.id, sessions.cwd, sessions.parent_session_id,
-                       sessions.kind, sessions.origin_call_id, sessions.created_at,
+                       sessions.kind, sessions.origin_call_id, sessions.title,
+                       sessions.description, sessions.annotation_revision,
+                       sessions.created_at,
                        COUNT(events.id) AS event_count
                 FROM sessions
                 LEFT JOIN events ON events.session_id = sessions.id
@@ -1490,18 +1563,121 @@ class Kernel:
     def session_metadata(self, session_id: str) -> dict[str, Any]:
         """Return one session's durable identity and derived root."""
         with closing(self._connect()) as connection:
-            row = connection.execute(
-                """
-                SELECT id, cwd, parent_session_id, kind, origin_call_id, created_at
-                FROM sessions WHERE id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise ToolboxError("unknown_session", f"unknown session: {session_id}")
-            metadata = dict(row)
-            metadata["root_session_id"] = self._root_session_id(connection, session_id)
+            return self._session_metadata_connection(connection, session_id)
+
+    def _session_metadata_connection(
+        self, connection: sqlite3.Connection, session_id: str
+    ) -> dict[str, Any]:
+        """Return session metadata from an existing connection snapshot."""
+        row = connection.execute(
+            """
+            SELECT id, cwd, parent_session_id, kind, origin_call_id, title,
+                   description, annotation_revision, created_at
+            FROM sessions WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise ToolboxError("unknown_session", f"unknown session: {session_id}")
+        metadata = dict(row)
+        metadata["root_session_id"] = self._root_session_id(connection, session_id)
         return metadata
+
+    def _set_session_annotation(
+        self,
+        session_id: str,
+        *,
+        field: str,
+        value: str | None,
+        expected_revision: int | None,
+        actor_session_id: str,
+        actor_call_id: str,
+    ) -> dict[str, Any]:
+        """Atomically set one mutable session field with optional revision checking."""
+        if field not in _SESSION_ANNOTATION_FIELDS:
+            raise AssertionError(f"unsupported session annotation field: {field}")
+        if value is not None and not isinstance(value, str):
+            raise ToolboxError(
+                "invalid_session_annotation",
+                f"session {field} must be a string or None",
+                field=field,
+            )
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ToolboxError(
+                "invalid_annotation_revision",
+                "expected_revision must be a non-negative integer",
+            )
+
+        with closing(self._connect()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    f"SELECT {field}, annotation_revision FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    raise ToolboxError(
+                        "unknown_session", f"unknown session: {session_id}"
+                    )
+                actual_revision = int(row["annotation_revision"])
+                if (
+                    expected_revision is not None
+                    and expected_revision != actual_revision
+                ):
+                    raise ToolboxError(
+                        "session_annotation_conflict",
+                        "session annotations changed since they were read",
+                        session_id=session_id,
+                        expected_revision=expected_revision,
+                        actual_revision=actual_revision,
+                    )
+                old_value = row[field]
+                if old_value == value:
+                    metadata = self._session_metadata_connection(connection, session_id)
+                    connection.commit()
+                    return metadata
+
+                connection.execute(
+                    f"UPDATE sessions SET {field} = ?, "
+                    "annotation_revision = annotation_revision + 1 WHERE id = ?",
+                    (value, session_id),
+                )
+                revision = actual_revision + 1
+                self._append_event_connection(
+                    connection,
+                    session_id,
+                    "session_annotation_changed",
+                    {
+                        "field": field,
+                        "old_value": old_value,
+                        "new_value": value,
+                        "annotation_revision": revision,
+                        "actor_session_id": actor_session_id,
+                        "actor_call_id": actor_call_id,
+                    },
+                )
+                metadata = self._session_metadata_connection(connection, session_id)
+                connection.commit()
+                return metadata
+            except sqlite3.OperationalError as error:
+                if connection.in_transaction:
+                    connection.rollback()
+                if self._is_sqlite_contention(error):
+                    raise ToolboxError(
+                        "session_annotation_busy",
+                        "session annotations are busy; retry the update",
+                        session_id=session_id,
+                        retryable=True,
+                    ) from error
+                raise
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def read_session(
         self, session_id: str, *, after: int = 0, limit: int = 50
@@ -1510,17 +1686,7 @@ class Kernel:
         limit = min(100, max(1, limit))
         after = max(0, after)
         with closing(self._connect()) as connection:
-            session = connection.execute(
-                """
-                SELECT id, cwd, parent_session_id, kind, origin_call_id, created_at
-                FROM sessions WHERE id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            if session is None:
-                raise ToolboxError("unknown_session", f"unknown session: {session_id}")
-            metadata = dict(session)
-            metadata["root_session_id"] = self._root_session_id(connection, session_id)
+            metadata = self._session_metadata_connection(connection, session_id)
             rows = connection.execute(
                 """
                 SELECT seq, kind, call_id, parent_call_id, toolbox_id, tool_name,

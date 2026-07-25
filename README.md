@@ -256,18 +256,24 @@ That call intentionally routes through the current source of `call_tool`.
 Replacing `call_tool` can therefore change nested routing, caching, tracing, or
 retry policy for the whole toolbox.
 
-Tools can read durable sessions:
+Tools can read and annotate durable sessions:
 
 ```python
 async def main(input, ctx):
     caller_session_id = ctx.caller_session_id
     lineage = ctx.sessions.metadata()
+    updated = ctx.sessions.set_title("Repository investigation")
+    described = ctx.sessions.set_description(
+        "Tracks dependency findings.", session_id=input["session_id"]
+    )
     current = ctx.sessions.current(after=0, limit=50)
     previous = ctx.sessions.list(limit=20, cursor=0)
     older = ctx.sessions.read(input["session_id"], after=0, limit=50)
     return {
         "caller_session_id": caller_session_id,
         "lineage": lineage,
+        "updated": updated,
+        "described": described,
         "current": current,
         "previous": previous,
         "older": older,
