@@ -802,8 +802,7 @@ class OpenRouterModel:
                     wired.extend(
                         dict(item)
                         for item in response_items
-                        if isinstance(item, Mapping)
-                        and item.get("type") != "reasoning"
+                        if isinstance(item, Mapping) and item.get("type") != "reasoning"
                     )
                     continue
                 calls = message.get("tool_calls") or ()

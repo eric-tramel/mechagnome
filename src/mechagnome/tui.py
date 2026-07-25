@@ -68,6 +68,9 @@ TOOL_IMAGE_MARKDOWN_PATTERN = re.compile(
 )
 COMPACT_CONTINUATION_PROMPT = "Continue from where the parent session left off."
 AUTO_COMPACT_REMAINING_PERCENT = 25
+AGENT_TREE_REFRESH_INTERVAL = 0.5
+AGENT_TREE_SPINNER_INTERVAL = 0.08
+AGENT_PROMPT_SNIPPET_LEN = 48
 
 
 def _format_duration(value: Any) -> str:
@@ -1619,6 +1622,26 @@ class ToolboxApp(App[None]):
         scrollbar-background: transparent;
     }
 
+    #agent-sessions {
+        height: auto;
+        min-height: 3;
+        max-height: 12;
+        padding: 0 1;
+        background: transparent;
+        color: #d7e0ea;
+        border-top: solid #34465a;
+        overflow-x: hidden;
+        overflow-y: auto;
+        scrollbar-color: #516b85;
+        scrollbar-background: transparent;
+    }
+
+    #agent-sessions-title {
+        color: #8fa5ba;
+        text-style: bold;
+        padding: 0 1;
+    }
+
     #status {
         height: 1;
         padding: 0 1;
@@ -1702,6 +1725,10 @@ class ToolboxApp(App[None]):
         self._active_pane_id = initial.pane_id
         self.model_options: list[OpenRouterModelOption] = []
         self._collapsed_sidebar_namespaces: dict[tuple[str, ...], set[str]] = {}
+        self._agent_tree_timer: Timer | None = None
+        self._agent_spinner_index = 0
+        self._viewed_agent_sessions: set[str] = set()
+        self._notified_agent_sessions: set[str] = set()
 
     def _make_session_tab(
         self, *, conversation: Conversation | None = None
@@ -1763,6 +1790,14 @@ class ToolboxApp(App[None]):
                 tree.guide_depth = 2
                 tree.root.expand()
                 yield tree
+                yield Static(
+                    "AGENTS", id="agent-sessions-title", classes="sidebar-title"
+                )
+                agent_tree = Tree[SidebarTreeItem]("agents", id="agent-sessions")
+                agent_tree.show_root = False
+                agent_tree.guide_depth = 2
+                agent_tree.root.expand()
+                yield agent_tree
         with Horizontal(id="status"):
             yield Static(id="status-message")
             yield Static("·", classes="status-separator")
@@ -1792,6 +1827,9 @@ class ToolboxApp(App[None]):
         self._detached_event_timer = self.set_interval(
             0.05, self._flush_staged_detached_events
         )
+        self._agent_tree_timer = self.set_interval(
+            AGENT_TREE_REFRESH_INTERVAL, self._refresh_agent_tree
+        )
         self._show_welcome()
         self._refresh_sidebar()
         self._refresh_model_controls()
@@ -1807,6 +1845,9 @@ class ToolboxApp(App[None]):
         if self._detached_event_timer is not None:
             self._detached_event_timer.stop()
             self._detached_event_timer = None
+        if self._agent_tree_timer is not None:
+            self._agent_tree_timer.stop()
+            self._agent_tree_timer = None
         for state in self.session_tabs:
             self._reset_stream_state(state)
             state.conversation.close()
@@ -2580,6 +2621,7 @@ class ToolboxApp(App[None]):
             picker.set_options(options)
             picker.value = value
         self._populate_tool_tree(active_tools, selected)
+        self._populate_agent_tree()
 
     def _sidebar_toolbox_options(
         self, selected: list[dict[str, Any]] | None = None
@@ -2637,6 +2679,147 @@ class ToolboxApp(App[None]):
 
         add_branch(tree.root, namespace_tree)
         tree.root.expand()
+
+    def _populate_agent_tree(self) -> None:
+        """Render child and detached agent sessions under the active session."""
+        active_session_id = self.conversation.session_id
+        all_sessions: list[dict[str, Any]] = []
+        cursor = 0
+        while cursor is not None:
+            page = self.kernel.list_sessions(limit=100, cursor=cursor)
+            all_sessions.extend(page["sessions"])
+            cursor = page.get("next_cursor")
+
+        # Build a map of parent -> [children] for all sessions.
+        children_by_parent: dict[str | None, list[dict[str, Any]]] = {}
+        for session in all_sessions:
+            parent = session.get("parent_session_id")
+            children_by_parent.setdefault(parent, []).append(session)
+
+        # Collect descendants of the active session.
+        descendants: list[dict[str, Any]] = []
+        pending = list(children_by_parent.get(active_session_id, []))
+        while pending:
+            child = pending.pop()
+            descendants.append(child)
+            pending.extend(children_by_parent.get(child["id"], []))
+
+        tree = self.query_one("#agent-sessions", Tree)
+        tree.clear()
+
+        if not descendants:
+            tree.root.add_leaf(
+                Text("(no child sessions)", style="dim #8fa5ba"),
+                SidebarTreeItem("agent_session", ""),
+            )
+            tree.root.expand()
+            return
+
+        # Track which sessions are running (have matching tabs that are running).
+        running_sessions: set[str] = set()
+        for state in self.session_tabs:
+            if state.running:
+                running_sessions.add(state.conversation.session_id)
+
+        # Also check detached_tool_events for active detached agents.
+        for state in self.session_tabs:
+            for tool_event in state.detached_tool_events.values():
+                if tool_event.processing:
+                    # Detached agent is still running — track by the state's session.
+                    running_sessions.add(state.conversation.session_id)
+
+        spinner_frame = ToolEvent.SPINNER_FRAMES[
+            self._agent_spinner_index % len(ToolEvent.SPINNER_FRAMES)
+        ]
+
+        # Build a set of session IDs that have completed and haven't been viewed.
+        completed_unviewed: set[str] = set()
+
+        def add_session_node(
+            parent: TreeNode[SidebarTreeItem],
+            session: dict[str, Any],
+        ) -> None:
+            session_id = str(session["id"])
+            is_running = session_id in running_sessions
+
+            # Determine notification badge.
+            badge = ""
+            if not is_running:
+                # Check if this is a completed session awaiting user attention.
+                if (
+                    session_id not in self._viewed_agent_sessions
+                    and session_id not in self._notified_agent_sessions
+                ):
+                    # Mark for notification.
+                    completed_unviewed.add(session_id)
+                if session_id in self._notified_agent_sessions:
+                    badge = " !"
+
+            # Build the label.
+            kind = str(session.get("kind", "agent"))
+            short_id = session_id[:8]
+            event_count = session.get("event_count", 0)
+
+            if is_running:
+                label = Text(f"{spinner_frame} ", style="yellow")
+                label.append(
+                    f"{kind} {short_id} ({event_count})",
+                    style="#d7e0ea",
+                )
+            else:
+                if badge:
+                    label = Text(f"{kind} {short_id} ({event_count})", style="green")
+                    label.append(badge, style="bold yellow")
+                else:
+                    label = Text(f"{kind} {short_id} ({event_count})", style="#7890a6")
+
+            node = parent.add(
+                label,
+                SidebarTreeItem("agent_session", session_id),
+                expand=True,
+            )
+            for child in children_by_parent.get(session_id, []):
+                add_session_node(node, child)
+
+        for child in children_by_parent.get(active_session_id, []):
+            add_session_node(tree.root, child)
+
+        tree.root.expand()
+
+        # Record newly notified sessions.
+        self._notified_agent_sessions.update(completed_unviewed)
+
+    def _refresh_agent_tree(self) -> None:
+        """Periodic refresh of the agent session tree with spinner animation."""
+        self._agent_spinner_index = (self._agent_spinner_index + 1) % len(
+            ToolEvent.SPINNER_FRAMES
+        )
+        if self.is_mounted:
+            self._populate_agent_tree()
+
+    @on(Tree.NodeSelected, "#agent-sessions")
+    def select_agent_session_node(self, event: Tree.NodeSelected) -> None:
+        """Switch to the tab for a selected agent session, if one exists."""
+        item = event.node.data
+        if not isinstance(item, SidebarTreeItem) or item.kind != "agent_session":
+            return
+        session_id = item.value
+        if not session_id:
+            return
+        # Mark as viewed.
+        self._viewed_agent_sessions.add(session_id)
+        self._notified_agent_sessions.discard(session_id)
+
+        # Find an existing tab for this session.
+        for state in self.session_tabs:
+            if state.conversation.session_id == session_id:
+                self.query_one("#session-tabs", TabbedContent).active = state.pane_id
+                self._set_status(f"switched to {session_id[:8]}", state)
+                self._populate_agent_tree()
+                return
+
+        # No existing tab — show a status message.
+        self._set_status(f"session {session_id[:8]} has no open tab")
 
     @on(Select.Changed, "#sidebar-toolbox")
     def select_sidebar_toolbox(self, event: Select.Changed) -> None:
