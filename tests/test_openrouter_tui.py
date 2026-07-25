@@ -4753,6 +4753,7 @@ def test_selecting_agent_session_renders_read_only_event_view(tmp_path: Path) ->
 
     async def exercise() -> None:
         async with app.run_test(size=(100, 34)) as pilot:
+            app._write_user("parent session content")
             app._populate_agent_tree()
             tree = app.query_one("#agent-sessions", Tree)
             child_node = next(
@@ -4764,11 +4765,31 @@ def test_selecting_agent_session_renders_read_only_event_view(tmp_path: Path) ->
             tree.select_node(child_node)
             await pilot.pause()
 
-            rendered = chat_text(app)
+            state = app.active_session
+            assert state.chat.display is False
+            assert state.session_view.display is True
+            rendered = chat_text(app, state.session_view)
             assert f"session {child_session_id[:12]}" in rendered
             assert "read-only view" in rendered
             assert "inspect this" in rendered
             assert "inspection done" in rendered
+
+            app._display_event(
+                state,
+                AgentEvent(
+                    "model",
+                    {"text": "parent background update", "calls": []},
+                    1,
+                ),
+            )
+            tree.select_node(tree.root)
+            await pilot.pause()
+
+            assert state.chat.display is True
+            assert state.session_view.display is False
+            assert "parent session content" in chat_text(app)
+            assert "parent background update" in chat_text(app)
+            assert "inspect this" not in chat_text(app)
 
     asyncio.run(exercise())
 
