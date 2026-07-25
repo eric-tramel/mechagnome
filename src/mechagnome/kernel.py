@@ -323,11 +323,12 @@ class _KernelCapability:
             scope=self._context._state.scope,
         )
 
-    def delete_tool(self, name: str) -> dict[str, Any]:
-        """Remove a tool binding through the delete capability."""
+    def delete_tool(self, name: str, version: int | None = None) -> dict[str, Any]:
+        """Remove a tool binding or specific version through the delete capability."""
         self._require("delete_tool")
         return self._context._kernel.delete_tool(
             name,
+            version=version,
             session_id=self._context._state.session_id,
             scope=self._context._state.scope,
         )
@@ -2540,14 +2541,148 @@ class Kernel:
         self,
         name: str,
         *,
+        version: int | None = None,
         session_id: str | None = None,
         scope: InvocationScope | None = None,
         toolbox: str | None = None,
     ) -> dict[str, Any]:
-        """Remove one toolbox binding while retaining its lineage history."""
-        if name in CORE_NAMES:
-            raise ToolboxError("core_tool_required", f"cannot delete core tool: {name}")
+        """Remove one toolbox binding or a specific version, retaining lineage."""
+        if name in CORE_NAMES and (version is None or version == 1):
+            raise ToolboxError(
+                "core_tool_required",
+                f"cannot delete core tool {name}"
+                + (" version 1" if version == 1 else ""),
+            )
         active_scope = self._scope(session_id=session_id, scope=scope)
+        if version is not None:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    target = (
+                        self._toolbox_id(connection, toolbox)
+                        if toolbox
+                        else self._resolve(
+                            name, scope=active_scope, connection=connection
+                        ).toolbox_id
+                    )
+                    tool = self._resolve(
+                        name,
+                        scope=active_scope,
+                        toolbox_id=target,
+                        connection=connection,
+                    )
+                    version_row = connection.execute(
+                        """
+                        SELECT id, version FROM tool_versions
+                        WHERE lineage_id = ? AND version = ?
+                        """,
+                        (tool.lineage_id, version),
+                    ).fetchone()
+                    if version_row is None:
+                        raise ToolboxError(
+                            "unknown_version",
+                            f"version {version} does not exist for tool {name!r}",
+                        )
+                    # Check it's not the last version
+                    count_row = connection.execute(
+                        "SELECT COUNT(*) AS count FROM tool_versions"
+                        " WHERE lineage_id = ?",
+                        (tool.lineage_id,),
+                    ).fetchone()
+                    if int(count_row["count"]) <= 1:
+                        raise ToolboxError(
+                            "last_version",
+                            f"cannot delete the last remaining version of {name!r}",
+                        )
+
+                    # Check if the deleted version is the active one
+                    active_row = connection.execute(
+                        """
+                        SELECT tool_version_id FROM bindings
+                        WHERE toolbox_id = ? AND name = ?
+                        """,
+                        (target, name),
+                    ).fetchone()
+                    rolled_back_to = None
+                    if active_row is not None and int(
+                        active_row["tool_version_id"]
+                    ) == int(version_row["id"]):
+                        # Find the next-highest remaining version
+                        prev_row = connection.execute(
+                            """
+                            SELECT id, version FROM tool_versions
+                            WHERE lineage_id = ? AND version < ?
+                            ORDER BY version DESC LIMIT 1
+                            """,
+                            (tool.lineage_id, version),
+                        ).fetchone()
+                        if prev_row is not None:
+                            # Update the binding to point to the previous version
+                            connection.execute(
+                                """
+                                UPDATE bindings SET tool_version_id = ?
+                                WHERE toolbox_id = ? AND name = ?
+                                """,
+                                (int(prev_row["id"]), target, name),
+                            )
+                            rolled_back_to = int(prev_row["version"])
+                        else:
+                            # No lower version exists; try the next-higher one
+                            next_row = connection.execute(
+                                """
+                                SELECT id, version FROM tool_versions
+                                WHERE lineage_id = ? AND version > ?
+                                ORDER BY version ASC LIMIT 1
+                                """,
+                                (tool.lineage_id, version),
+                            ).fetchone()
+                            if next_row is not None:
+                                connection.execute(
+                                    """
+                                    UPDATE bindings SET tool_version_id = ?
+                                    WHERE toolbox_id = ? AND name = ?
+                                    """,
+                                    (int(next_row["id"]), target, name),
+                                )
+                                rolled_back_to = int(next_row["version"])
+
+                    # Null out event references to the deleted version,
+                    # log the deletion event, then delete the version row.
+                    connection.execute(
+                        "UPDATE events SET tool_version_id = NULL"
+                        " WHERE tool_version_id = ?",
+                        (int(version_row["id"]),),
+                    )
+                    if session_id is not None:
+                        event_payload = {
+                            "name": name,
+                            "deleted_version": version,
+                            "toolbox_id": target,
+                        }
+                        if rolled_back_to is not None:
+                            event_payload["rolled_back_to"] = rolled_back_to
+                        self._append_event_connection(
+                            connection,
+                            session_id,
+                            "version_deleted",
+                            event_payload,
+                            toolbox_id=target,
+                            tool_name=name,
+                            tool_version=version,
+                            tool_version_id=None,
+                        )
+                    connection.execute(
+                        "DELETE FROM tool_versions WHERE id = ?",
+                        (int(version_row["id"]),),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            result = {"name": name, "deleted_version": version}
+            if rolled_back_to is not None:
+                result["rolled_back_to"] = rolled_back_to
+            return result
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:

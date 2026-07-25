@@ -1111,6 +1111,141 @@ def test_delete_tool_core_operation(tmp_path: Path) -> None:
     assert error.value.code == "core_tool_required"
 
 
+def test_delete_tool_version_removes_specific_version(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    write(
+        kernel,
+        "versioned",
+        "async def main(input, ctx):\n    return 'v1'\n",
+        session_id=session_id,
+    )
+    write(
+        kernel,
+        "versioned",
+        "async def main(input, ctx):\n    return 'v2'\n",
+        session_id=session_id,
+        base_version=1,
+    )
+    write(
+        kernel,
+        "versioned",
+        "async def main(input, ctx):\n    return 'v3'\n",
+        session_id=session_id,
+        base_version=2,
+    )
+
+    result = kernel.delete_tool("versioned", version=2, session_id=session_id)
+    assert result == {"name": "versioned", "deleted_version": 2}
+
+    history = kernel.tool_history("versioned")
+    versions = [v["version"] for v in history["versions"]]
+    assert 2 not in versions
+    assert 1 in versions
+    assert 3 in versions
+    assert history["active_version"] == 3
+
+    assert call_tool(kernel, "versioned", {}, session_id=session_id) == "v3"
+    assert call_tool(kernel, "versioned", {}, session_id=session_id, version=1) == "v1"
+
+
+def test_delete_tool_active_version_rolls_back(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    write(
+        kernel,
+        "number",
+        "async def main(input, ctx):\n    return 1\n",
+        session_id=session_id,
+    )
+    write(
+        kernel,
+        "number",
+        "async def main(input, ctx):\n    return 2\n",
+        session_id=session_id,
+        base_version=1,
+    )
+    write(
+        kernel,
+        "number",
+        "async def main(input, ctx):\n    return 3\n",
+        session_id=session_id,
+        base_version=2,
+    )
+
+    result = kernel.delete_tool("number", version=3, session_id=session_id)
+    assert result == {"name": "number", "deleted_version": 3, "rolled_back_to": 2}
+
+    # The tool now returns 2 (rolled back to v2)
+    assert call_tool(kernel, "number", {}, session_id=session_id) == 2
+
+    # v3 no longer appears in tool_history versions
+    history = kernel.tool_history("number")
+    versions = [v["version"] for v in history["versions"]]
+    assert 3 not in versions
+    assert 1 in versions
+    assert 2 in versions
+    assert history["active_version"] == 2
+
+
+def test_delete_tool_version_rejects_last_version(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(kernel, "solo", "async def main(input, ctx):\n    return 'v1'\n")
+
+    with pytest.raises(ToolboxError) as error:
+        kernel.delete_tool("solo", version=1)
+    assert error.value.code == "last_version"
+
+    history = kernel.tool_history("solo")
+    assert len(history["versions"]) == 1
+
+
+def test_delete_tool_version_rejects_core_v1(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+
+    with pytest.raises(ToolboxError) as error:
+        kernel.delete_tool("help", version=1)
+    assert error.value.code == "core_tool_required"
+
+
+def test_delete_tool_core_version_rolls_back_to_v1(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+
+    # Replace a core tool with a v2 override
+    write(
+        kernel,
+        "help",
+        'async def main(input, ctx):\n    return "custom help"\n',
+        input_schema=CORE_SCHEMAS["help"],
+        base_version=1,
+    )
+    assert kernel.call("help", {}) == "custom help"
+
+    # Delete v2; should roll back to v1
+    result = kernel.delete_tool("help", version=2)
+    assert result == {"name": "help", "deleted_version": 2, "rolled_back_to": 1}
+
+    # Calling help should now use the original v1 implementation
+    assert kernel.call("help", {}).startswith("# Mechagnome help")
+
+    # v2 is gone from history
+    history = kernel.tool_history("help")
+    versions = [v["version"] for v in history["versions"]]
+    assert versions == [1]
+    assert history["active_version"] == 1
+
+
+def test_delete_tool_version_rejects_unknown_version(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(kernel, "solo", "async def main(input, ctx):\n    return 'v1'\n")
+
+    with pytest.raises(ToolboxError) as error:
+        kernel.delete_tool("solo", version=99)
+    assert error.value.code == "unknown_version"
+
+
 def test_terminal_timings_are_persisted_and_aggregated_by_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

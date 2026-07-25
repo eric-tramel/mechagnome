@@ -129,6 +129,7 @@ DELETE_SCHEMA = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
+        "version": {"type": "integer", "minimum": 1},
     },
     "required": ["name"],
     "additionalProperties": False,
@@ -373,10 +374,13 @@ CALL_SOURCE = dedent(
 
 DELETE_SOURCE = dedent(
     '''\
-    """Remove a tool binding while retaining its lineage and version history."""
+    """Remove a tool binding or specific version while retaining lineage history."""
 
     async def main(input, ctx):
-        return ctx.kernel.delete_tool(name=input["name"])
+        return ctx.kernel.delete_tool(
+            name=input["name"],
+            version=input.get("version"),
+        )
     '''
 )
 
