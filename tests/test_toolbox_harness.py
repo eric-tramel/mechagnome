@@ -237,6 +237,8 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "ctx.sessions.current(after=0, limit=50)",
         "ctx.sessions.read(session_id, after=0, limit=50)",
         "ctx.sessions.list(limit=20, cursor=0)",
+        "ctx.kernel.list_tools(namespace=None)",
+        "ctx.kernel.list_tool_namespaces(namespace=None)",
         "await ctx.model_provider.complete([",
         "await ctx.model_provider.run_agent(",
         "ctx.kernel.catalog(include_core=True)",
@@ -303,6 +305,113 @@ def test_write_immediately_search_view_and_call(tmp_path: Path) -> None:
     viewed = kernel.call("view_tool", {"name": "echo"})
     assert viewed["source"] == source
     assert viewed["active"] is True
+
+
+def test_list_tools_pages_all_tools_and_filters_namespace_subtrees(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "python_format",
+        "async def main(input, ctx):\n    return None\n",
+        namespaces=["development/python", "quality/formatting"],
+    )
+    write(
+        kernel,
+        "python_test",
+        "async def main(input, ctx):\n    return None\n",
+        namespaces=["development/python/testing"],
+    )
+    write(
+        kernel,
+        "device_status",
+        "async def main(input, ctx):\n    return None\n",
+        namespaces=["device"],
+    )
+
+    first = kernel.call("list_tools", {"namespace": "development", "limit": 1})
+    second = kernel.call(
+        "list_tools",
+        {
+            "namespace": "development",
+            "limit": 1,
+            "cursor": first["next_cursor"],
+        },
+    )
+
+    assert first == {
+        "items": [
+            {
+                "name": "python_format",
+                "description": "Test tool python_format.",
+                "namespaces": ["development/python", "quality/formatting"],
+            }
+        ],
+        "next_cursor": 1,
+        "total": 2,
+    }
+    assert [item["name"] for item in second["items"]] == ["python_test"]
+    assert second["next_cursor"] is None
+    assert (
+        kernel.call("list_tools", {"namespace": "development/python/testing"})["items"][
+            0
+        ]["name"]
+        == "python_test"
+    )
+    assert kernel.call("list_tools", {"namespace": "develop"})["items"] == []
+
+
+def test_list_tool_namespaces_pages_hierarchy_with_recursive_unique_counts(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "python_format",
+        "async def main(input, ctx):\n    return None\n",
+        namespaces=["development", "development/python", "quality/formatting"],
+    )
+    write(
+        kernel,
+        "python_test",
+        "async def main(input, ctx):\n    return None\n",
+        namespaces=["development/python/testing"],
+    )
+
+    first = kernel.call(
+        "list_tool_namespaces", {"namespace": "development", "limit": 2}
+    )
+    second = kernel.call(
+        "list_tool_namespaces",
+        {
+            "namespace": "development",
+            "limit": 2,
+            "cursor": first["next_cursor"],
+        },
+    )
+
+    assert first == {
+        "items": [
+            {"namespace": "development", "tool_count": 2},
+            {"namespace": "development/python", "tool_count": 2},
+        ],
+        "next_cursor": 2,
+        "total": 3,
+    }
+    assert second == {
+        "items": [{"namespace": "development/python/testing", "tool_count": 1}],
+        "next_cursor": None,
+        "total": 3,
+    }
+    all_namespaces = kernel.call("list_tool_namespaces", {})["items"]
+    assert {"namespace": "quality", "tool_count": 1} in all_namespaces
+    assert {"namespace": "quality/formatting", "tool_count": 1} in all_namespaces
+    assert kernel.call("list_tool_namespaces", {"namespace": "missing"}) == {
+        "items": [],
+        "next_cursor": None,
+        "total": 0,
+    }
 
 
 def test_search_uses_ranked_matches_across_tool_metadata(tmp_path: Path) -> None:
@@ -654,7 +763,7 @@ def test_schema_two_database_migrates_without_feedback_storage(tmp_path: Path) -
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 7
+    assert version == 8
     assert table is None
 
 
@@ -682,7 +791,7 @@ def test_schema_five_database_removes_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 7
+    assert version == 8
     assert table is None
 
 
@@ -729,6 +838,62 @@ def test_schema_six_backfills_all_lineage_namespaces_idempotently(
         ).fetchall()
     assert {int(row["lineage_id"]) for row in counts} == set(lineage_ids.values())
     assert all(int(row["count"]) == 1 for row in counts)
+
+
+def test_schema_seven_reserves_and_seeds_tool_listing_core_slots(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    toolbox_id = kernel.active_toolboxes(session_id)[0]["id"]
+    with closing(kernel._connect()) as connection, connection:
+        for name in ("list_tools", "list_tool_namespaces"):
+            lineage = connection.execute(
+                "SELECT id FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+                (toolbox_id, name),
+            ).fetchone()
+            assert lineage is not None
+            lineage_id = int(lineage["id"])
+            connection.execute(
+                "DELETE FROM bindings WHERE toolbox_id = ? AND name = ?",
+                (toolbox_id, name),
+            )
+            connection.execute(
+                "DELETE FROM tool_versions WHERE lineage_id = ?", (lineage_id,)
+            )
+            connection.execute(
+                "DELETE FROM tool_namespaces WHERE lineage_id = ?", (lineage_id,)
+            )
+            connection.execute("DELETE FROM tool_lineages WHERE id = ?", (lineage_id,))
+        lineage = connection.execute(
+            "INSERT INTO tool_lineages (toolbox_id, name, created_at) "
+            "VALUES (?, 'list_tools', 'legacy')",
+            (toolbox_id,),
+        )
+        version = connection.execute(
+            "INSERT INTO tool_versions ("
+            "lineage_id, version, description, schema_json, source, created_at"
+            ") VALUES (?, 1, 'legacy listing', '{}', "
+            "'async def main(input, ctx): return null', 'legacy')",
+            (int(lineage.lastrowid),),
+        )
+        connection.execute(
+            "INSERT INTO bindings (toolbox_id, name, tool_version_id) "
+            "VALUES (?, 'list_tools', ?)",
+            (toolbox_id, int(version.lastrowid)),
+        )
+        connection.execute(
+            "INSERT INTO tool_namespaces (lineage_id, path) VALUES (?, 'legacy')",
+            (int(lineage.lastrowid),),
+        )
+        connection.execute("PRAGMA user_version = 7")
+
+    reopened = kernel_at(tmp_path)
+
+    assert reopened.view_tool("list_tools")["kind"] == "core"
+    assert reopened.view_tool("list_tool_namespaces")["kind"] == "core"
+    assert reopened.view_tool("list_tools_legacy")["description"] == "legacy listing"
+    assert reopened.view_tool("list_tools_legacy")["namespaces"] == ["legacy"]
 
 
 def test_schema_three_database_migrates_real_pre_lineage_sessions(
@@ -2830,9 +2995,12 @@ def test_toolbox_union_collisions_versions_mutations_and_core_order(
     kernel.select_toolboxes(session_id, ["alpha", "beta"], mode="use")
     assert call_tool(kernel, "same", {}, session_id=session_id) == "alpha"
     assert call_tool(kernel, "same", {}, session_id=session_id, version=1) == "alpha"
-    assert kernel.tool_definitions(session_id=session_id)[1]["description"] == (
-        "Test tool search_tools."
+    search_definition = next(
+        definition
+        for definition in kernel.tool_definitions(session_id=session_id)
+        if definition["name"] == "search_tools"
     )
+    assert search_definition["description"] == "Test tool search_tools."
     matches = [
         item for item in kernel.catalog(session_id=session_id) if item["name"] == "same"
     ]
@@ -2935,7 +3103,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 8
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -3868,7 +4036,7 @@ def test_parallel_isolated_tools_emit_each_durable_event_once(tmp_path: Path) ->
     assert not any(event.kind == "call_failed" for event in tool_events)
 
 
-def test_harness_exposes_five_core_operations_plus_run_agent_and_saves_everything(
+def test_harness_exposes_core_operations_plus_run_agent_and_saves_everything(
     tmp_path: Path,
 ) -> None:
     kernel = kernel_at(tmp_path)

@@ -361,6 +361,8 @@ logical slot in which they run:
 | Core slot | Allowed context method |
 | --- | --- |
 | `help` | none |
+| `list_tools` | `ctx.kernel.list_tools(namespace=None)` |
+| `list_tool_namespaces` | `ctx.kernel.list_tool_namespaces(namespace=None)` |
 | `search_tools` | `ctx.kernel.catalog(include_core=True)` |
 | `view_tool` | `ctx.kernel.view_tool(name, version=None)` |
 | `write_tool` | `ctx.kernel.write_tool(...)` |

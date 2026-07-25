@@ -48,6 +48,20 @@ SEARCH_SCHEMA = {
     "additionalProperties": False,
 }
 
+LIST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "namespace": {
+            "type": "string",
+            "maxLength": NAMESPACE_PATH_MAX,
+            "pattern": NAMESPACE_PATH_PATTERN,
+        },
+        "cursor": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+    },
+    "additionalProperties": False,
+}
+
 VIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -262,6 +276,54 @@ SEARCH_SOURCE = dedent(
     '''
 )
 
+LIST_TOOLS_SOURCE = dedent(
+    '''\
+    """Page through active tools, optionally within one namespace subtree."""
+
+    async def main(input, ctx):
+        cursor = max(0, input.get("cursor", 0))
+        limit = min(50, max(1, input.get("limit", 10)))
+        tools = sorted(
+            ctx.kernel.list_tools(namespace=input.get("namespace")),
+            key=lambda tool: tool["name"],
+        )
+        next_cursor = cursor + limit if cursor + limit < len(tools) else None
+        return {
+            "items": [
+                {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "namespaces": tool["namespaces"],
+                }
+                for tool in tools[cursor:cursor + limit]
+            ],
+            "next_cursor": next_cursor,
+            "total": len(tools),
+        }
+    '''
+)
+
+LIST_TOOL_NAMESPACES_SOURCE = dedent(
+    '''\
+    """Page through hierarchical namespaces and their recursive tool counts."""
+
+    async def main(input, ctx):
+        cursor = max(0, input.get("cursor", 0))
+        limit = min(50, max(1, input.get("limit", 10)))
+        namespaces = ctx.kernel.list_tool_namespaces(
+            namespace=input.get("namespace")
+        )
+        next_cursor = (
+            cursor + limit if cursor + limit < len(namespaces) else None
+        )
+        return {
+            "items": namespaces[cursor:cursor + limit],
+            "next_cursor": next_cursor,
+            "total": len(namespaces),
+        }
+    '''
+)
+
 VIEW_SOURCE = dedent(
     '''\
     """View the exact stored source and metadata for a tool version."""
@@ -307,6 +369,18 @@ BOOTSTRAP_TOOLS = (
         "Read progressive documentation for using and extending the toolbox.",
         HELP_SCHEMA,
         HELP_SOURCE,
+    ),
+    BootstrapTool(
+        "list_tools",
+        "List active tools, optionally within a hierarchical namespace.",
+        LIST_SCHEMA,
+        LIST_TOOLS_SOURCE,
+    ),
+    BootstrapTool(
+        "list_tool_namespaces",
+        "List hierarchical tool namespaces and recursive tool counts.",
+        LIST_SCHEMA,
+        LIST_TOOL_NAMESPACES_SOURCE,
     ),
     BootstrapTool(
         "search_tools",

@@ -1,8 +1,10 @@
 # Core operations
 
-The five base operations are ordinary readable tool versions:
+The seven base operations are ordinary readable tool versions:
 
 - `help`
+- `list_tools`
+- `list_tool_namespaces`
 - `search_tools`
 - `view_tool`
 - `write_tool`
@@ -13,12 +15,16 @@ behavior are editable. Privilege follows the active logical core slot, not
 copied source text. Copying `search_tools` source into an ordinary user tool,
 for example, does not grant catalog access.
 
+When an upgrade introduces a new fixed core name, an existing user-authored
+tool with that name is preserved under a collision-free `_legacy` suffix before
+the shipped core slot is installed.
+
 A host-only rollback command can recover a broken core binding.
 
 ## Agent action
 
 `run_agent` is a host action rather than an editable core tool. Every root,
-child, and grandchild conversation receives it alongside the five operations
+child, and grandchild conversation receives it alongside the seven operations
 above. Run another full agent in the foreground with:
 
 ```json

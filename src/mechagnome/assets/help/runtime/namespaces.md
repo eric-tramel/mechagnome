@@ -26,15 +26,18 @@ an older version shows the lineage's current namespaces. Assignment updates are
 last-write-wins. `base_version`, when supplied, checks the active source version
 but does not create an independent namespace revision.
 
-`search_tools` returns each tool's sorted namespace paths. Namespace text also
-participates in keyword ranking. Pass `namespace` to browse one subtree; for
-example, filtering `development` includes exact `development` assignments and
-descendants such as `development/python`, but not `device`.
+`list_tools` pages through tools and accepts a `namespace` filter. Filtering
+`development` includes exact `development` assignments and descendants such as
+`development/python`, but not `device`. `list_tool_namespaces` pages through
+namespace paths with recursive, de-duplicated tool counts; intermediate parent
+paths are included even when no tool is assigned directly to them. `search_tools`
+returns each tool's sorted namespace paths and also indexes namespace text for
+keyword ranking.
 
 The TUI sidebar presents these paths as a collapsible tree. Tool leaves show only
 their callable names; selecting one opens its source, history, and usage details.
 
-Namespaces do not affect `call_tool` resolution, the fixed five core operation
+Namespaces do not affect `call_tool` resolution, the fixed seven core operation
 slots, capabilities, or filesystem access. They are organization metadata, not
 security boundaries. Use `help(topic="toolboxes")` for the separate ordered
 toolbox-stack and working-directory routing behavior.

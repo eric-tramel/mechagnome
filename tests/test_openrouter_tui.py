@@ -336,6 +336,8 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     }
     assert list(tools) == [
         "help",
+        "list_tools",
+        "list_tool_namespaces",
         "search_tools",
         "view_tool",
         "write_tool",

@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
@@ -274,6 +274,24 @@ class _KernelCapability:
             scope=self._context._state.scope,
         )
 
+    def list_tools(self, namespace: str | None = None) -> list[dict[str, Any]]:
+        """Return effective metadata to the paged tool listing."""
+        self._require("list_tools")
+        return self._context._kernel.catalog(
+            namespace=namespace,
+            scope=self._context._state.scope,
+        )
+
+    def list_tool_namespaces(
+        self, namespace: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return hierarchical namespace counts to the paged listing."""
+        self._require("list_tool_namespaces")
+        return self._context._kernel.list_tool_namespaces(
+            namespace=namespace,
+            scope=self._context._state.scope,
+        )
+
     def view_tool(self, name: str, version: int | None = None) -> dict[str, Any]:
         """View a tool through the inspection capability."""
         self._require("view_tool")
@@ -321,7 +339,7 @@ class _KernelCapability:
 
 
 class Kernel:
-    """Persistent host substrate below the five editable core operations."""
+    """Persistent host substrate below the editable core operations."""
 
     def __init__(
         self,
@@ -404,6 +422,9 @@ class Kernel:
                     if version == 6:
                         self._migrate_v6(connection)
                         version = 7
+                    if version == 7:
+                        self._migrate_v7(connection)
+                        version = 8
                     if version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -491,6 +512,59 @@ class Kernel:
         """Add hierarchical namespace memberships to every tool lineage."""
         Kernel._create_namespace_schema(connection)
         Kernel._backfill_namespaces(connection)
+
+    def _migrate_v7(self, connection: sqlite3.Connection) -> None:
+        """Reserve and seed the two tool-listing core slots."""
+        self._reserve_new_core_names(connection, ("list_tools", "list_tool_namespaces"))
+        for row in connection.execute("SELECT id FROM toolboxes").fetchall():
+            self._seed_missing_core(connection, str(row["id"]))
+
+    @staticmethod
+    def _reserve_new_core_names(
+        connection: sqlite3.Connection, names: tuple[str, ...]
+    ) -> None:
+        """Keep pre-core user lineages callable under collision-free names."""
+        defaults = {tool.name: tool for tool in BOOTSTRAP_TOOLS}
+        for toolbox_row in connection.execute("SELECT id FROM toolboxes").fetchall():
+            toolbox_id = str(toolbox_row["id"])
+            for name in names:
+                lineage = connection.execute(
+                    "SELECT id FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+                    (toolbox_id, name),
+                ).fetchone()
+                if lineage is None:
+                    continue
+                version_one = connection.execute(
+                    "SELECT description, schema_json, source FROM tool_versions "
+                    "WHERE lineage_id = ? AND version = 1",
+                    (int(lineage["id"]),),
+                ).fetchone()
+                default = defaults[name]
+                if version_one is not None and (
+                    str(version_one["description"]) == default.description
+                    and str(version_one["schema_json"]) == _json(default.input_schema)
+                    and str(version_one["source"]) == default.source
+                ):
+                    continue
+                suffix = 1
+                legacy_name = f"{name}_legacy"
+                while (
+                    connection.execute(
+                        "SELECT 1 FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+                        (toolbox_id, legacy_name),
+                    ).fetchone()
+                    is not None
+                ):
+                    suffix += 1
+                    legacy_name = f"{name}_legacy_{suffix}"
+                connection.execute(
+                    "UPDATE tool_lineages SET name = ? WHERE id = ?",
+                    (legacy_name, int(lineage["id"])),
+                )
+                connection.execute(
+                    "UPDATE bindings SET name = ? WHERE toolbox_id = ? AND name = ?",
+                    (legacy_name, toolbox_id, name),
+                )
 
     @staticmethod
     def _create_namespace_schema(connection: sqlite3.Connection) -> None:
@@ -757,6 +831,7 @@ class Kernel:
             "legacy_sessions",
         ):
             connection.execute(f"DROP TABLE {table}")
+        self._reserve_new_core_names(connection, ("list_tools", "list_tool_namespaces"))
         self._seed_missing_core(connection, toolbox_id)
         self._backfill_namespaces(connection)
 
@@ -1560,7 +1635,7 @@ class Kernel:
     def tool_definitions(
         self, *, session_id: str | None = None, scope: InvocationScope | None = None
     ) -> list[dict[str, Any]]:
-        """Return the five fixed model-facing operation definitions."""
+        """Return the fixed model-facing operation definitions."""
         active_scope = self._scope(session_id=session_id, scope=scope)
         return [
             {
@@ -1614,6 +1689,40 @@ class Kernel:
                 }
             )
         return tools
+
+    def list_tool_namespaces(
+        self,
+        *,
+        namespace: str | None = None,
+        session_id: str | None = None,
+        scope: InvocationScope | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return namespace paths with recursive de-duplicated tool counts."""
+        namespace_filter = (
+            self._normalize_namespace_path(namespace) if namespace is not None else None
+        )
+        tools = self.catalog(session_id=session_id, scope=scope)
+        memberships: dict[str, set[str]] = {}
+        for tool in tools:
+            for assigned_path in tool["namespaces"]:
+                if namespace_filter is not None and not (
+                    assigned_path == namespace_filter
+                    or assigned_path.startswith(f"{namespace_filter}/")
+                ):
+                    continue
+                parts = assigned_path.split("/")
+                for depth in range(1, len(parts) + 1):
+                    path = "/".join(parts[:depth])
+                    if namespace_filter is not None and not (
+                        path == namespace_filter
+                        or path.startswith(f"{namespace_filter}/")
+                    ):
+                        continue
+                    memberships.setdefault(path, set()).add(tool["name"])
+        return [
+            {"namespace": path, "tool_count": len(names)}
+            for path, names in sorted(memberships.items())
+        ]
 
     @staticmethod
     def _effective_rows(

@@ -28,26 +28,28 @@
 </p>
 <p align="center"><sub><strong>Reuse tools across sessions.</strong> A fresh conversation calls the persisted tool directly—no regeneration or provider-side magic.</sub></p>
 
-A small proof of a metaprogrammable agent toolbox. The model sees five editable
+A small proof of a metaprogrammable agent toolbox. The model sees seven editable
 toolbox operations:
 
 - `help`
+- `list_tools`
+- `list_tool_namespaces`
 - `search_tools`
 - `view_tool`
 - `write_tool`
 - `call_tool`
 
 It also sees the host-owned `run_agent` action. Every agent session—root or
-recursively launched—receives this same six-action surface.
+recursively launched—receives this same eight-action surface.
 
 It begins with no user-authored tools. During a session, an agent can write a
 Python tool, call it immediately, find it again later, compose it from other
-tools, and inspect current or historical sessions. The five core operations are
+tools, and inspect current or historical sessions. The seven core operations are
 also readable and replaceable through `write_tool`; their code-shipped version 1
 defaults track the installed library, while persisted version 2 and later
 implementations are immutable. Each working directory has a default toolbox,
 and sessions may compose an ordered toolbox stack without changing the
-provider-facing five-tool surface. Inside a toolbox, tools belong to one or more
+provider-facing seven-tool surface. Inside a toolbox, tools belong to one or more
 hierarchical discovery namespaces such as `development/python`. Search results
 expose those namespaces alongside each matching tool, while the tool manager
 summarizes passive call, outcome, duration, and session metrics.
@@ -214,10 +216,12 @@ Namespace assignment is last-write-wins mutable metadata. `base_version`, when
 provided, verifies the active source version but does not version namespace
 changes independently.
 
-`search_tools` returns namespace paths, indexes them for keyword search, and
-accepts a `namespace` filter. Filtering `development` includes tools explicitly
-assigned to `development` or descendants such as `development/python`. Callable
-tool names remain flat, and multiple memberships never duplicate a result.
+`list_tools` pages through tools and accepts a `namespace` filter. Filtering
+`development` includes tools explicitly assigned to `development` or descendants
+such as `development/python`. `list_tool_namespaces` pages through the namespace
+tree with recursive, de-duplicated tool counts. `search_tools` returns namespace
+paths and indexes them for keyword search. Callable tool names remain flat, and
+multiple memberships never duplicate a result.
 Toolboxes and namespaces organize executable code; neither isolates it or
 restricts filesystem access.
 
@@ -305,7 +309,7 @@ foreground-only compatibility API.
 The TUI wraps the bundled streaming `OpenRouterModel` in a host-owned
 `ModelProvider`. The provider creates/binds durable sessions and is the sole
 route from the harness to raw model transport. A transport adapter receives the
-accumulated messages and the same five editable operation definitions plus the
+accumulated messages and the same seven editable operation definitions plus the
 host `run_agent` definition on every turn, then returns a `ModelTurn`:
 
 ```python
@@ -383,15 +387,21 @@ does not stop detached agents; `Harness.close()` does.
 
 ## Metacircular core
 
-The outer names and schemas of the five editable operations are pinned so a
+The outer names and schemas of the seven editable operations are pinned so a
 provider can keep one stable toolbox surface. Their version 1 descriptions, source, and behavior
 are code-shipped defaults refreshed from the installed library at startup.
 Persisted version 2 and later implementations can override those defaults like
 any other tool version. Privilege comes from the logical core slot being invoked:
 
+If an upgrade introduces a new fixed core name that collides with an existing
+user-authored tool, the user tool is preserved under a collision-free `_legacy`
+suffix before the new core slot is installed.
+
 | Slot | Low-level capability |
 | --- | --- |
 | `help` | none; its editable source reads bundled Markdown assets |
+| `list_tools` | enumerate active tools by namespace |
+| `list_tool_namespaces` | enumerate hierarchical namespaces and tool counts |
 | `search_tools` | enumerate active tool metadata |
 | `view_tool` | view stored source, metadata, and schemas |
 | `write_tool` | compile, store, and bind versions |
