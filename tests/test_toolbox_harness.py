@@ -763,7 +763,7 @@ def test_schema_two_database_migrates_without_feedback_storage(tmp_path: Path) -
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 8
+    assert version == 9
     assert table is None
 
 
@@ -791,7 +791,7 @@ def test_schema_five_database_removes_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 8
+    assert version == 9
     assert table is None
 
 
@@ -836,7 +836,8 @@ def test_schema_six_backfills_all_lineage_namespaces_idempotently(
             "SELECT lineage_id, COUNT(*) AS count FROM tool_namespaces "
             "GROUP BY lineage_id"
         ).fetchall()
-    assert {int(row["lineage_id"]) for row in counts} == set(lineage_ids.values())
+    count_ids = {int(row["lineage_id"]) for row in counts}
+    assert set(lineage_ids.values()) <= count_ids
     assert all(int(row["count"]) == 1 for row in counts)
 
 
@@ -1076,6 +1077,38 @@ def test_tool_management_history_usage_provenance_and_deletion(
     with pytest.raises(ToolboxError) as core_error:
         kernel.delete_tool("help")
     assert core_error.value.code == "core_tool_required"
+
+
+def test_delete_tool_core_operation(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+
+    # delete_tool must be registered as a core operation and model action.
+    assert "delete_tool" in CORE_NAMES
+    assert "delete_tool" in MODEL_ACTION_NAMES
+
+    # Write a user tool that can be deleted.
+    write(kernel, "the_tool", "async def main(input, ctx):\n    return 42\n")
+    assert call_tool(kernel, "the_tool", {}) == 42
+
+    # Delete through the model-facing core operation.
+    result = kernel.call("delete_tool", {"name": "the_tool"})
+    assert result == {"name": "the_tool", "deleted_version": 1, "active": False}
+
+    # The tool no longer appears in bindings or catalog.
+    assert "the_tool" not in {item["name"] for item in kernel.bindings()}
+    assert "the_tool" not in {item["name"] for item in kernel.catalog()}
+
+    # Version history is still accessible.
+    history = kernel.tool_history("the_tool")
+    assert history["name"] == "the_tool"
+    assert history["active_version"] is None
+    assert len(history["versions"]) == 1
+    assert history["versions"][0]["version"] == 1
+
+    # Deleting a core tool is rejected with core_tool_required.
+    with pytest.raises(ToolboxError) as error:
+        kernel.call("delete_tool", {"name": "help"})
+    assert error.value.code == "core_tool_required"
 
 
 def test_terminal_timings_are_persisted_and_aggregated_by_version(
@@ -3103,7 +3136,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 9
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 

@@ -1,6 +1,6 @@
 # Core operations
 
-The seven base operations are ordinary readable tool versions:
+The eight base operations are ordinary readable tool versions:
 
 - `help`
 - `list_tools`
@@ -9,6 +9,7 @@ The seven base operations are ordinary readable tool versions:
 - `view_tool`
 - `write_tool`
 - `call_tool`
+- `delete_tool`
 
 Their names and outer schemas are fixed, but their descriptions, source, and
 behavior are editable. Privilege follows the active logical core slot, not
@@ -21,10 +22,14 @@ the shipped core slot is installed.
 
 A host-only rollback command can recover a broken core binding.
 
+`delete_tool` removes a tool's binding from the active toolbox, so it
+disappears from catalog/search/listings, while retaining its lineage and
+version history. Core tools cannot be deleted.
+
 ## Agent action
 
 `run_agent` is a host action rather than an editable core tool. Every root,
-child, and grandchild conversation receives it alongside the seven operations
+child, and grandchild conversation receives it alongside the eight operations
 above. Run another full agent in the foreground with:
 
 ```json
