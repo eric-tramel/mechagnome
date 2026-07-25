@@ -125,6 +125,15 @@ CALL_SCHEMA = {
     "additionalProperties": False,
 }
 
+DELETE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+    },
+    "required": ["name"],
+    "additionalProperties": False,
+}
+
 
 HELP_SOURCE = dedent(
     '''\
@@ -362,6 +371,15 @@ CALL_SOURCE = dedent(
     '''
 )
 
+DELETE_SOURCE = dedent(
+    '''\
+    """Remove a tool binding while retaining its lineage and version history."""
+
+    async def main(input, ctx):
+        return ctx.kernel.delete_tool(name=input["name"])
+    '''
+)
+
 
 BOOTSTRAP_TOOLS = (
     BootstrapTool(
@@ -405,6 +423,12 @@ BOOTSTRAP_TOOLS = (
         "Invoke a tool, detach it for later inspection, or inspect a detached job.",
         CALL_SCHEMA,
         CALL_SOURCE,
+    ),
+    BootstrapTool(
+        "delete_tool",
+        "Delete a tool from the active toolbox, retaining its version history.",
+        DELETE_SCHEMA,
+        DELETE_SOURCE,
     ),
 )
 

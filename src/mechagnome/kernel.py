@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
@@ -323,6 +323,15 @@ class _KernelCapability:
             scope=self._context._state.scope,
         )
 
+    def delete_tool(self, name: str) -> dict[str, Any]:
+        """Remove a tool binding through the delete capability."""
+        self._require("delete_tool")
+        return self._context._kernel.delete_tool(
+            name,
+            session_id=self._context._state.session_id,
+            scope=self._context._state.scope,
+        )
+
     async def execute(
         self, name: str, args: dict[str, Any], version: int | None = None
     ) -> JsonValue:
@@ -425,6 +434,9 @@ class Kernel:
                     if version == 7:
                         self._migrate_v7(connection)
                         version = 8
+                    if version == 8:
+                        self._migrate_v8(connection)
+                        version = 9
                     if version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -516,6 +528,12 @@ class Kernel:
     def _migrate_v7(self, connection: sqlite3.Connection) -> None:
         """Reserve and seed the two tool-listing core slots."""
         self._reserve_new_core_names(connection, ("list_tools", "list_tool_namespaces"))
+        for row in connection.execute("SELECT id FROM toolboxes").fetchall():
+            self._seed_missing_core(connection, str(row["id"]))
+
+    def _migrate_v8(self, connection: sqlite3.Connection) -> None:
+        """Reserve and seed the delete_tool core slot."""
+        self._reserve_new_core_names(connection, ("delete_tool",))
         for row in connection.execute("SELECT id FROM toolboxes").fetchall():
             self._seed_missing_core(connection, str(row["id"]))
 
