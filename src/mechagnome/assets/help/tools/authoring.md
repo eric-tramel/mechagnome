@@ -98,7 +98,7 @@ not data to save or return. Its public interface is:
 
 - `await ctx.call_tool(name, args, version=None)` — invoke another tool.
 - `ctx.caller_session_id` — the durable session ID for this call tree.
-- `ctx.sessions` — a bounded, read-only `SessionAccess` object.
+- `ctx.sessions` — bounded session history and annotation access.
 - `ctx.model_provider` — a bounded text-completion capability supplied by the
   host.
 - `ctx.kernel` — a narrow capability available only to the matching core slot.
@@ -271,13 +271,13 @@ message is sent to the configured provider, and authored code can place data
 read from files or saved sessions into those messages. Do not pass sensitive
 data to `complete()` unless disclosure to that provider is explicitly intended.
 
-### Reading the current session
+### Reading and annotating sessions
 
 `ctx.sessions` is a `SessionAccess` object scoped to the caller's durable
 session. `ctx.sessions.id` and `ctx.caller_session_id` are the same ID.
 `ctx.sessions.metadata()` returns that session's kind, direct parent, derived
-root, origin call, cwd, and creation time. Pass another saved ID to inspect its
-lineage.
+root, origin call, cwd, title, description, annotation revision, and creation
+time. Pass another saved ID to inspect its lineage.
 
 ```python
 async def main(input, ctx):
@@ -303,9 +303,26 @@ A `call_started` event is committed before source begins, so
 `call_succeeded` or `call_failed` event does not exist until after `main`
 returns or raises.
 
+Use `ctx.sessions.set_title(title, *, session_id=None, expected_revision=None)`
+or `ctx.sessions.set_description(description, *, session_id=None,
+expected_revision=None)` to annotate the current session or a named existing
+session. Each method is synchronous and returns the updated metadata. Strings
+are stored verbatim, including blanks; pass `None` to clear a field.
+
+Each successful change advances `annotation_revision` and appends a
+`session_annotation_changed` event to the target. Pass a previously read
+revision as `expected_revision` to detect a race. A stale value raises
+`ToolboxError` with code `session_annotation_conflict`; refetch and retry.
+Without a revision guard, same-field writes are last-commit-wins, while title
+and description writes never overwrite one another.
+
+Annotations commit independently of the authored tool's eventual result. If a
+tool annotates a session and later fails or is cancelled, that committed change
+remains durable.
+
 ### Listing and paging through saved sessions
 
-The session context exposes three read-only methods:
+The session context exposes these read methods:
 
 - `ctx.sessions.current(after=0, limit=50)` reads this call's session.
 - `ctx.sessions.read(session_id, after=0, limit=50)` reads a saved session.

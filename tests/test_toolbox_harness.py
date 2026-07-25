@@ -237,6 +237,8 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         "ctx.sessions.current(after=0, limit=50)",
         "ctx.sessions.read(session_id, after=0, limit=50)",
         "ctx.sessions.list(limit=20, cursor=0)",
+        "ctx.sessions.set_title(title, *, session_id=None, expected_revision=None)",
+        "ctx.sessions.set_description(description, *, session_id=None",
         "ctx.kernel.list_tools(namespace=None)",
         "ctx.kernel.list_tool_namespaces(namespace=None)",
         "await ctx.model_provider.complete([",
@@ -270,6 +272,8 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
     assert "next_after" in sessions
     assert "parent_call_id" in sessions
     assert "call_succeeded" in sessions
+    assert "session_annotation_conflict" in sessions
+    assert "session_annotation_busy" in sessions
     assert "call_finished" not in authoring + sessions
     assert "not isinstance(value, bool)" in authoring
 
@@ -763,7 +767,7 @@ def test_schema_two_database_migrates_without_feedback_storage(tmp_path: Path) -
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 9
+    assert version == 10
     assert table is None
 
 
@@ -791,7 +795,7 @@ def test_schema_five_database_removes_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 9
+    assert version == 10
     assert table is None
 
 
@@ -953,6 +957,39 @@ def test_schema_three_database_migrates_real_pre_lineage_sessions(
 
     reopened_again = kernel_at(tmp_path)
     assert reopened_again.session_metadata(root) == metadata
+
+
+def test_schema_nine_database_adds_session_annotations(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session("existing")
+    kernel.append_event(session_id, "existing_event", {"kept": True})
+    with closing(kernel._connect()) as connection:
+        connection.execute("ALTER TABLE sessions DROP COLUMN title")
+        connection.execute("ALTER TABLE sessions DROP COLUMN description")
+        connection.execute("ALTER TABLE sessions DROP COLUMN annotation_revision")
+        connection.execute("PRAGMA user_version = 9")
+        connection.commit()
+
+    reopened = kernel_at(tmp_path)
+    metadata = reopened.session_metadata(session_id)
+
+    assert metadata["title"] is None
+    assert metadata["description"] is None
+    assert metadata["annotation_revision"] == 0
+    assert reopened.read_session(session_id)["events"][0]["payload"] == {"kept": True}
+    with closing(reopened._connect()) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        columns = {
+            row["name"]: row
+            for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        trigger = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'sessions_lineage_immutable'"
+        ).fetchone()
+    assert columns["annotation_revision"]["notnull"] == 1
+    assert columns["annotation_revision"]["dflt_value"] == "0"
+    assert trigger is not None
 
 
 def test_schema_four_database_renames_view_core_slot(tmp_path: Path) -> None:
@@ -1394,6 +1431,189 @@ def test_tools_compose_and_read_the_live_session(tmp_path: Path) -> None:
     ]
     assert len(add_starts) == 1
     assert add_starts[0]["parent_call_id"] is not None
+
+
+def test_authored_tools_annotate_current_and_named_sessions(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    actor = kernel.create_session(kind="conversation")
+    target = kernel.create_session(kind="conversation")
+    write(
+        kernel,
+        "annotate_sessions",
+        "async def main(input, ctx):\n"
+        "    current = ctx.sessions.set_title(input['title'])\n"
+        "    named = ctx.sessions.set_description(\n"
+        "        input['description'], session_id=input['target']\n"
+        "    )\n"
+        "    return {'current': current, 'named': named}\n",
+    )
+
+    result = call_tool(
+        kernel,
+        "annotate_sessions",
+        {
+            "title": "Current title",
+            "description": "Named description",
+            "target": target,
+        },
+        session_id=actor,
+    )
+
+    assert result["current"]["title"] == "Current title"
+    assert result["current"]["annotation_revision"] == 1
+    assert result["named"]["description"] == "Named description"
+    assert result["named"]["annotation_revision"] == 1
+    actor_start = next(
+        event
+        for event in kernel.read_session(actor, limit=100)["events"]
+        if event["kind"] == "call_started" and event["tool_name"] == "annotate_sessions"
+    )
+    target_change = next(
+        event
+        for event in kernel.read_session(target, limit=100)["events"]
+        if event["kind"] == "session_annotation_changed"
+    )
+    assert target_change["call_id"] is None
+    assert target_change["parent_call_id"] is None
+    assert target_change["payload"] == {
+        "field": "description",
+        "old_value": None,
+        "new_value": "Named description",
+        "annotation_revision": 1,
+        "actor_session_id": actor,
+        "actor_call_id": actor_start["call_id"],
+    }
+
+
+def test_session_annotations_round_trip_clear_noop_and_conflict(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    access = kernel_module.SessionAccess(kernel, session_id, "actor-call")
+
+    title = access.set_title("  title  ")
+    assert title["title"] == "  title  "
+    assert title["description"] is None
+    assert title["annotation_revision"] == 1
+    unchanged = access.set_title("  title  ", expected_revision=1)
+    assert unchanged == title
+    changes = [
+        event
+        for event in kernel.read_session(session_id)["events"]
+        if event["kind"] == "session_annotation_changed"
+    ]
+    assert len(changes) == 1
+    assert changes[0]["call_id"] is None
+    assert changes[0]["parent_call_id"] is None
+    assert changes[0]["payload"] == {
+        "field": "title",
+        "old_value": None,
+        "new_value": "  title  ",
+        "annotation_revision": 1,
+        "actor_session_id": session_id,
+        "actor_call_id": "actor-call",
+    }
+
+    with pytest.raises(ToolboxError) as stale:
+        access.set_title("  title  ", expected_revision=0)
+    assert stale.value.code == "session_annotation_conflict"
+    assert stale.value.details == {
+        "session_id": session_id,
+        "expected_revision": 0,
+        "actual_revision": 1,
+    }
+
+    cleared = access.set_title(None, expected_revision=1)
+    assert cleared["title"] is None
+    assert cleared["annotation_revision"] == 2
+    assert kernel.session_metadata(session_id) == cleared
+    assert kernel.read_session(session_id)["session"] == cleared
+    listed = {item["id"]: item for item in kernel.list_sessions()["sessions"]}
+    assert listed[session_id]["title"] is None
+    assert listed[session_id]["description"] is None
+    assert listed[session_id]["annotation_revision"] == 2
+
+
+@pytest.mark.parametrize("value", [False, 1, [], {}])
+def test_session_annotations_reject_non_text_values(tmp_path: Path, value: Any) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    access = kernel_module.SessionAccess(kernel, session_id, "call")
+
+    with pytest.raises(ToolboxError) as invalid:
+        access.set_description(value)
+
+    assert invalid.value.code == "invalid_session_annotation"
+    assert kernel.session_metadata(session_id)["annotation_revision"] == 0
+
+
+@pytest.mark.parametrize("revision", [True, -1, 1.5, "0"])
+def test_session_annotations_reject_invalid_revisions(
+    tmp_path: Path, revision: Any
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    access = kernel_module.SessionAccess(kernel, session_id, "call")
+
+    with pytest.raises(ToolboxError) as invalid:
+        access.set_description("text", expected_revision=revision)
+
+    assert invalid.value.code == "invalid_annotation_revision"
+    assert kernel.session_metadata(session_id)["annotation_revision"] == 0
+
+
+def test_session_annotations_reject_unknown_targets_and_roll_back_audit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    access = kernel_module.SessionAccess(kernel, session_id, "call")
+
+    with pytest.raises(ToolboxError) as unknown:
+        access.set_title("missing", session_id="missing")
+    assert unknown.value.code == "unknown_session"
+
+    def fail_event(*args: Any, **kwargs: Any) -> int:
+        raise RuntimeError("injected audit failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kernel, "_append_event_connection", fail_event)
+        with pytest.raises(RuntimeError, match="injected audit failure"):
+            access.set_title("rolled back")
+
+    metadata = kernel.session_metadata(session_id)
+    assert metadata["title"] is None
+    assert metadata["annotation_revision"] == 0
+    assert kernel.read_session(session_id)["events"] == []
+
+
+def test_session_annotation_lock_contention_is_structured_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    access = kernel_module.SessionAccess(kernel, session_id, "call")
+
+    def short_connect() -> sqlite3.Connection:
+        connection = sqlite3.connect(kernel.db_path, timeout=0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    with closing(sqlite3.connect(kernel.db_path, timeout=0)) as locker:
+        locker.execute("BEGIN IMMEDIATE")
+        with monkeypatch.context() as patch:
+            patch.setattr(kernel, "_connect", short_connect)
+            with pytest.raises(ToolboxError) as busy:
+                access.set_description("blocked")
+        assert busy.value.code == "session_annotation_busy"
+        assert busy.value.details == {"session_id": session_id, "retryable": True}
+        locker.rollback()
+
+    updated = access.set_description("retried")
+    assert updated["description"] == "retried"
+    assert updated["annotation_revision"] == 1
 
 
 def test_model_provider_propagates_through_nested_tool_calls(tmp_path: Path) -> None:
@@ -3270,8 +3490,12 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     assert kernel.call("legacy_tool", {}, session_id="old-session") == "legacy"
     migrated = kernel.read_session("old-session", limit=100)["events"][0]
     assert migrated["toolbox_id"] == kernel.list_toolboxes()[0]["id"]
+    metadata = kernel.session_metadata("old-session")
+    assert metadata["title"] is None
+    assert metadata["description"] is None
+    assert metadata["annotation_revision"] == 0
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 10
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -4202,6 +4426,129 @@ def test_parallel_isolated_tools_emit_each_durable_event_once(tmp_path: Path) ->
     assert len([event for event in tool_events if event.kind == "call_started"]) == 4
     assert len([event for event in tool_events if event.kind == "call_succeeded"]) == 4
     assert not any(event.kind == "call_failed" for event in tool_events)
+
+
+def test_parallel_isolated_session_annotations_compose_and_conflict(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "race_annotate",
+        "import os\n"
+        "import time\n"
+        "from pathlib import Path\n\n"
+        "async def main(input, ctx):\n"
+        "    Path(input['ready']).write_text(str(os.getpid()))\n"
+        "    release = Path(input['release'])\n"
+        "    while not release.exists():\n"
+        "        time.sleep(0.01)\n"
+        "    kwargs = {\n"
+        "        'session_id': input['target'],\n"
+        "        'expected_revision': input.get('expected_revision'),\n"
+        "    }\n"
+        "    if input['field'] == 'title':\n"
+        "        return ctx.sessions.set_title(input['value'], **kwargs)\n"
+        "    return ctx.sessions.set_description(input['value'], **kwargs)\n",
+    )
+    runner = IsolatedToolRunner(kernel, timeout=5)
+    actor = kernel.create_session(kind="conversation")
+    race_number = 0
+
+    def race(
+        target: str,
+        fields: tuple[str, str],
+        *,
+        expected_revision: int | None = None,
+    ) -> list[dict[str, Any] | ToolboxError]:
+        nonlocal race_number
+        race_number += 1
+        release = tmp_path / f"annotation-release-{race_number}"
+        ready = [
+            tmp_path / f"annotation-ready-{race_number}-{index}" for index in range(2)
+        ]
+        outcomes: list[dict[str, Any] | ToolboxError] = []
+        outcomes_lock = threading.Lock()
+
+        def annotate(index: int) -> None:
+            args: dict[str, Any] = {
+                "target": target,
+                "field": fields[index],
+                "value": f"value-{index}",
+                "ready": str(ready[index]),
+                "release": str(release),
+            }
+            if expected_revision is not None:
+                args["expected_revision"] = expected_revision
+            try:
+                outcome: dict[str, Any] | ToolboxError = runner.call(
+                    "race_annotate", args, session_id=actor
+                )
+            except ToolboxError as error:
+                outcome = error
+            with outcomes_lock:
+                outcomes.append(outcome)
+
+        threads = [
+            threading.Thread(target=annotate, args=(index,)) for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 3
+        while not all(path.exists() for path in ready):
+            if time.monotonic() >= deadline:
+                raise AssertionError("isolated annotation workers did not rendezvous")
+            time.sleep(0.01)
+        assert len({path.read_text() for path in ready}) == 2
+        release.write_text("go")
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        assert len(outcomes) == 2
+        return outcomes
+
+    disjoint = kernel.create_session()
+    assert all(
+        isinstance(outcome, dict)
+        for outcome in race(disjoint, ("title", "description"))
+    )
+    disjoint_metadata = kernel.session_metadata(disjoint)
+    assert disjoint_metadata["title"] == "value-0"
+    assert disjoint_metadata["description"] == "value-1"
+    assert disjoint_metadata["annotation_revision"] == 2
+
+    guarded = kernel.create_session()
+    guarded_outcomes = race(guarded, ("title", "title"), expected_revision=0)
+    successes = [outcome for outcome in guarded_outcomes if isinstance(outcome, dict)]
+    conflicts = [
+        outcome for outcome in guarded_outcomes if isinstance(outcome, ToolboxError)
+    ]
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert conflicts[0].code == "session_annotation_conflict"
+    assert conflicts[0].details["actual_revision"] == 1
+    assert kernel.session_metadata(guarded)["annotation_revision"] == 1
+
+    unguarded = kernel.create_session()
+    assert all(
+        isinstance(outcome, dict) for outcome in race(unguarded, ("title", "title"))
+    )
+    unguarded_metadata = kernel.session_metadata(unguarded)
+    assert unguarded_metadata["title"] in {"value-0", "value-1"}
+    assert unguarded_metadata["annotation_revision"] == 2
+
+    for target, count in ((disjoint, 2), (guarded, 1), (unguarded, 2)):
+        changes = [
+            event
+            for event in kernel.read_session(target, limit=100)["events"]
+            if event["kind"] == "session_annotation_changed"
+        ]
+        assert len(changes) == count
+        assert [event["seq"] for event in changes] == list(range(1, count + 1))
+        assert [event["payload"]["annotation_revision"] for event in changes] == list(
+            range(1, count + 1)
+        )
+    runner.close()
 
 
 def test_harness_exposes_core_operations_plus_run_agent_and_saves_everything(

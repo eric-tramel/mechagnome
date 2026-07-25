@@ -1,8 +1,8 @@
 # Sessions
 
-Every tool receives bounded, read-only access to durable session history through
-`ctx.sessions` (`SessionAccess`). The context is scoped to the session that
-started the current call tree:
+Every tool receives bounded access to durable session history and fixed mutable
+annotations through `ctx.sessions` (`SessionAccess`). The context is scoped to
+the session that started the current call tree:
 
 ```python
 async def main(input, ctx):
@@ -31,6 +31,10 @@ walking the parent chain rather than stored separately.
   creation order.
 - `ctx.sessions.metadata(session_id=None)` returns identity and lineage for the
   current or named session.
+- `ctx.sessions.set_title(title, *, session_id=None, expected_revision=None)`
+  sets or clears a title.
+- `ctx.sessions.set_description(description, *, session_id=None,
+  expected_revision=None)` sets or clears a description.
 
 `current` and `read` return this shape:
 
@@ -43,6 +47,9 @@ walking the parent chain rather than stored separately.
     "root_session_id": "...",
     "kind": "conversation",
     "origin_call_id": null,
+    "title": "Investigate dependencies",
+    "description": null,
+    "annotation_revision": 1,
     "cwd": "/workspace",
     "created_at": "..."
   },
@@ -67,6 +74,9 @@ events in that page. Limits are clamped to the range 1 through 100.
       "root_session_id": "...",
       "kind": "conversation",
       "origin_call_id": null,
+      "title": "Investigate dependencies",
+      "description": null,
+      "annotation_revision": 1,
       "created_at": "...",
       "event_count": 12
     }
@@ -77,6 +87,31 @@ events in that page. Limits are clamped to the range 1 through 100.
 
 Pass a non-null `next_cursor` back as `cursor` to continue listing. List limits
 are also clamped to 1 through 100.
+
+## Writing annotations
+
+Both setters default to `ctx.sessions.id`; use `session_id=` to target any other
+existing saved session. They return the complete updated session metadata.
+Strings are stored verbatim, including blank strings, and `None` clears the
+selected field. A named target must already exist.
+
+Each actual change atomically updates one field, increments
+`annotation_revision`, and appends one `session_annotation_changed` event to the
+target. Repeating the current value is a no-op. The event payload records the
+field, old and new values, revision, actor session, and actor call; its structural
+`call_id` fields remain `None` because a cross-session actor does not belong to
+the target's call tree. Annotation events count toward `event_count`.
+
+For optimistic concurrency, read `annotation_revision` and pass it back as
+`expected_revision`. A stale revision raises `session_annotation_conflict` with
+the expected and actual revisions so the caller can refetch and retry. The
+revision check happens before no-op detection. Without a guard, concurrent
+writes are serialized: different fields compose and same-field writes are
+last-commit-wins. Exhausted database contention raises the retryable
+`session_annotation_busy` error instead of a raw SQLite lock error.
+
+An annotation is its own committed mutation. It remains durable if the authored
+tool later fails or is cancelled.
 
 ## Reading context from events
 
@@ -161,6 +196,6 @@ attributes that sample to the resolved version. Nested durations are inclusive,
 so parent and child durations must not be summed. Calls interrupted by timeout,
 cancellation, or worker failure may have no terminal event or duration sample.
 
-Session access is read-only but not an authorization boundary: a tool can list
-saved sessions and read one when it knows the ID. Do not store secrets in
-session payloads that authored code should not inspect.
+Session access is not an authorization boundary: trusted authored tools can
+list, read, and annotate any saved session whose ID they know. Do not store
+secrets in session payloads that authored code should not inspect.
