@@ -135,6 +135,20 @@ DELETE_SCHEMA = {
     "additionalProperties": False,
 }
 
+RUN_AGENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "session_id": {"type": "string"},
+        "prompt": {"type": "string"},
+        "mode": {"type": "string", "enum": ["continue", "spawn", "fork"]},
+        "detach": {"type": "boolean"},
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "job_id": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
 
 HELP_SOURCE = dedent(
     '''\
@@ -384,6 +398,45 @@ DELETE_SOURCE = dedent(
     '''
 )
 
+RUN_AGENT_SOURCE = dedent(
+    '''\
+    """Prompt a durable conversation through the generic session capability."""
+
+    from mechagnome import ToolboxError
+
+    async def main(input, ctx):
+        keys = set(input)
+        if "job_id" in input:
+            if keys != {"job_id"}:
+                raise ToolboxError(
+                    "invalid_session_prompt",
+                    "session prompt inspection requires only a non-empty job_id",
+                )
+            return await ctx.sessions.inspect(input["job_id"])
+        if "prompt" not in input or not keys <= {
+            "session_id", "prompt", "mode", "detach", "title", "description"
+        }:
+            raise ToolboxError(
+                "invalid_session_prompt",
+                "session prompting requires a prompt and optional session_id, "
+                "mode, detach, title, and description",
+            )
+        session = ctx.sessions.get(input.get("session_id"))
+        metadata = {
+            name: input[name]
+            for name in ("title", "description")
+            if name in input
+        }
+        outcome = await session.prompt(
+            input["prompt"],
+            mode=input.get("mode", "spawn"),
+            detach=input.get("detach", False),
+            metadata=metadata or None,
+        )
+        return outcome if input.get("detach", False) else outcome["result"]
+    '''
+)
+
 
 BOOTSTRAP_TOOLS = (
     BootstrapTool(
@@ -433,6 +486,13 @@ BOOTSTRAP_TOOLS = (
         "Delete a tool from the active toolbox, retaining its version history.",
         DELETE_SCHEMA,
         DELETE_SOURCE,
+    ),
+    BootstrapTool(
+        "run_agent",
+        "Continue, spawn, or fork a session; set its title and description; or "
+        "inspect a detached prompt job.",
+        RUN_AGENT_SCHEMA,
+        RUN_AGENT_SOURCE,
     ),
 )
 

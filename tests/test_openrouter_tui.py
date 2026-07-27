@@ -46,6 +46,7 @@ from mechagnome import (
 from mechagnome import __main__ as cli
 from mechagnome import openrouter as openrouter_module
 from mechagnome import tui as tui_module
+from mechagnome.bootstrap import CORE_NAMES
 from mechagnome.harness import AgentEvent
 from mechagnome.isolation import IsolatedToolRunner
 from mechagnome.openrouter import (
@@ -319,15 +320,7 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert "async def main(input, ctx)" in system_prompt
     assert "Await ctx.call_tool" in " ".join(system_prompt.split())
     tools = {tool["name"]: tool for tool in captured["body"]["tools"]}
-    assert list(tools) == [
-        "help",
-        "list_tools",
-        "list_tool_namespaces",
-        "search_tools",
-        "view_tool",
-        "write_tool",
-        "call_tool",
-    ]
+    assert tuple(tools) == CORE_NAMES
     write_schema = tools["write_tool"]["parameters"]["properties"]["input_schema"]
     namespaces_schema = tools["write_tool"]["parameters"]["properties"]["namespaces"]
     namespace_filter = tools["search_tools"]["parameters"]["properties"]["namespace"]

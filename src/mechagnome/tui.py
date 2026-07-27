@@ -2584,8 +2584,8 @@ class ToolboxApp(App[None]):
             Panel(
                 Markdown(
                     f"**{self._active_model_name}** · {readiness}\n\n"
-                    "Ask for a task. The agent begins with seven editable toolbox "
-                    "operations plus run_agent and grows the toolbox as needed. "
+                    "Ask for a task. The agent begins with nine editable toolbox "
+                    "tools and grows the toolbox as needed. "
                     "Use `/help` for TUI commands."
                 ),
                 title="mechagnome",
