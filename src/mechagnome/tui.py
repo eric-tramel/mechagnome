@@ -45,7 +45,14 @@ from textual.widgets import (
 from textual.widgets.tree import TreeNode
 from textual_image.widget import Image as TerminalImage
 
-from mechagnome.harness import AgentEvent, Conversation, Harness, Model, RunCancelled
+from mechagnome.harness import (
+    AgentEvent,
+    Conversation,
+    Harness,
+    Model,
+    RunCancelled,
+    _RolloutReservation,
+)
 from mechagnome.kernel import Kernel
 from mechagnome.model_provider import CompletionTransport, ModelProvider
 from mechagnome.openrouter import (
@@ -562,6 +569,8 @@ class SessionTab:
     history_index: int | None = None
     history_draft: str = ""
     running: bool = False
+    rollout: _RolloutReservation | None = None
+    stop_requested: bool = False
     status: str = "ready"
     total_tokens: int | None = None
     context_model: str | None = None
@@ -1995,11 +2004,13 @@ class ToolboxApp(App[None]):
             return
         state.auto_compact_suppressed = False
         self._write_user(prompt, state)
-        self._start_rollout(state)
-        self.run_agent(prompt, state)
+        rollout = self._start_rollout(state)
+        self.run_agent(prompt, state, rollout)
 
     @work(thread=True, group="agent", exit_on_error=False)
-    def run_agent(self, prompt: str, state: SessionTab) -> None:
+    def run_agent(
+        self, prompt: str, state: SessionTab, rollout: _RolloutReservation
+    ) -> None:
         """Run the synchronous model/tool loop without blocking the terminal UI."""
         error_reported = False
 
@@ -2022,7 +2033,7 @@ class ToolboxApp(App[None]):
             self.call_from_thread(self._display_event, state, event)
 
         try:
-            state.conversation.send(prompt, on_event=relay)
+            state.conversation.send(prompt, on_event=relay, _rollout=rollout)
         except RunCancelled:
             pass
         except (
@@ -2031,7 +2042,7 @@ class ToolboxApp(App[None]):
             if not error_reported:
                 self.call_from_thread(self._write_error, str(error), state)
         finally:
-            self.call_from_thread(self._finish_rollout, state)
+            self.call_from_thread(self._finish_rollout, state, rollout)
 
     def _display_event(self, state: SessionTab, event: AgentEvent) -> None:
         if event.kind == "user":
@@ -2134,9 +2145,14 @@ class ToolboxApp(App[None]):
             self._write_error(str(event.payload.get("message") or event.payload), state)
         elif event.kind == "cancelled":
             self._stop_active_tool_events(state)
-            partial = state.streamed_text + "".join(state.pending_stream_text)
-            content = partial or str(event.payload.get("message") or "Rollout stopped.")
-            self._finish_stream(state, content, stopped=True)
+            durable_partial = str(event.payload.get("partial_text") or "")
+            partial = durable_partial or (
+                state.streamed_text + "".join(state.pending_stream_text)
+            )
+            if partial:
+                self._finish_stream(state, partial, stopped=True)
+            else:
+                self._clear_stream(state)
             self._set_status("stopped", state)
 
     def _display_detached_event(self, state: SessionTab, event: AgentEvent) -> None:
@@ -2400,8 +2416,8 @@ class ToolboxApp(App[None]):
         state.auto_compact_suppressed = True
         if state is self.active_session:
             self._refresh_sidebar()
-        self._start_rollout(state)
-        self.run_agent(COMPACT_CONTINUATION_PROMPT, state)
+        rollout = self._start_rollout(state)
+        self.run_agent(COMPACT_CONTINUATION_PROMPT, state, rollout)
 
     def action_previous_prompt(self) -> None:
         """Replace the active draft with the previous submitted prompt."""
@@ -2489,12 +2505,17 @@ class ToolboxApp(App[None]):
         self.query_one("#session-tabs", TabbedContent).active = successor.pane_id
 
     def action_stop_rollout(self) -> None:
-        """Stop the active tab's model stream or tool subprocess."""
+        """Gracefully stop the active rollout, escalating on a second press."""
         state = self.active_session
         if state.running:
-            if state.conversation.cancel():
+            if not state.stop_requested:
+                if not state.conversation.request_graceful_stop(user_initiated=True):
+                    return
+                state.stop_requested = True
                 self._set_status("stopping…", state)
-                self._refresh_active_status()
+                self.notify("press again to stop immediately")
+            else:
+                state.conversation.cancel(user_initiated=True)
             return
         if isinstance(self.screen, DeleteToolScreen):
             self.screen.dismiss(False)
@@ -2549,7 +2570,8 @@ class ToolboxApp(App[None]):
             Panel(
                 Markdown(
                     "**Commands**\n\n"
-                    "- `Esc` — stop the active tab's rollout\n"
+                    "- `Esc` — stop after this agent turn; press again to stop "
+                    "immediately\n"
                     "- `Ctrl+B` — toggle the toolbox sidebar\n"
                     "- `Ctrl+N` or `/new` — open a new session tab\n"
                     "- `TAB` or click — switch session tabs\n"
@@ -2992,6 +3014,20 @@ class ToolboxApp(App[None]):
             state.session_view.write(
                 Panel(Text(error), title="error", border_style="red")
             )
+        elif kind == "cancelled":
+            for tool_event in state.viewed_tool_events.values():
+                tool_event.stop_spinner()
+            state.viewed_tool_events.clear()
+            partial = str(payload.get("partial_text") or "")[:4000]
+            if partial:
+                state.session_view.write(
+                    Panel(
+                        Markdown(partial),
+                        title=f"{self._active_model_name} · stopped",
+                        title_align="left",
+                        border_style="yellow",
+                    )
+                )
 
     @staticmethod
     def _stop_session_view(state: SessionTab) -> None:
@@ -3084,7 +3120,10 @@ class ToolboxApp(App[None]):
             None,
         )
 
-    def _start_rollout(self, state: SessionTab) -> None:
+    def _start_rollout(self, state: SessionTab) -> _RolloutReservation:
+        rollout = state.conversation._reserve_rollout()
+        state.rollout = rollout
+        state.stop_requested = False
         state.running = True
         state.status = "thinking…"
         self._show_model_activity(state)
@@ -3092,12 +3131,17 @@ class ToolboxApp(App[None]):
         prompt.disabled = self.active_session.running
         self._refresh_model_controls()
         self._refresh_active_status()
+        return rollout
 
-    def _finish_rollout(self, state: SessionTab) -> None:
+    def _finish_rollout(self, state: SessionTab, rollout: _RolloutReservation) -> None:
+        if state.rollout is not rollout:
+            return
         self._stop_active_tool_events(state)
         if state.stream_entry is not None:
             self._clear_stream(state)
         state.running = False
+        state.rollout = None
+        state.stop_requested = False
         if state.status not in {"error", "stopped"}:
             state.status = "ready"
         prompt = self.query_one("#prompt", Input)
@@ -3131,6 +3175,8 @@ class ToolboxApp(App[None]):
 
     def _set_status(self, message: str, state: SessionTab | None = None) -> None:
         state = state or self.active_session
+        if state.stop_requested and message not in {"error", "stopped"}:
+            message = "stopping…"
         state.status = message
         if state is self.active_session:
             self._refresh_active_status()
@@ -3204,6 +3250,8 @@ class ToolboxApp(App[None]):
         state.history_index = None
         state.history_draft = ""
         state.running = False
+        state.rollout = None
+        state.stop_requested = False
         state.status = "ready"
         state.total_tokens = None
         state.context_model = None

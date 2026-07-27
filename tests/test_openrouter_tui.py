@@ -2900,6 +2900,235 @@ class PausingStreamingModel:
         self.release.set()
 
 
+class InterruptibleStreamingModel:
+    """Stop after one yielded delta when provider cancellation is requested."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.cancelled = threading.Event()
+        self.requests = 0
+        self.message_snapshots: list[list[dict[str, Any]]] = []
+
+    def stream(self, messages: Any, tools: Any) -> Any:
+        self.requests += 1
+        self.message_snapshots.append([dict(message) for message in messages])
+        if self.requests > 1:
+            yield ModelStreamEvent(turn=ModelTurn(text="continued"))
+            return
+        yield ModelStreamEvent(text_delta="Partial")
+        self.started.set()
+        self.release.wait(timeout=3)
+        if self.cancelled.is_set():
+            return
+        yield ModelStreamEvent(turn=ModelTurn(text="Partial response"))
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        raise AssertionError("streaming interface should be preferred")
+
+    def cancel_current(self) -> None:
+        self.cancelled.set()
+        self.release.set()
+
+    def reset_cancellation(self) -> None:
+        self.cancelled.clear()
+
+
+class GracefulToolModel:
+    """Pause one model turn that requests a core tool and no continuation."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.cancelled = threading.Event()
+        self.requests = 0
+
+    def stream(self, messages: Any, tools: Any) -> Any:
+        self.requests += 1
+        if self.requests != 1:
+            raise AssertionError("graceful stop started another model request")
+        yield ModelStreamEvent(text_delta="Planning")
+        self.started.set()
+        self.release.wait(timeout=3)
+        yield ModelStreamEvent(
+            turn=ModelTurn(
+                text="Planning",
+                calls=(ToolCall("help", {}, "help-1"),),
+            )
+        )
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        raise AssertionError("streaming interface should be preferred")
+
+    def cancel_current(self) -> None:
+        self.cancelled.set()
+        self.release.set()
+
+
+def test_graceful_stop_finishes_reserved_model_and_tool_turn(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = GracefulToolModel()
+    harness = Harness(kernel)
+    conversation = harness.start(model)
+    rollout = conversation._reserve_rollout()
+    outcomes: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            conversation.send("use help", _rollout=rollout)
+        except BaseException as error:
+            outcomes.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert model.started.wait(timeout=1)
+    assert conversation.request_graceful_stop(user_initiated=True) is True
+    assert model.cancelled.is_set() is False
+    model.release.set()
+    thread.join(timeout=3)
+
+    assert thread.is_alive() is False
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], RunCancelled)
+    assert model.requests == 1
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    kinds = [event["kind"] for event in events]
+    assert kinds[-2:] == ["tool_observation", "cancelled"]
+    assert "call_succeeded" in kinds
+    assert events[-1]["payload"] == {
+        "code": "cancelled",
+        "message": "rollout stopped",
+        "details": {},
+        "mode": "graceful",
+        "user_initiated": True,
+        "partial_text": "",
+    }
+    assert [message["role"] for message in conversation.messages] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+
+
+def test_force_stop_persists_partial_and_prefixes_next_transmission_once(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = InterruptibleStreamingModel()
+    harness = Harness(kernel)
+    conversation = harness.start(model)
+    outcomes: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            conversation.send("interrupted work")
+        except BaseException as error:
+            outcomes.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert model.started.wait(timeout=1)
+    assert conversation.cancel(user_initiated=True) is True
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], RunCancelled)
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert events[-1]["payload"]["partial_text"] == "Partial"
+    assert events[-1]["payload"]["mode"] == "force"
+    assert events[-1]["payload"]["user_initiated"] is True
+    assert conversation.messages == [{"role": "user", "content": "interrupted work"}]
+
+    fork_id = kernel.create_child_session(
+        kernel.snapshot_scope(conversation.session_id),
+        kind="conversation",
+        context_source_session_id=conversation.session_id,
+        context_through_seq=kernel.latest_completed_sequence(conversation.session_id),
+    )
+    fork_model = FinalModel()
+    fork = Harness(kernel).start(fork_model, session_id=fork_id)
+    fork.send("continue in fork")
+    assert fork_model.message_snapshots[0][-1]["content"] == (
+        "<user cancelled previous turn>\n\ncontinue in fork"
+    )
+
+    compacted_child = harness.start_child(conversation)
+    compacted_child.send("continue from parent")
+    assert model.message_snapshots[-1][-1]["content"] == (
+        "<user cancelled previous turn>\n\ncontinue from parent"
+    )
+
+    resumed_model = FinalModel()
+    resumed = Harness(kernel).start(resumed_model, session_id=conversation.session_id)
+    resumed.send("continue")
+    assert [message["content"] for message in resumed_model.message_snapshots[0]] == [
+        "interrupted work",
+        "<user cancelled previous turn>\n\ncontinue",
+    ]
+    resumed.send("later")
+    assert resumed_model.message_snapshots[1][-1]["content"] == "later"
+
+    user_events = [
+        event
+        for event in kernel.read_session(conversation.session_id, limit=100)["events"]
+        if event["kind"] == "user"
+    ]
+    assert user_events[1]["payload"] == {
+        "content": "continue",
+        "cancelled_previous_turn": True,
+    }
+    assert user_events[2]["payload"] == {"content": "later"}
+
+
+def test_first_escape_finishes_a_natural_final_and_shows_one_toast(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = PausingStreamingModel()
+    app = ToolboxApp(kernel, model, model_name="test/model")
+    notifications: list[str] = []
+    app.notify = lambda message, **kwargs: notifications.append(message)  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "finish this answer"
+            await pilot.press("enter")
+            assert model.started.wait(timeout=1)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.active_session.status == "stopping…"
+            assert model.cancelled.is_set() is False
+            assert notifications == ["press again to stop immediately"]
+            model.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.active_session.status == "ready"
+
+    asyncio.run(exercise())
+    events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "model", "final"]
+
+
+def test_failed_rollout_reservation_is_rolled_back(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    conversation = Harness(Kernel(tmp_path / "toolbox.db")).start(FinalModel())
+    original_refresh = conversation._refresh_messages
+    monkeypatch.setattr(
+        conversation,
+        "_refresh_messages",
+        lambda: (_ for _ in ()).throw(RuntimeError("refresh failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="refresh failed"):
+        conversation._reserve_rollout()
+
+    monkeypatch.setattr(conversation, "_refresh_messages", original_refresh)
+    assert conversation.send("still usable").answer == "answer 1"
+
+
 class PausingResponseModel:
     """Block a nonstreaming response so the waiting indicator is observable."""
 
@@ -3224,6 +3453,7 @@ def test_tui_cancellation_salvages_an_unflushed_stream_delta(tmp_path: Path) -> 
             assert state.pending_stream_text == ["Partial"]
             activity = app.query_one(".streaming-response", ModelActivity)
             app.action_stop_rollout()
+            app.action_stop_rollout()
             await app.workers.wait_for_complete()
             await asyncio.sleep(0)
             assert activity._animation_timer is None
@@ -3335,6 +3565,7 @@ def test_active_tab_cancellation_and_idle_teardown_are_session_local(
             assert model.wait_until_started(second_id)
 
             await pilot.press("escape")
+            await pilot.press("escape")
             for _ in range(30):
                 await pilot.pause()
                 if not second.running:
@@ -3389,6 +3620,7 @@ def test_tool_manager_opens_during_streaming_rollout(tmp_path: Path) -> None:
             assert isinstance(app.screen, ToolManagerScreen)
             assert app.busy is True
 
+            await pilot.press("escape")
             await pilot.press("escape")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -3445,6 +3677,7 @@ def test_escape_stops_streaming_rollout_and_records_cancellation(
                     break
             assert app.streamed_text == "Partial"
             await pilot.press("escape")
+            await pilot.press("escape")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.busy is False
@@ -3459,11 +3692,13 @@ def test_escape_stops_streaming_rollout_and_records_cancellation(
 
     events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
     assert [event["kind"] for event in events] == ["user", "cancelled"]
-    assert app.conversation.messages == []
+    assert app.conversation.messages == [
+        {"role": "user", "content": "stop this stream"}
+    ]
     resumed = Harness(kernel).start(
         FinalModel(), session_id=app.conversation.session_id
     )
-    assert resumed.messages == []
+    assert resumed.messages == [{"role": "user", "content": "stop this stream"}]
 
 
 def test_ctrl_q_stops_active_rollout_before_exiting(tmp_path: Path) -> None:
@@ -3927,6 +4162,7 @@ def test_escape_terminates_active_tool_subprocess(tmp_path: Path) -> None:
                 tool_title_text(slow_call).split(" ", 1)[0] in ToolEvent.SPINNER_FRAMES
             )
             await pilot.press("escape")
+            await pilot.press("escape")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert slow_call.processing is False
@@ -3952,8 +4188,20 @@ def test_escape_terminates_active_tool_subprocess(tmp_path: Path) -> None:
 
     events = kernel.read_session(app.conversation.session_id, limit=100)["events"]
     assert events[-1]["kind"] == "cancelled"
+    assert events[-1]["payload"]["mode"] == "force"
+    assert events[-1]["payload"]["user_initiated"] is True
     assert model.turn == 1
-    assert app.conversation.messages == []
+    assert app.conversation.messages == [
+        {"role": "user", "content": "run the slow tool"}
+    ]
+    resumed_model = FinalModel()
+    resumed = Harness(kernel).start(
+        resumed_model, session_id=app.conversation.session_id
+    )
+    resumed.send("continue after tool stop")
+    assert resumed_model.message_snapshots[0][-1]["content"] == (
+        "<user cancelled previous turn>\n\ncontinue after tool stop"
+    )
 
 
 def _process_exists(pid: int) -> bool:

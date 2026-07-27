@@ -251,6 +251,12 @@ Fields that do not apply to an event may be `None`. Common tool-call kinds are
 `call_started`, `call_succeeded`, and `call_failed`; sessions also record model,
 binding, invocation-scope, and toolbox-selection events.
 
+User-initiated stopped rollouts record a `cancelled` event with `mode`,
+`user_initiated`, and any incomplete visible model text in `partial_text`.
+Partial text remains inspectable session data but is not replayed as a complete
+assistant message. The next user prompt is stored in its raw form and transmitted
+once with a `<user cancelled previous turn>` header.
+
 Accepted one-shot model completions record `model_input`, then `model` and
 `final`; provider failures record a sanitized `model_failed` terminal event.
 Invalid requests rejected before provider dispatch do not create a session.
