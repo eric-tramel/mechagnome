@@ -220,7 +220,7 @@ class ToolSession:
         expected_revision: int | None = None,
         **changes: str | None,
     ) -> dict[str, Any]:
-        """Update human-facing metadata and refresh this handle's snapshot."""
+        """Update display metadata; keep a supplied title to four words or fewer."""
         self._metadata = self._kernel._update_session_metadata(
             self.id,
             changes,
@@ -242,7 +242,7 @@ class ToolSession:
         detach: bool = False,
         metadata: dict[str, str | None] | None = None,
     ) -> JsonValue:
-        """Continue, spawn from, or fork this durable conversation."""
+        """Prompt this conversation; keep metadata titles to four words or fewer."""
         request: dict[str, Any] = {
             "session_id": self.id,
             "prompt": prompt,
@@ -318,7 +318,7 @@ class SessionAccess:
         session_id: str | None = None,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        """Set or clear one saved session's title."""
+        """Set or clear a short title, using no more than four words."""
         return self._kernel._set_session_annotation(
             self.id if session_id is None else session_id,
             field="title",

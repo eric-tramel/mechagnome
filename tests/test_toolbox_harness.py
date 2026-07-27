@@ -139,6 +139,12 @@ def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
     run_agent = kernel.view_tool("run_agent")
     assert "ctx.sessions.get" in run_agent["source"]
     assert "ctx.sessions.inspect" in run_agent["source"]
+    assert "four words or fewer" in run_agent["source"]
+    assert "no more than four words" in run_agent["description"]
+    assert (
+        "no more than four words"
+        in run_agent["input_schema"]["properties"]["title"]["description"]
+    )
     assert "ctx.kernel.run_agent" not in run_agent["source"]
     assert not hasattr(kernel_module._KernelCapability, "run_agent")
 
@@ -239,6 +245,8 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
         document = kernel.call("help", {"topic": topic})
         assert isinstance(document, str)
         assert document.startswith(heading)
+        if topic in {"authoring", "composition", "sessions", "core"}:
+            assert "four words" in document
 
     authoring = kernel.call("help", {"topic": "authoring"})
     assert "```python" in authoring
@@ -1815,6 +1823,11 @@ def test_session_annotations_round_trip_clear_noop_and_conflict(
     assert listed[session_id]["title"] is None
     assert listed[session_id]["description"] is None
     assert listed[session_id]["annotation_revision"] == 2
+
+    over_guidance = access.set_title(
+        "Five word titles remain accepted", expected_revision=2
+    )
+    assert over_guidance["title"] == "Five word titles remain accepted"
 
 
 @pytest.mark.parametrize("value", [False, 1, [], {}])

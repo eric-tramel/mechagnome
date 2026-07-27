@@ -48,11 +48,12 @@ child agent in the foreground with:
 }
 ```
 
-`title` and `description` are optional. The ordinary `run_agent` source passes
-them through the generic session prompt request, which validates and applies
-them before the rollout starts. Every authored tool can also retrieve a prompt
-result's `session_id` and call
-`ctx.sessions.get(session_id).update_metadata(...)` afterward.
+`title` and `description` are optional. Keep titles to no more than four words
+so the session tree stays easy to scan; this is guidance, not a runtime word
+limit. The ordinary `run_agent` source passes the metadata through the generic
+session prompt request, which validates and applies it before the rollout
+starts. Every authored tool can also retrieve a prompt result's `session_id`
+and call `ctx.sessions.get(session_id).update_metadata(...)` afterward.
 
 Target a saved conversation and choose an explicit prompting mode:
 

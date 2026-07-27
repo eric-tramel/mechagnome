@@ -35,7 +35,7 @@ walking the parent chain rather than stored separately.
 - `ctx.sessions.metadata(session_id=None)` returns identity and lineage for the
   current or named session.
 - `ctx.sessions.set_title(title, *, session_id=None, expected_revision=None)`
-  sets or clears a title.
+  sets or clears a short title. Use no more than four words.
 - `ctx.sessions.set_description(description, *, session_id=None,
   expected_revision=None)` sets or clears a description.
 - `ctx.sessions.get(session_id=None)` returns a `ToolSession` handle.
@@ -80,7 +80,8 @@ async def main(input, ctx):
 with `None`, and `expected_revision=` provides optimistic concurrency. Updates
 are restricted to the caller's session tree. The returned metadata and the
 handle's `title`, `description`, and `metadata` snapshot reflect the update
-immediately.
+immediately. Keep titles to no more than four words so they remain scannable;
+this is usage guidance, not an enforced word limit.
 
 When the labels are known before work starts, apply them atomically with the
 prompt so invalid metadata cannot launch an unlabeled session:
@@ -165,7 +166,8 @@ in the same tree. `ToolSession.update_metadata()` can update one or both fields
 through a handle. These APIs return the complete updated session metadata.
 Strings are stored verbatim, including blank strings, and `None` clears the
 selected field. A named target must already exist. Titles are limited to 256
-UTF-8 bytes and descriptions to 4096 UTF-8 bytes.
+UTF-8 bytes and descriptions to 4096 UTF-8 bytes. Titles should also contain no
+more than four words, but that recommendation is intentionally not validated.
 
 Each actual change atomically updates one field, increments
 `annotation_revision`, and appends one `session_annotation_changed` event to the

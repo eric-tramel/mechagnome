@@ -104,8 +104,9 @@ def sidebar_tree_nodes(tree: Tree) -> list[Any]:
 
 
 def tool_title_text(event: ToolEvent) -> str:
-    """Render a tool event's public Rich-markup title as plain text."""
-    return render_markup(event.title).plain
+    """Render a tool event's public title as plain text."""
+    title = event.title
+    return title.plain if isinstance(title, Text) else render_markup(title).plain
 
 
 class FinalModel:
@@ -4102,6 +4103,27 @@ def test_tool_argument_summary_is_single_line_and_truncated() -> None:
     assert all(character.isprintable() for character in unsafe)
 
 
+def test_tool_event_title_treats_code_argument_summary_as_literal_text() -> None:
+    summary = ToolboxApp._argument_summary(
+        {
+            "args": {
+                "content": (
+                    "import re\\n\\n\\ndef tokenize(source: str) -> list[dict]:\\n"
+                    '    """Tokenize a math expression.' + "x" * 3000
+                ),
+                "path": "/tmp/distributed_calc/lexer.py",
+            },
+            "name": "write_file",
+        },
+    )
+
+    event = ToolEvent("call", "call_tool", "{}", summary)
+
+    assert "list[dict]" in summary
+    assert summary.endswith("…]")
+    assert tool_title_text(event) == f"→ call_tool{summary}"
+
+
 def test_tui_displays_images_embedded_in_tool_responses(tmp_path: Path) -> None:
     image_bytes = BytesIO()
     PILImage.new("RGB", (2, 1), "red").save(image_bytes, format="PNG")
@@ -4743,8 +4765,18 @@ def test_selecting_agent_session_renders_read_only_event_view(tmp_path: Path) ->
         kernel.snapshot_scope(app.conversation.session_id),
         kind="conversation",
     )
+    kernel._update_session_metadata(
+        child_session_id,
+        {"title": "Child investigation"},
+        caller_session_id=app.conversation.session_id,
+        actor_call_id=None,
+    )
     kernel.append_event(child_session_id, "user", {"content": "inspect this"})
     kernel.append_event(child_session_id, "final", {"content": "inspection done"})
+    untitled_session_id = kernel.create_child_session(
+        kernel.snapshot_scope(app.conversation.session_id),
+        kind="conversation",
+    )
 
     async def exercise() -> None:
         async with app.run_test(size=(100, 34)) as pilot:
@@ -4756,6 +4788,13 @@ def test_selecting_agent_session_renders_read_only_event_view(tmp_path: Path) ->
                 for node in sidebar_tree_nodes(tree)
                 if node.data == SidebarTreeItem("agent_session", child_session_id)
             )
+            untitled_node = next(
+                node
+                for node in sidebar_tree_nodes(tree)
+                if node.data == SidebarTreeItem("agent_session", untitled_session_id)
+            )
+            assert child_node.label.plain.startswith("Child investigation (3)")
+            assert untitled_node.label.plain.startswith(f"{untitled_session_id} (0)")
 
             tree.select_node(child_node)
             await pilot.pause()
@@ -4764,7 +4803,7 @@ def test_selecting_agent_session_renders_read_only_event_view(tmp_path: Path) ->
             assert state.chat.display is False
             assert state.session_view.display is True
             rendered = chat_text(app, state.session_view)
-            assert f"session {child_session_id[:12]}" in rendered
+            assert "session Child investigation" in rendered
             assert "read-only view" in rendered
             assert "inspect this" in rendered
             assert "inspection done" in rendered

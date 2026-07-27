@@ -325,7 +325,9 @@ expected_revision=None)` to annotate the current session or a named existing
 session in the same tree. Each method is synchronous and returns the updated
 metadata. Strings are stored verbatim, including blanks; pass `None` to clear a
 field. Titles are limited to 256 UTF-8 bytes and descriptions to 4096 UTF-8
-bytes.
+bytes. Keep titles to no more than four words so they remain easy to scan. The
+four-word recommendation is guidance and is not enforced programmatically.
+
 The equivalent handle API is
 `ctx.sessions.get(session_id).update_metadata(title=..., description=...,
 expected_revision=...)`, which can update both fields in one transaction.

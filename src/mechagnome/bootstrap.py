@@ -142,7 +142,10 @@ RUN_AGENT_SCHEMA = {
         "prompt": {"type": "string"},
         "mode": {"type": "string", "enum": ["continue", "spawn", "fork"]},
         "detach": {"type": "boolean"},
-        "title": {"type": "string"},
+        "title": {
+            "type": "string",
+            "description": "Short session title; use no more than four words.",
+        },
         "description": {"type": "string"},
         "job_id": {"type": "string"},
     },
@@ -400,7 +403,7 @@ DELETE_SOURCE = dedent(
 
 RUN_AGENT_SOURCE = dedent(
     '''\
-    """Prompt a durable conversation through the generic session capability."""
+    """Prompt a durable conversation; keep session titles to four words or fewer."""
 
     from mechagnome import ToolboxError
 
@@ -489,8 +492,8 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "run_agent",
-        "Continue, spawn, or fork a session; set its title and description; or "
-        "inspect a detached prompt job.",
+        "Continue, spawn, or fork a session; set a short title (no more than four "
+        "words) and description; or inspect a detached prompt job.",
         RUN_AGENT_SCHEMA,
         RUN_AGENT_SOURCE,
     ),

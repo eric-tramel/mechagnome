@@ -18,7 +18,6 @@ from typing import Any
 from PIL import Image as PILImage
 from rich.cells import split_graphemes
 from rich.markdown import Markdown
-from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
@@ -88,6 +87,14 @@ def _format_duration(value: Any) -> str:
     if value < 1000:
         return f"{value:.1f} ms"
     return f"{value / 1000:.2f} s"
+
+
+def _session_display_name(session: dict[str, Any]) -> str:
+    """Return a non-blank title when available, otherwise the durable ID."""
+    title = session.get("title")
+    if isinstance(title, str) and title.strip():
+        return title
+    return str(session["id"])
 
 
 def _compact_json(value: Any, limit: int = 1600) -> str:
@@ -377,8 +384,9 @@ class ToolEvent(Collapsible):
             f"job\n{self.detached_job_id or 'starting'}\n\noutput\n{output}"
         )
 
-    def _render_title(self, symbol: str) -> str:
-        return escape(
+    def _render_title(self, symbol: str) -> Text:
+        """Render untrusted tool details as literal text, never as markup."""
+        return Text(
             f"{symbol} {self.tool_name}{self.argument_summary}{self.outcome_summary}"
         )
 
@@ -2742,21 +2750,20 @@ class ToolboxApp(App[None]):
                     completed_unviewed.add(session_id)
                 if session_id in self._notified_agent_sessions:
                     badge = " !"
-            kind = str(session.get("kind", "agent"))
-            short_id = session_id[:8]
+            display_name = _session_display_name(session)
             event_count = session.get("event_count", 0)
             if is_running:
                 label = Text(f"{spinner_frame} ", style="yellow")
                 label.append(
-                    f"{kind} {short_id} ({event_count})",
+                    f"{display_name} ({event_count})",
                     style="#d7e0ea",
                 )
             else:
                 if badge:
-                    label = Text(f"{kind} {short_id} ({event_count})", style="green")
+                    label = Text(f"{display_name} ({event_count})", style="green")
                     label.append(badge, style="bold yellow")
                 else:
-                    label = Text(f"{kind} {short_id} ({event_count})", style="#7890a6")
+                    label = Text(f"{display_name} ({event_count})", style="#7890a6")
             return label
 
         def add_session_node(
@@ -2813,9 +2820,10 @@ class ToolboxApp(App[None]):
         self._agent_spinner_index = (self._agent_spinner_index + 1) % len(
             ToolEvent.SPINNER_FRAMES
         )
-        if self.is_mounted:
-            self._populate_agent_tree()
-            self._refresh_session_view(self.active_session)
+        if not self.is_mounted or not self.query("#agent-sessions"):
+            return
+        self._populate_agent_tree()
+        self._refresh_session_view(self.active_session)
 
     @on(Tree.NodeSelected, "#agent-sessions")
     def select_agent_session_node(self, event: Tree.NodeSelected) -> None:
@@ -2853,6 +2861,8 @@ class ToolboxApp(App[None]):
     def _render_session_events(self, session_id: str) -> None:
         """Render a read-only view without replacing the active live chat."""
         state = self.active_session
+        metadata = self.kernel.session_metadata(session_id)
+        display_name = _session_display_name(metadata)
         self._stop_session_view(state)
         state.session_view.clear()
         state.chat.display = False
@@ -2860,7 +2870,7 @@ class ToolboxApp(App[None]):
         state.session_view.write(
             Panel(
                 Text(
-                    f"session {session_id[:12]}\n"
+                    f"session {display_name}\n"
                     "read-only view — type a new prompt to return to the live"
                     " conversation",
                     style="dim",

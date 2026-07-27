@@ -116,3 +116,5 @@ same help topic. Authored tools receive its underlying generic
 modes. Because prompt outcomes include the durable `session_id`, a tool can
 immediately retrieve that handle and call
 `update_metadata(title=..., description=...)` to label the resulting work.
+Keep session titles to no more than four words; this is intentionally guidance,
+not a validation rule.

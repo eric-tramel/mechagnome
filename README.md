@@ -298,7 +298,9 @@ async def main(input, ctx):
 ```
 
 Pass `None` to clear either field. Metadata changes are limited to sessions in
-the caller's session tree.
+the caller's session tree. Keep session titles short—no more than four words—so
+they remain easy to scan in the session tree. This is usage guidance rather
+than an enforced word limit.
 
 A `call_started` event is committed before the source runs, so a tool reading
 the current session sees its own in-progress call. Events use a stable
@@ -330,7 +332,8 @@ fresh child without transcript inheritance, or `fork` a child from the source's
 latest completed context. Spawn is the default and preserves the original
 `run_agent({"prompt": "..."})` behavior. `run_agent` also accepts optional
 `title` and `description` fields and applies them to the prompted session. Set
-`detach=true` to receive distinct
+titles to no more than four words; the limit is guidance rather than runtime
+validation. Set `detach=true` to receive distinct
 process-lifetime `job_id` and durable `session_id` values, continue other work,
 and inspect the job through `run_agent` later. Existing authored tools may still
 use `await ctx.model_provider.run_agent(prompt)` as a foreground-only spawn

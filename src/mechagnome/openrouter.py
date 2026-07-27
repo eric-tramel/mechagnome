@@ -78,9 +78,10 @@ For a long-running independent call_tool invocation, set detach=true, continue
 other work with the returned job_id, and inspect it later with call_tool.
 Prompt conversations directly with run_agent: continue an idle session, spawn
 a fresh child (the default), or fork from completed context. Set title and
-description when the resulting session should be easy to identify later. Set
-detach=true when it should continue independently, and inspect the returned
-job_id with run_agent later. Tools may call other tools through ctx.call_tool;
+description when the resulting session should be easy to identify later; keep
+session titles short, using no more than four words. Set detach=true when it
+should continue independently, and inspect the returned job_id with run_agent
+later. Tools may call other tools through ctx.call_tool;
 read, prompt, and update revisioned session metadata through ctx.sessions; and
 use the ordinary Linux/Python environment.
 Source passed to write_tool must define async def main(input, ctx). Await
