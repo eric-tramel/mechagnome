@@ -28,7 +28,7 @@
 </p>
 <p align="center"><sub><strong>Reuse tools across sessions.</strong> A fresh conversation calls the persisted tool directly—no regeneration or provider-side magic.</sub></p>
 
-A small proof of a metaprogrammable agent toolbox. The model sees nine editable
+A small proof of a metaprogrammable agent toolbox. The model sees twelve editable
 toolbox operations:
 
 - `help`
@@ -38,20 +38,23 @@ toolbox operations:
 - `view_tool`
 - `write_tool`
 - `call_tool`
+- `get_tool_run`
+- `wait_tool_run`
+- `cancel_tool_run`
 - `delete_tool`
 - `run_agent`
 
-Every agent session—root or recursively launched—receives this same nine-tool
+Every agent session—root or recursively launched—receives this same twelve-tool
 surface.
 
 It begins with no user-authored tools. During a session, an agent can write a
 Python tool, call it immediately, find it again later, compose it from other
-tools, and inspect current or historical sessions. The nine core operations are
+tools, and inspect current or historical sessions. The twelve core operations are
 also readable and replaceable through `write_tool`; their code-shipped version 1
 defaults track the installed library, while persisted version 2 and later
 implementations are immutable. Each working directory has a default toolbox,
 and sessions may compose an ordered toolbox stack without changing the
-provider-facing nine-tool surface. Inside a toolbox, tools belong to one or more
+provider-facing twelve-tool surface. Inside a toolbox, tools belong to one or more
 hierarchical discovery namespaces such as `development/python`. Search results
 expose those namespaces alongside each matching tool, while the tool manager
 summarizes passive call, outcome, duration, and session metrics.
@@ -337,9 +340,9 @@ latest completed context. Spawn is the default and preserves the original
 `run_agent({"prompt": "..."})` behavior. `run_agent` also accepts optional
 `title` and `description` fields and applies them to the prompted session. Set
 titles to no more than four words; the limit is guidance rather than runtime
-validation. Set `detach=true` to receive distinct
-process-lifetime `job_id` and durable `session_id` values, continue other work,
-and inspect the job through `run_agent` later. Existing authored tools may still
+validation. Like every tool, `run_agent` can be invoked with `call_tool` and
+`detach=true`; this returns a process-lifetime `run_id` that can be checked,
+waited for, or cancelled with the generic ToolRun operations. Existing authored tools may still
 use `await ctx.model_provider.run_agent(prompt)` as a foreground-only spawn
 compatibility API.
 
@@ -348,7 +351,7 @@ compatibility API.
 The TUI wraps the bundled streaming `OpenRouterModel` in a host-owned
 `ModelProvider`. The provider creates/binds durable sessions and is the sole
 route from the harness to raw model transport. A transport adapter receives the
-accumulated messages and the same nine editable tool definitions on every turn,
+accumulated messages and the same twelve editable tool definitions on every turn,
 then returns a `ModelTurn`:
 
 ```python
@@ -390,44 +393,40 @@ context remaining; the indicator stays hidden when either value is unavailable.
 After a successful rollout reaches 25% remaining, the TUI automatically continues
 in a compacted child session.
 
-The harness rejects calls outside its nine core tools. Dynamic tools never
+The harness rejects calls outside its twelve core tools. Dynamic tools never
 need to be registered with the inference provider; they are reached through the
 stable `call_tool(name, args, version=None)` envelope.
 
-Long-running top-level calls can be detached with
-`{"name": "tool", "args": {}, "detach": true}`. The immediate response is a
-process-lifetime `job_id`; `{"job_id": "..."}` later returns `running`, the
-bounded merged stdout/stderr tail, or the typed terminal result/error. The TUI
+Any tool invocation can be detached with
+`{"name": "tool", "args": {}, "detach": true}`. The immediate response contains
+a process-lifetime `run_id`. Use `get_tool_run` for lightweight status,
+`wait_tool_run` for the bounded output tail and typed terminal result/error, and
+`cancel_tool_run` to request cancellation. The TUI
 keeps the original expandable tool row animated and updates its tail while the
-model continues. A runner allows four concurrent detached jobs, does not expose
-`ctx.model_provider` to them, retains only the latest 64 completed handles, and
+model continues. A runner allows four concurrent ToolRuns, preserves the same
+model and agent capabilities as foreground execution, retains only the latest 64 completed handles, and
 retains at most 1 MiB per result. Oversized results become a structured
 `detached_result_too_large` failure. The runner stops unfinished jobs on
-application shutdown. Handles have no per-job cancel
-operation and do not survive a restart; `Harness` owners must call `close()`.
+application shutdown. Handles do not survive a restart; `Harness` owners must call `close()`.
 Clearing or ending a TUI tab while the app remains open hides its rows without
 cancelling its jobs; ending the final tab exits the app and triggers shutdown.
 Captured output can contain sensitive tool data, and inspecting it copies the
-tail into the model transcript. The host handles detach start/inspection; the
-background job itself still executes one ordinary call through the active,
-editable `call_tool` dispatcher. Authored `ctx.call_tool` calls are awaited
-foreground calls and cannot request host detachment.
+tail into the model transcript. The background run executes one ordinary call
+through the active, editable `call_tool` dispatcher. Authored tools use
+`await ctx.call_tool(name, args, detach=True)` to create the same kind of run.
 
 Agent runs share a 16-active foreground limit and a cumulative 64-launch budget
-across each top-level rollout and all of its recursive descendants. They also
-have a separate detached pool with the same four-running and 64-terminal
-retention limits. Start one with
-`{"prompt": "...", "detach": true}` and inspect it with
-`{"job_id": "..."}`. Detached starts return both a process-lifetime job ID and
-the durable prompted session ID. A successful inspection includes its final
-text as `result`; a failure includes a structured `error`. The creator
-conversation and its ancestors may inspect the handle, while unrelated and
-sibling sessions may not. Foreground cancellation does not stop detached
-prompts; `Harness.close()` does.
+across each top-level rollout and all of its recursive descendants. To detach an
+agent, invoke `run_agent` through `call_tool` with `detach=true`; it consumes the
+same four-running ToolRun pool as every other detached tool. Its terminal result
+contains both the durable agent `session_id` and its `result` text. The creator
+conversation and its ancestors may control the run, while unrelated and sibling
+sessions receive `unknown_tool_run`. Foreground cancellation does not stop a
+detached run; `cancel_tool_run` and `Harness.close()` do.
 
 ## Metacircular core
 
-The outer names and schemas of the nine editable tools are pinned so a
+The outer names and schemas of the twelve editable tools are pinned so a
 provider can keep one stable toolbox surface. Their version 1 descriptions, source, and behavior
 are code-shipped defaults refreshed from the installed library at startup.
 Persisted version 2 and later implementations can override those defaults like

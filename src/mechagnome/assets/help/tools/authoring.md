@@ -96,7 +96,8 @@ definitions. Do not copy that legacy form into new or replacement tools.
 Every invocation receives its own `ctx` (`ToolContext`). It is a runtime handle,
 not data to save or return. Its public interface is:
 
-- `await ctx.call_tool(name, args, version=None)` — invoke another tool.
+- `await ctx.call_tool(name, args, version=None, *, detach=False)` — invoke
+  another tool, optionally returning a ToolRun handle immediately.
 - `ctx.caller_session_id` — the durable session ID for this call tree.
 - `ctx.sessions` — bounded session discovery, history, prompting, and annotations.
 - `ctx.model_provider` — a bounded text-completion capability supplied by the
@@ -223,7 +224,7 @@ async def main(input, ctx):
     outcome = await source.prompt(
         input["prompt"],
         mode=input.get("mode", "spawn"),
-        detach=input.get("detach", False),
+        detach=False,
     )
     prompted = ctx.sessions.get(outcome["session_id"])
     metadata = prompted.update_metadata(
@@ -235,9 +236,10 @@ async def main(input, ctx):
 
 `continue` retains the same session ID and transcript, `spawn` creates a fresh
 child without transcript inheritance, and `fork` snapshots the source through
-its latest completed turn. Foreground outcomes contain `session_id`, `status`,
-and `result`; detached outcomes also contain a process-lifetime `job_id` that is
-inspected with `await ctx.sessions.inspect(job_id)`. Use the returned
+its latest completed turn. Prompt outcomes contain `session_id`, `status`, and
+`result`. To detach this or any other tool, call it with
+`await ctx.call_tool(name, args, detach=True)` and use the returned `run_id`
+with the ToolRun lifecycle tools. Use the returned
 `session_id` to retrieve the prompted handle and pair the transition with
 `update_metadata(title=..., description=...)`. Passing `None` clears a field;
 metadata updates are limited to the caller's session tree.

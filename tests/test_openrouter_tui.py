@@ -3896,6 +3896,38 @@ def test_detached_terminal_snapshot_marks_local_tail_truncation(
             assert agent_row.processing is False
             assert "done" in agent_row.detail
 
+            terminal = AgentEvent(
+                "tool_run_finished",
+                {
+                    "run_id": "ordered-run",
+                    "tool_name": "ordered",
+                    "status": "cancelled",
+                    "generation": 2,
+                    "output_tail": "",
+                    "truncated": False,
+                    "error": {"code": "tool_run_cancelled"},
+                },
+                None,
+            )
+            stale = AgentEvent(
+                "tool_run_started",
+                {
+                    "run_id": "ordered-run",
+                    "tool_name": "ordered",
+                    "status": "running",
+                    "generation": 1,
+                    "output_tail": "",
+                    "truncated": False,
+                },
+                None,
+            )
+            app._stage_detached_event(state, terminal)
+            app._stage_detached_event(state, stale)
+            app._flush_staged_detached_events()
+            assert "ordered-run" not in state.detached_tool_events
+            app._display_detached_event(state, stale)
+            assert "ordered-run" not in state.detached_tool_events
+
     asyncio.run(exercise())
 
 

@@ -1,6 +1,6 @@
 # Core tools
 
-The nine base tools are ordinary readable tool versions:
+The twelve base tools are ordinary readable tool versions:
 
 - `help`
 - `list_tools`
@@ -9,6 +9,9 @@ The nine base tools are ordinary readable tool versions:
 - `view_tool`
 - `write_tool`
 - `call_tool`
+- `get_tool_run`
+- `wait_tool_run`
+- `cancel_tool_run`
 - `delete_tool`
 - `run_agent`
 
@@ -70,53 +73,67 @@ The default mode is `spawn`. `continue` appends to the same idle conversation;
 creates a child with context snapshotted through the source's latest completed
 turn.
 
-Set `detach` when the agent should continue independently:
+`run_agent` is an ordinary tool: its foreground result contains the durable
+`session_id` and final `result`. Detach it through `call_tool` when it should
+continue independently:
 
 ```json
-{"prompt": "Run the long analysis and return the result.", "detach": true}
+{
+  "name": "run_agent",
+  "args": {"prompt": "Run the long analysis and return the result."},
+  "detach": true
+}
 ```
 
-The immediate response contains `job_id`, the prompted `session_id`, and
-`status`. Job and session identities are distinct so the same conversation may
-be continued by multiple detached prompts over its lifetime. Inspect the job
-later through the same tool with `{"job_id": "..."}`. Successful terminal
-snapshots include `result`; failures include a structured `error`.
+The immediate response contains `run_id`, `tool_name`, and `status`. The
+terminal ToolRun result contains the agent's distinct durable `session_id` and
+answer text.
 
 Foreground agents share a 16-active limit. Each top-level rollout and all of
 its recursive descendants also share a cumulative 64-agent launch budget.
-Detached agents use a separate four-job pool, retain the latest 64 terminal
-handles, and retain at most 1 MiB per answer. The creator or any ancestor
-conversation may inspect a handle. Foreground cancellation does not stop a
-detached agent; application or `Harness` shutdown does. Detached mode requires
-a provider that can isolate cancellation per conversation session.
+Detached agents use the same four-run pool and 64-terminal retention as other
+tools. Foreground cancellation does not stop a detached agent; its ToolRun
+cancellation domain is independent.
 
-## Detached `call_tool` jobs
+## Detached ToolRuns
 
-The model-facing `call_tool` operation can return before a long-running tool
-finishes. Start a process-lifetime background job with:
+`detach` is an invocation mode, not a second operation hidden inside
+`call_tool`. Start a process-lifetime run with:
 
 ```json
 {"name": "slow_report", "args": {"path": "data.csv"}, "detach": true}
 ```
 
-The immediate result is `{"job_id": "...", "status": "running"}`. The agent
-can continue with other operations and later inspect it through the same core
-operation:
+The immediate result contains `run_id`, `tool_name`, and `status`. The deprecated
+`job_id` alias is also returned during schema version 14. Check status without
+copying retained output into the conversation:
 
 ```json
-{"job_id": "..."}
+{"run_id": "..."}
 ```
 
-Inspection returns `status`, a bounded merged stdout/stderr `output_tail`, and
-`truncated`. A successful terminal response also contains `result` (including
-an explicit `null`); a failed response contains a structured `error`.
+Call `get_tool_run` with that input for lightweight status. Call
+`wait_tool_run` with optional `timeout_ms` (0–30000) to wait for completion; a
+nonterminal timeout adds `timed_out=true`, while a terminal response includes
+the bounded merged stdout/stderr `output_tail` and `truncated`. Success includes
+`result` (including explicit `null`); failure or cancellation includes a typed
+`error`. Polling is repeated `get_tool_run`.
 
-Detached jobs are owned by the current host process. They do not survive an app
+Request cancellation with:
+
+```json
+{"run_id": "..."}
+```
+
+`cancel_tool_run` moves an active run through `cancelling` to `cancelled` and
+reports whether this call newly requested cancellation. Repeated cancellation
+is idempotent. The canonical terminal error code is `tool_run_cancelled`.
+
+ToolRuns are owned by the current host process. They do not survive an app
 restart, at most four run concurrently, and app shutdown stops unfinished jobs.
 The latest 64 completed handles remain inspectable; older completed handles are
 evicted. Each result is limited to 1 MiB; an oversized result becomes a
-structured `detached_result_too_large` failure. There is no public per-job
-cancel operation. The first Escape stops only the foreground rollout after its
+structured `detached_result_too_large` failure. The first Escape stops only the foreground rollout after its
 current model response and requested tools finish. A second Escape while it is
 stopping immediately cancels the model stream, foreground child agents, and
 foreground tool processes. Detached jobs remain unaffected. Clearing or ending
@@ -129,13 +146,12 @@ The bounded output tail may contain sensitive data written by the tool.
 Inspecting a handle supplies that tail to the model and therefore records it in
 the conversation transcript.
 
-Detach start and inspection are host controls rather than calls through the
-editable dispatcher, so dispatcher-specific logging or policy does not wrap
-those control actions. The background job itself executes one ordinary,
-providerless call through the active `call_tool` implementation in an inherited
-toolbox and working-directory scope. It receives the ordinary filesystem/toolbox
-environment but not `ctx.model_provider`. Detach is available only on the
-model-facing top-level operation, not on authored `ctx.call_tool` calls.
+The background run executes one ordinary call through the active `call_tool`
+implementation in an inherited toolbox, working-directory, model-provider, and
+agent capability scope. Authored tools can create the same runs with
+`await ctx.call_tool(name, args, version=None, detach=True)`. The creator or any
+ancestor conversation may get, wait for, or cancel a run; siblings, unrelated
+sessions, unknown IDs, and evicted IDs all return `unknown_tool_run`.
 
 The subprocess boundary cleans up the worker's process group. It is not a
 hostile-code sandbox and cannot control a tool that deliberately creates a new,

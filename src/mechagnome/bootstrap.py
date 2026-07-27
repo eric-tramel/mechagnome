@@ -125,6 +125,27 @@ CALL_SCHEMA = {
     "additionalProperties": False,
 }
 
+GET_TOOL_RUN_SCHEMA = {
+    "type": "object",
+    "properties": {"run_id": {"type": "string", "minLength": 1}},
+    "required": ["run_id"],
+    "additionalProperties": False,
+}
+
+WAIT_TOOL_RUN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "timeout_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 30000,
+        },
+    },
+    "required": ["run_id"],
+    "additionalProperties": False,
+}
+
 DELETE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -383,9 +404,47 @@ CALL_SOURCE = dedent(
     """Resolve and execute an active or exact tool version."""
 
     async def main(input, ctx):
+        if "job_id" in input:
+            return await ctx.call_tool(
+                "wait_tool_run",
+                {"run_id": input["job_id"], "timeout_ms": 0},
+            )
+        if input.get("detach", False):
+            return ctx.kernel.start_tool_run(
+                input["name"], input["args"], version=input.get("version")
+            )
         return await ctx.kernel.execute(
             input["name"], input["args"], version=input.get("version")
         )
+    '''
+)
+
+GET_TOOL_RUN_SOURCE = dedent(
+    '''\
+    """Return lightweight state for one detached tool invocation."""
+
+    async def main(input, ctx):
+        return ctx.kernel.get_tool_run(input["run_id"])
+    '''
+)
+
+WAIT_TOOL_RUN_SOURCE = dedent(
+    '''\
+    """Wait for one detached tool invocation to finish or time out."""
+
+    async def main(input, ctx):
+        return await ctx.kernel.wait_tool_run(
+            input["run_id"], timeout_ms=input.get("timeout_ms", 30000)
+        )
+    '''
+)
+
+CANCEL_TOOL_RUN_SOURCE = dedent(
+    '''\
+    """Request cancellation of one detached tool invocation."""
+
+    async def main(input, ctx):
+        return ctx.kernel.cancel_tool_run(input["run_id"])
     '''
 )
 
@@ -415,7 +474,17 @@ RUN_AGENT_SOURCE = dedent(
                     "invalid_session_prompt",
                     "session prompt inspection requires only a non-empty job_id",
                 )
-            return await ctx.sessions.inspect(input["job_id"])
+            snapshot = await ctx.call_tool(
+                "wait_tool_run",
+                {"run_id": input["job_id"], "timeout_ms": 0},
+            )
+            result = snapshot.get("result")
+            if isinstance(result, dict) and set(result) == {
+                "session_id", "result"
+            }:
+                snapshot["session_id"] = result["session_id"]
+                snapshot["result"] = result["result"]
+            return snapshot
         if "prompt" not in input or not keys <= {
             "session_id", "prompt", "mode", "detach", "title", "description"
         }:
@@ -424,7 +493,13 @@ RUN_AGENT_SOURCE = dedent(
                 "session prompting requires a prompt and optional session_id, "
                 "mode, detach, title, and description",
             )
-        session = ctx.sessions.get(input.get("session_id"))
+        if input.get("detach", False):
+            request = {name: value for name, value in input.items() if name != "detach"}
+            return await ctx.call_tool("run_agent", request, detach=True)
+        session_id = input.get("session_id")
+        if session_id is None:
+            session_id = ctx.kernel.enclosing_conversation_session_id()
+        session = ctx.sessions.get(session_id)
         metadata = {
             name: input[name]
             for name in ("title", "description")
@@ -433,10 +508,10 @@ RUN_AGENT_SOURCE = dedent(
         outcome = await session.prompt(
             input["prompt"],
             mode=input.get("mode", "spawn"),
-            detach=input.get("detach", False),
+            detach=False,
             metadata=metadata or None,
         )
-        return outcome if input.get("detach", False) else outcome["result"]
+        return {"session_id": outcome["session_id"], "result": outcome["result"]}
     '''
 )
 
@@ -480,9 +555,27 @@ BOOTSTRAP_TOOLS = (
     ),
     BootstrapTool(
         "call_tool",
-        "Invoke a tool, detach it for later inspection, or inspect a detached job.",
+        "Invoke a tool, optionally returning a detached ToolRun handle.",
         CALL_SCHEMA,
         CALL_SOURCE,
+    ),
+    BootstrapTool(
+        "get_tool_run",
+        "Get the current status of a detached tool invocation.",
+        GET_TOOL_RUN_SCHEMA,
+        GET_TOOL_RUN_SOURCE,
+    ),
+    BootstrapTool(
+        "wait_tool_run",
+        "Wait up to 30 seconds for a detached tool invocation to finish.",
+        WAIT_TOOL_RUN_SCHEMA,
+        WAIT_TOOL_RUN_SOURCE,
+    ),
+    BootstrapTool(
+        "cancel_tool_run",
+        "Request cancellation of a detached tool invocation.",
+        GET_TOOL_RUN_SCHEMA,
+        CANCEL_TOOL_RUN_SOURCE,
     ),
     BootstrapTool(
         "delete_tool",
@@ -493,7 +586,7 @@ BOOTSTRAP_TOOLS = (
     BootstrapTool(
         "run_agent",
         "Continue, spawn, or fork a session; set a short title (no more than four "
-        "words) and description; or inspect a detached prompt job.",
+        "words) and description. Detach it through call_tool like any other tool.",
         RUN_AGENT_SCHEMA,
         RUN_AGENT_SOURCE,
     ),

@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import count
-from threading import Event, Lock, Thread, current_thread
+from threading import Event, Lock
 from typing import Any
-from uuid import uuid4
 
 from mechagnome.bootstrap import CORE_NAMES
 from mechagnome.isolation import IsolatedToolRunner
@@ -62,9 +60,6 @@ class AgentEvent:
 EventSink = Callable[[AgentEvent], None]
 DEFAULT_MAX_CALLS_PER_TURN = 16
 MODEL_ACTION_NAMES = CORE_NAMES
-_MAX_DETACHED_AGENT_JOBS = 4
-_MAX_RETAINED_DETACHED_AGENT_JOBS = 64
-_MAX_DETACHED_AGENT_RESULT_BYTES = 1024 * 1024
 _MAX_ACTIVE_FOREGROUND_AGENTS = 16
 _MAX_AGENT_LAUNCHES_PER_ROLLOUT = 64
 _CANCELLED_PROMPT_HEADER = "<user cancelled previous turn>\n\n"
@@ -282,25 +277,6 @@ class _OrderedEventSink:
                 self._next_sequence += 1
 
 
-@dataclass
-class _DetachedAgentJob:
-    """One supervised background session prompt and its observable state."""
-
-    job_id: str
-    session_id: str
-    owner_session_id: str
-    origin_call_id: str | None
-    mode: str
-    prompt: str
-    conversation: Conversation | None
-    budget: _AgentLaunchBudget
-    sink: EventSink | None
-    status: str = "running"
-    result: str | None = None
-    error: dict[str, Any] | None = None
-    thread: Thread | None = None
-
-
 class _AgentCoordinator:
     """Create and supervise ordinary child conversations for one harness."""
 
@@ -314,8 +290,6 @@ class _AgentCoordinator:
         self.kernel = kernel
         self.max_calls_per_turn = max_calls_per_turn
         self.tool_runner = tool_runner
-        self._jobs: dict[str, _DetachedAgentJob] = {}
-        self._completed: list[str] = []
         self._lock = Lock()
         self._closed = False
         self._active_foreground = 0
@@ -345,9 +319,11 @@ class _AgentCoordinator:
         caller_scope: InvocationScope | None = None,
         origin_call_id: str | None = None,
         metadata: dict[str, str | None] | None = None,
+        independent: bool = False,
+        agent_budget: _AgentLaunchBudget | None = None,
     ) -> dict[str, Any]:
         """Prompt one continued, spawned, or forked conversation and wait."""
-        budget = parent._agent_budget_for_launch()
+        budget = agent_budget or parent._agent_budget_for_launch()
         with self._lock:
             if self._closed:
                 raise ToolboxError(
@@ -378,7 +354,11 @@ class _AgentCoordinator:
                 raise
             except Exception as error:
                 raise _agent_failure(error) from error
-            parent._register_foreground_child(conversation, origin_call_id)
+            parent._register_foreground_child(
+                conversation,
+                origin_call_id,
+                independent=independent,
+            )
             try:
                 send_kwargs: dict[str, Any] = {"_agent_budget": budget}
                 if mode == "continue":
@@ -414,108 +394,56 @@ class _AgentCoordinator:
         caller_scope: InvocationScope | None = None,
         origin_call_id: str | None = None,
         metadata: dict[str, str | None] | None = None,
+        agent_budget: _AgentLaunchBudget | None = None,
     ) -> dict[str, Any]:
-        """Create a child synchronously, then run it in a supervised thread."""
-        if not parent.model_session.supports_detached_agents:
-            raise ToolboxError(
-                "detached_agents_unavailable",
-                "the model provider cannot isolate detached agent cancellation",
-            )
-        budget = parent._agent_budget_for_launch()
+        """Translate a schema-14 session detach into a generic run_agent ToolRun."""
+        budget = agent_budget or parent._agent_budget_for_launch()
         with self._lock:
             if self._closed:
                 raise ToolboxError(
                     "detached_agent_runner_closed",
                     "detached agent runner is closed",
                 )
-            active = sum(job.status == "running" for job in self._jobs.values())
-            if active >= _MAX_DETACHED_AGENT_JOBS:
-                raise ToolboxError(
-                    "detached_agent_limit",
-                    f"at most {_MAX_DETACHED_AGENT_JOBS} detached agents may run",
-                )
-            budget.consume()
-            conversation = self._conversation_for_prompt(
-                parent,
-                target_session_id=target_session_id or parent.session_id,
-                mode=mode,
-                caller_scope=caller_scope,
-                origin_call_id=origin_call_id,
-                metadata=metadata,
-            )
-            job = _DetachedAgentJob(
-                uuid4().hex,
-                conversation.session_id,
-                parent.session_id,
-                origin_call_id,
-                mode,
-                prompt,
-                conversation,
-                budget,
-                sink,
-            )
-            thread = Thread(
-                target=self._run_detached,
-                args=(job,),
-                name=f"mechagnome-agent-{job.job_id[:8]}",
-                daemon=True,
-            )
-            job.thread = thread
-            self._jobs[job.job_id] = job
-            try:
-                thread.start()
-            except Exception as error:
-                self._jobs.pop(job.job_id, None)
-                conversation.close()
-                raise ToolboxError(
-                    "detached_agent_start_failed",
-                    "could not start detached agent",
-                ) from error
-        return {
-            "job_id": job.job_id,
-            "session_id": job.session_id,
-            "status": "running",
-        }
+        scope = caller_scope or self.kernel.snapshot_scope(parent.session_id)
+        run_args: dict[str, Any] = {"prompt": prompt, "mode": mode}
+        if target_session_id is not None:
+            run_args["session_id"] = target_session_id
+        if metadata is not None:
+            run_args.update(metadata)
+        provider = parent._completion_provider(
+            sink=sink,
+            scope=scope,
+            agent_budget=budget,
+        )
+        return parent._control_tool_run(
+            scope,
+            origin_call_id,
+            {"operation": "start", "name": "run_agent", "args": run_args},
+            sink=sink,
+            model_provider=provider,
+        )
 
     def inspect(self, job_id: str, *, session_id: str) -> dict[str, Any]:
-        """Inspect a job from its creator conversation or one of its ancestors."""
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or not self._is_owner_or_ancestor(
-                session_id, job.owner_session_id
-            ):
-                raise ToolboxError(
-                    "unknown_detached_agent", f"unknown detached agent: {job_id}"
-                )
-            snapshot: dict[str, Any] = {
-                "job_id": job.job_id,
-                "session_id": job.session_id,
-                "status": job.status,
-            }
-            if job.status == "succeeded":
-                snapshot["result"] = job.result
-            elif job.status == "failed":
-                snapshot["error"] = dict(job.error or {})
-            return snapshot
+        """Return the schema-14 detached-agent compatibility snapshot."""
+        try:
+            snapshot = self.tool_runner.inspect_detached(
+                job_id,
+                session_id=session_id,
+            )
+        except ToolboxError as error:
+            raise ToolboxError(
+                "unknown_detached_agent", f"unknown detached agent: {job_id}"
+            ) from error
+        result = snapshot.get("result")
+        if isinstance(result, dict) and set(result) == {"session_id", "result"}:
+            snapshot["session_id"] = result["session_id"]
+            snapshot["result"] = result["result"]
+        return snapshot
 
     def close(self) -> None:
-        """Reject new jobs, cancel active detached agents, and join them."""
+        """Reject new agent launches; the shared ToolRun supervisor owns shutdown."""
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
-            jobs = list(self._jobs.values())
-        for job in jobs:
-            if job.status == "running" and job.conversation is not None:
-                job.conversation.close()
-        for job in jobs:
-            thread = job.thread
-            if (
-                thread is not None
-                and thread.ident is not None
-                and thread is not current_thread()
-            ):
-                thread.join()
 
     def _conversation_for_prompt(
         self,
@@ -600,108 +528,6 @@ class _AgentCoordinator:
             caller_scope=parent_scope,
             origin_call_id=origin_call_id,
         )
-
-    def _run_detached(self, job: _DetachedAgentJob) -> None:
-        self._notify(job, "detached_started", self._event_snapshot(job))
-        try:
-            send_kwargs: dict[str, Any] = {"_agent_budget": job.budget}
-            if job.mode == "continue":
-                send_kwargs["_prompt_origin"] = (
-                    job.owner_session_id,
-                    job.origin_call_id,
-                )
-            result = job.conversation.send(job.prompt, **send_kwargs).answer
-        except Exception as error:
-            if self._closed:
-                failure = {
-                    "code": "detached_agent_shutdown",
-                    "message": "detached agent stopped because its harness closed",
-                    "details": {},
-                }
-            else:
-                failure = _agent_failure(error).to_dict()["error"]
-            self._finish(job, status="failed", error=failure)
-        else:
-            self._finish(job, status="succeeded", result=result)
-        finally:
-            if job.conversation is not None:
-                job.conversation.close()
-            with self._lock:
-                job.conversation = None
-                job.prompt = ""
-                job.thread = None
-
-    def _finish(
-        self,
-        job: _DetachedAgentJob,
-        *,
-        status: str,
-        result: str | None = None,
-        error: dict[str, Any] | None = None,
-    ) -> None:
-        if status == "succeeded":
-            encoded = json.dumps(result, separators=(",", ":")).encode("utf-8")
-            if len(encoded) > _MAX_DETACHED_AGENT_RESULT_BYTES:
-                status = "failed"
-                result = None
-                error = {
-                    "code": "detached_agent_result_too_large",
-                    "message": "detached agent result exceeds the retained byte limit",
-                    "details": {"limit_bytes": _MAX_DETACHED_AGENT_RESULT_BYTES},
-                }
-        with self._lock:
-            if job.status != "running":
-                return
-            job.status = status
-            job.result = result
-            job.error = error
-            self._completed.append(job.job_id)
-            payload = self._event_snapshot_locked(job)
-        self._notify(job, "detached_finished", payload)
-        with self._lock:
-            job.sink = None
-            while len(self._completed) > _MAX_RETAINED_DETACHED_AGENT_JOBS:
-                evicted = self._completed.pop(0)
-                self._jobs.pop(evicted, None)
-
-    def _is_owner_or_ancestor(self, candidate: str, owner: str) -> bool:
-        current: str | None = owner
-        while current is not None:
-            if current == candidate:
-                return True
-            current = self.kernel.session_metadata(current)["parent_session_id"]
-        return False
-
-    def _event_snapshot(self, job: _DetachedAgentJob) -> dict[str, Any]:
-        with self._lock:
-            return self._event_snapshot_locked(job)
-
-    @staticmethod
-    def _event_snapshot_locked(job: _DetachedAgentJob) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "job_id": job.job_id,
-            "session_id": job.session_id,
-            "job_kind": "session_prompt",
-            "name": "session.prompt",
-            "args": {"prompt": job.prompt, "mode": job.mode},
-            "status": job.status,
-            "output_tail": "",
-            "truncated": False,
-        }
-        if job.status == "succeeded":
-            payload["result"] = job.result
-        elif job.status == "failed":
-            payload["error"] = dict(job.error or {})
-        return payload
-
-    @staticmethod
-    def _notify(job: _DetachedAgentJob, kind: str, payload: dict[str, Any]) -> None:
-        if job.sink is None:
-            return
-        try:
-            job.sink(AgentEvent(kind, payload, None))
-        except Exception:
-            pass
 
 
 def _agent_failure(error: Exception) -> ToolboxError:
@@ -1030,17 +856,21 @@ class Conversation:
         self,
         child: Conversation,
         origin_call_id: str | None,
+        *,
+        independent: bool = False,
     ) -> None:
         with self._run_lock:
             if origin_call_id in self._cancelled_tool_prompt_origins:
                 child.close()
                 raise RunCancelled
-            if self._closed or (
-                self._current_token is not None and self._current_token.cancelled
+            if not independent and (
+                self._closed
+                or (self._current_token is not None and self._current_token.cancelled)
             ):
                 child.close()
                 raise RunCancelled
-            self._foreground_children.add(child)
+            if not independent:
+                self._foreground_children.add(child)
             self._foreground_children_by_origin.setdefault(origin_call_id, set()).add(
                 child
             )
@@ -1065,8 +895,6 @@ class Conversation:
         origin_call_id: str | None,
     ) -> None:
         """Cancel foreground children when their tool worker is stopped."""
-        if parent_scope.session_id != self.session_id:
-            return
         with self._run_lock:
             self._cancelled_tool_prompt_origins.add(origin_call_id)
             children = tuple(
@@ -1278,30 +1106,8 @@ class Conversation:
             effective_args = call.args
             if call.name == "call_tool":
                 mode, effective_args = _parse_call_tool_request(call.args)
-                if mode == "inspect":
-                    inspect = getattr(self.tool_runner, "inspect_detached", None)
-                    if not callable(inspect):
-                        raise ToolboxError(
-                            "detached_jobs_unavailable",
-                            "this tool runner does not support detached jobs",
-                        )
-                    return inspect(effective_args["job_id"], session_id=self.session_id)
-                if mode == "start":
-                    start = getattr(self.tool_runner, "start_detached", None)
-                    if not callable(start):
-                        raise ToolboxError(
-                            "detached_jobs_unavailable",
-                            "this tool runner does not support detached jobs",
-                        )
-                    return start(
-                        effective_args["name"],
-                        effective_args["args"],
-                        version=effective_args.get("version"),
-                        session_id=self.session_id,
-                        on_update=lambda kind, payload: self._emit_transient(
-                            sink, kind, payload
-                        ),
-                    )
+                if mode in {"inspect", "start"}:
+                    effective_args = call.args
 
             call_with_provider = getattr(
                 self.tool_runner,
@@ -1317,16 +1123,9 @@ class Conversation:
                 return call_with_provider(
                     call.name,
                     effective_args,
-                    model_provider=self.model_session.completion_provider(
-                        session_prompter=lambda scope, origin, args: (
-                            self._prompt_session_from_tool(
-                                scope,
-                                origin,
-                                args,
-                                sink=sink,
-                            )
-                        ),
-                        session_prompt_canceller=self._cancel_tool_session_prompts,
+                    model_provider=self._completion_provider(
+                        sink=sink,
+                        agent_budget=self._agent_budget_for_launch(),
                     ),
                     **call_kwargs,
                 )
@@ -1340,6 +1139,106 @@ class Conversation:
         except Exception as error:  # Generated tools may raise anything.
             return {"error": {"code": "tool_failed", "message": str(error)}}
 
+    def _completion_provider(
+        self,
+        *,
+        sink: EventSink | None,
+        scope: InvocationScope | None = None,
+        agent_budget: _AgentLaunchBudget | None = None,
+    ) -> Any:
+        """Bind model and ToolRun capabilities to one immutable call-tree scope."""
+        return self.model_session.completion_provider(
+            scope,
+            session_prompter=lambda active_scope, origin, args: (
+                self._prompt_session_from_tool(
+                    active_scope,
+                    origin,
+                    args,
+                    sink=sink,
+                    agent_budget=agent_budget,
+                )
+            ),
+            session_prompt_canceller=self._cancel_tool_session_prompts,
+            tool_run_controller=lambda active_scope, origin, args, provider: (
+                self._control_tool_run(
+                    active_scope,
+                    origin,
+                    args,
+                    sink=sink,
+                    model_provider=provider,
+                )
+            ),
+        )
+
+    def _control_tool_run(
+        self,
+        parent_scope: InvocationScope,
+        _origin_call_id: str | None,
+        args: dict[str, Any],
+        *,
+        sink: EventSink | None,
+        model_provider: Any,
+    ) -> JsonValue:
+        """Apply one creator-scoped ToolRun lifecycle request."""
+        if not isinstance(args, dict) or not isinstance(args.get("operation"), str):
+            raise ToolboxError(
+                "invalid_tool_run_request", "tool run operation is required"
+            )
+        operation = args["operation"]
+        if operation == "start":
+            if not set(args) <= {"operation", "name", "args", "version"}:
+                raise ToolboxError(
+                    "invalid_tool_run_request", "invalid tool run start request"
+                )
+            _, request = _parse_call_tool_request(
+                {key: value for key, value in args.items() if key != "operation"}
+            )
+            start = getattr(self.tool_runner, "start_detached", None)
+            if not callable(start):
+                raise ToolboxError(
+                    "tool_runs_unavailable",
+                    "this tool runner does not support detached tool runs",
+                )
+            return start(
+                request["name"],
+                request["args"],
+                version=request.get("version"),
+                session_id=parent_scope.session_id,
+                scope=parent_scope,
+                owner_session_id=self.session_id,
+                model_provider=model_provider.for_tool_run(parent_scope),
+                on_update=lambda kind, payload: self._emit_transient(
+                    sink, kind, payload
+                ),
+            )
+        if operation not in {"get", "wait", "cancel"}:
+            raise ToolboxError(
+                "invalid_tool_run_request", f"unknown tool run operation: {operation}"
+            )
+        allowed = {"operation", "run_id"}
+        if operation == "wait":
+            allowed.add("timeout_ms")
+        run_id = args.get("run_id")
+        if set(args) - allowed or not isinstance(run_id, str) or not run_id:
+            raise ToolboxError(
+                "invalid_tool_run_request", "tool run operation requires a run_id"
+            )
+        if operation == "get":
+            return self.tool_runner.get_tool_run(
+                run_id,
+                session_id=self.session_id,
+            )
+        if operation == "wait":
+            return self.tool_runner.wait_tool_run(
+                run_id,
+                session_id=self.session_id,
+                timeout_ms=args.get("timeout_ms", 30_000),
+            )
+        return self.tool_runner.cancel_tool_run(
+            run_id,
+            session_id=self.session_id,
+        )
+
     def _prompt_session_from_tool(
         self,
         parent_scope: InvocationScope,
@@ -1347,6 +1246,7 @@ class Conversation:
         args: dict[str, Any],
         *,
         sink: EventSink | None,
+        agent_budget: _AgentLaunchBudget | None = None,
     ) -> JsonValue:
         self._start_tool_session_prompt(origin_call_id)
         try:
@@ -1355,7 +1255,11 @@ class Conversation:
                 return self._agent_coordinator.inspect(
                     prompt_args["job_id"], session_id=self.session_id
                 )
-            target_session_id = prompt_args.get("session_id", parent_scope.session_id)
+            target_session_id = prompt_args.get("session_id")
+            if target_session_id is None:
+                target_session_id = self.kernel._nearest_conversation_session(
+                    parent_scope.session_id
+                )
             if operation == "start":
                 return self._agent_coordinator.start_detached(
                     self,
@@ -1366,6 +1270,7 @@ class Conversation:
                     caller_scope=parent_scope,
                     origin_call_id=origin_call_id,
                     metadata=prompt_args.get("metadata"),
+                    agent_budget=agent_budget,
                 )
             return self._agent_coordinator.run_foreground(
                 self,
@@ -1375,6 +1280,8 @@ class Conversation:
                 caller_scope=parent_scope,
                 origin_call_id=origin_call_id,
                 metadata=prompt_args.get("metadata"),
+                independent=parent_scope.session_id != self.session_id,
+                agent_budget=agent_budget,
             )
         finally:
             self._finish_tool_session_prompt(origin_call_id)

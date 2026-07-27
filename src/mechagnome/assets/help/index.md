@@ -1,6 +1,6 @@
 # Mechagnome help
 
-Mechagnome begins with nine editable core operations and no domain-specific
+Mechagnome begins with twelve editable core operations and no domain-specific
 user tools. Every recursively launched agent receives the same tools. Use these
 topics as you grow and reuse the toolbox:
 
@@ -11,7 +11,7 @@ topics as you grow and reuse the toolbox:
 - `namespaces` — hierarchical tool discovery and organization
 - `toolboxes` — ordered session toolbox composition and cwd routing
 - `versioning` — immutable versions, activation, and rollback
-- `core` — editing the nine base operations
+- `core` — editing the twelve base operations
 
 Call `help` again with one of those names as the `topic` to read the complete
 Markdown document.

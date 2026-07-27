@@ -12,10 +12,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event, Lock, Thread, current_thread
+from threading import Condition, Event, Lock, Thread, current_thread
 from typing import Any
 
 from mechagnome.kernel import InvocationScope, JsonValue, Kernel, ToolboxError
@@ -28,7 +30,7 @@ from mechagnome.model_provider import (
 )
 
 CommittedEventSink = Callable[[dict[str, Any]], None]
-DetachedEventSink = Callable[[str, dict[str, Any]], None]
+ToolRunEventSink = Callable[[str, dict[str, Any]], None]
 
 _MAX_DETACHED_JOBS = 4
 _MAX_RETAINED_DETACHED_JOBS = 64
@@ -108,15 +110,16 @@ class _ControlSanitizer:
 
 
 @dataclass
-class _DetachedJob:
-    """One process-lifetime background call and its bounded observable state."""
+class _ToolRun:
+    """One process-lifetime detached tool invocation and its retained state."""
 
-    job_id: str
-    parent_session_id: str
+    run_id: str
+    trace_session_id: str
+    owner_session_id: str
     name: str
     args: dict[str, Any]
     version: int | None
-    sink: DetachedEventSink | None
+    sink: ToolRunEventSink | None
     status: str = "running"
     output_tail: str = ""
     truncated: bool = False
@@ -124,6 +127,8 @@ class _DetachedJob:
     error: dict[str, Any] | None = None
     cancelled: Event = field(default_factory=Event)
     thread: Thread | None = None
+    generation: int = 0
+    stop_reason: str | None = None
 
 
 class IsolatedToolRunner:
@@ -132,8 +137,10 @@ class IsolatedToolRunner:
     def __init__(self, kernel: Kernel, *, timeout: float = 120.0) -> None:
         self.kernel = kernel
         self.timeout = timeout
-        self._jobs: dict[str, _DetachedJob] = {}
-        self._jobs_lock = Lock()
+        self._runs: dict[str, _ToolRun] = {}
+        self._completed_run_ids: deque[str] = deque()
+        self._runs_lock = Lock()
+        self._runs_changed = Condition(self._runs_lock)
         self._foreground_lock = Lock()
         self._foreground_processes: dict[str, set[subprocess.Popen[bytes]]] = {}
         self._foreground_cancelled: set[str] = set()
@@ -146,9 +153,12 @@ class IsolatedToolRunner:
         *,
         session_id: str,
         version: int | None = None,
-        on_update: DetachedEventSink | None = None,
+        on_update: ToolRunEventSink | None = None,
+        model_provider: _CompletionProvider | None = None,
+        scope: InvocationScope | None = None,
+        owner_session_id: str | None = None,
     ) -> dict[str, Any]:
-        """Start one providerless call tree and return its process-lifetime handle."""
+        """Start one call tree and return its process-lifetime ToolRun handle."""
         if not isinstance(name, str) or not name or not isinstance(args, dict):
             raise ToolboxError(
                 "invalid_call_tool_request",
@@ -161,22 +171,27 @@ class IsolatedToolRunner:
                 "invalid_call_tool_request",
                 "detached call version must be a positive integer",
             )
-        scope = self.kernel.snapshot_scope(session_id)
-        with self._jobs_lock:
+        scope = scope or self.kernel.snapshot_scope(session_id)
+        owner_session_id = owner_session_id or session_id
+        with self._runs_changed:
             if self._closed:
                 raise ToolboxError(
                     "detached_runner_closed", "detached tool runner is closed"
                 )
-            active = sum(job.status == "running" for job in self._jobs.values())
+            active = sum(
+                run.status in {"running", "cancelling"} for run in self._runs.values()
+            )
             if active >= _MAX_DETACHED_JOBS:
                 raise ToolboxError(
                     "detached_job_limit",
                     f"at most {_MAX_DETACHED_JOBS} detached jobs may run at once",
                 )
-            job_id = self.kernel.create_child_session(scope, kind="generic")
-            job = _DetachedJob(
-                job_id,
-                session_id,
+            trace_session_id = self.kernel.create_child_session(scope, kind="generic")
+            run_id = uuid.uuid4().hex
+            run = _ToolRun(
+                run_id,
+                trace_session_id,
+                owner_session_id,
                 name,
                 dict(args),
                 version,
@@ -184,11 +199,11 @@ class IsolatedToolRunner:
             )
             thread = Thread(
                 target=self._run_detached,
-                args=(job, scope),
-                name=f"mechagnome-detached-{job_id[:8]}",
+                args=(run, scope, model_provider),
+                name=f"mechagnome-tool-run-{run_id[:8]}",
             )
-            job.thread = thread
-            self._jobs[job_id] = job
+            run.thread = thread
+            self._runs[run_id] = run
             try:
                 thread.start()
             except Exception as error:
@@ -196,49 +211,101 @@ class IsolatedToolRunner:
             else:
                 start_error = None
         if start_error is not None:
-            failure = {
-                "code": "detached_start_failed",
-                "message": str(start_error),
-                "details": {},
-            }
-            self._finish_job(job, status="failed", error=failure)
+            with self._runs_changed:
+                self._runs.pop(run_id, None)
+                run.sink = None
+                self._runs_changed.notify_all()
             raise ToolboxError(
                 "detached_start_failed", "could not start detached tool job"
             ) from start_error
-        return {"job_id": job_id, "status": "running"}
+        return {
+            "run_id": run_id,
+            "job_id": run_id,
+            "tool_name": name,
+            "status": "running",
+        }
 
     def inspect_detached(self, job_id: str, *, session_id: str) -> dict[str, Any]:
-        """Return the latest bounded state for a job owned by this conversation."""
-        with self._jobs_lock:
-            job = self._jobs.get(job_id)
-            if job is None or job.parent_session_id != session_id:
+        """Compatibility view of a ToolRun using the former detached-job shape."""
+        try:
+            with self._runs_lock:
+                run = self._visible_run_locked(job_id, session_id)
+                result = self._event_snapshot_locked(run)
+        except ToolboxError as error:
+            if error.code == "unknown_tool_run":
                 raise ToolboxError(
                     "unknown_detached_job", f"unknown detached job: {job_id}"
-                )
-            result: dict[str, Any] = {
-                "job_id": job.job_id,
-                "status": job.status,
-                "output_tail": job.output_tail,
-                "truncated": job.truncated,
-            }
-            if job.status == "succeeded":
-                result["result"] = job.result
-            elif job.status == "failed":
-                result["error"] = dict(job.error or {})
+                ) from error
+            raise
+        return result
+
+    def get_tool_run(self, run_id: str, *, session_id: str) -> dict[str, Any]:
+        """Return lightweight state for a ToolRun visible to this session."""
+        with self._runs_lock:
+            run = self._visible_run_locked(run_id, session_id)
+            return self._status_locked(run)
+
+    def wait_tool_run(
+        self, run_id: str, *, session_id: str, timeout_ms: int = 30_000
+    ) -> dict[str, Any]:
+        """Wait for a visible ToolRun to finish, bounded by ``timeout_ms``."""
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or not 0 <= timeout_ms <= 30_000
+        ):
+            raise ToolboxError(
+                "invalid_tool_run_request",
+                "tool run timeout_ms must be an integer from 0 through 30000",
+            )
+        deadline = time.monotonic() + timeout_ms / 1000
+        with self._runs_changed:
+            run = self._visible_run_locked(run_id, session_id)
+            while run.status in {"running", "cancelling"}:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result = self._status_locked(run)
+                    result["timed_out"] = True
+                    return result
+                self._runs_changed.wait(remaining)
+            return self._terminal_snapshot_locked(run)
+
+    def cancel_tool_run(self, run_id: str, *, session_id: str) -> dict[str, Any]:
+        """Request cancellation without exposing whether an inaccessible run exists."""
+        with self._runs_changed:
+            run = self._visible_run_locked(run_id, session_id)
+            requested = run.status == "running"
+            if requested:
+                run.status = "cancelling"
+                run.stop_reason = "cancel"
+                run.generation += 1
+                run.cancelled.set()
+                payload = self._event_snapshot_locked(run)
+                self._runs_changed.notify_all()
+            else:
+                payload = None
+            result = self._status_locked(run)
+            result["cancellation_requested"] = requested
+        if payload is not None:
+            self._notify(run, "tool_run_cancelling", payload)
         return result
 
     def close(self) -> None:
         """Stop and join every owned detached worker; safe to call repeatedly."""
-        with self._jobs_lock:
+        with self._runs_changed:
             if self._closed:
                 return
             self._closed = True
-            jobs = list(self._jobs.values())
-            for job in jobs:
-                if job.status == "running":
-                    job.cancelled.set()
-        for job in jobs:
-            thread = job.thread
+            runs = list(self._runs.values())
+            for run in runs:
+                if run.status == "running":
+                    run.status = "cancelling"
+                    run.stop_reason = "shutdown"
+                    run.generation += 1
+                    run.cancelled.set()
+            self._runs_changed.notify_all()
+        for run in runs:
+            thread = run.thread
             if (
                 thread is not None
                 and thread.ident is not None
@@ -246,73 +313,87 @@ class IsolatedToolRunner:
             ):
                 thread.join()
 
-    def _run_detached(self, job: _DetachedJob, parent_scope: InvocationScope) -> None:
-        self._notify(job, "detached_started", self._snapshot(job))
-        envelope: dict[str, Any] = {"name": job.name, "args": job.args}
-        if job.version is not None:
-            envelope["version"] = job.version
+    def _run_detached(
+        self,
+        run: _ToolRun,
+        parent_scope: InvocationScope,
+        model_provider: _CompletionProvider | None,
+    ) -> None:
+        self._notify(run, "tool_run_started", self._event_snapshot(run))
+        envelope: dict[str, Any] = {"name": run.name, "args": run.args}
+        if run.version is not None:
+            envelope["version"] = run.version
         scope = InvocationScope(
-            session_id=job.job_id,
+            session_id=run.trace_session_id,
             toolbox_ids=parent_scope.toolbox_ids,
             cwd=parent_scope.cwd,
         )
+        result: JsonValue = None
+        error: dict[str, Any] | None = None
         try:
             result = self._call(
                 "call_tool",
                 envelope,
-                session_id=job.job_id,
+                session_id=run.trace_session_id,
                 on_event=None,
-                cancelled=job.cancelled.is_set,
-                model_provider=None,
+                cancelled=run.cancelled.is_set,
+                model_provider=model_provider,
                 scope=scope,
-                on_output=lambda text: self._append_job_output(job, text),
+                on_output=lambda text: self._append_run_output(run, text),
                 foreground=False,
             )
-        except Exception as error:
-            if job.cancelled.is_set():
-                failure = {
-                    "code": "detached_shutdown",
-                    "message": "detached job stopped because its runner closed",
-                    "details": {},
-                }
-            elif isinstance(error, ToolboxError):
-                failure = error.to_dict()["error"]
+        except Exception as caught:
+            status = "failed"
+            if isinstance(caught, ToolboxError):
+                failure = caught.to_dict()["error"]
             else:
                 failure = {
                     "code": "tool_failed",
-                    "message": str(error),
+                    "message": str(caught),
                     "details": {},
                 }
-            self._finish_job(job, status="failed", error=failure)
+            error = failure
         else:
-            self._finish_job(job, status="succeeded", result=result)
+            status = "succeeded"
+        finally:
+            release = getattr(model_provider, "release_tool_run", None)
+            if callable(release):
+                release(run.trace_session_id)
+        self._finish_run(run, status=status, result=result, error=error)
 
-    def _append_job_output(self, job: _DetachedJob, text: str) -> None:
+    def _append_run_output(self, run: _ToolRun, text: str) -> None:
         if not text:
             return
-        with self._jobs_lock:
-            combined = (job.output_tail + text).encode("utf-8")
+        with self._runs_changed:
+            combined = (run.output_tail + text).encode("utf-8")
             if len(combined) > _MAX_OUTPUT_BYTES:
                 combined = combined[-_MAX_OUTPUT_BYTES:]
                 while combined and combined[0] & 0xC0 == 0x80:
                     combined = combined[1:]
-                job.truncated = True
-            job.output_tail = combined.decode("utf-8", errors="replace")
-            payload = self._snapshot_locked(job)
-        self._notify(job, "detached_output", payload)
+                run.truncated = True
+            run.output_tail = combined.decode("utf-8", errors="replace")
+            run.generation += 1
+            payload = self._event_snapshot_locked(run)
+            self._runs_changed.notify_all()
+        self._notify(run, "tool_run_output", payload)
 
-    def _finish_job(
+    def _finish_run(
         self,
-        job: _DetachedJob,
+        run: _ToolRun,
         *,
         status: str,
         result: JsonValue = None,
         error: dict[str, Any] | None = None,
     ) -> None:
         if status == "succeeded":
-            encoded_result = json.dumps(
-                result, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            try:
+                encoded_result = json.dumps(
+                    result, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                encoded_result = json.dumps(
+                    result, ensure_ascii=True, separators=(",", ":")
+                ).encode("utf-8")
             if len(encoded_result) > _MAX_DETACHED_RESULT_BYTES:
                 status = "failed"
                 result = None
@@ -321,50 +402,109 @@ class IsolatedToolRunner:
                     "message": "detached result exceeds the retained byte limit",
                     "details": {"limit_bytes": _MAX_DETACHED_RESULT_BYTES},
                 }
-        with self._jobs_lock:
-            if job.status != "running":
+        with self._runs_changed:
+            if run.status not in {"running", "cancelling"}:
                 return
-            job.status = status
-            job.result = result
-            job.error = error
-            payload = self._snapshot_locked(job)
-        self._notify(job, "detached_finished", payload)
-        with self._jobs_lock:
-            job.sink = None
-            terminal = [
-                job_id
-                for job_id, candidate in self._jobs.items()
-                if candidate.status != "running"
-            ]
-            for job_id in terminal[:-_MAX_RETAINED_DETACHED_JOBS]:
-                del self._jobs[job_id]
+            if run.stop_reason == "cancel":
+                run.status = "cancelled"
+                run.result = None
+                run.error = {
+                    "code": "tool_run_cancelled",
+                    "message": "tool run cancelled by request",
+                    "details": {},
+                }
+            elif run.stop_reason == "shutdown":
+                run.status = "failed"
+                run.result = None
+                run.error = {
+                    "code": "detached_shutdown",
+                    "message": "detached job stopped because its runner closed",
+                    "details": {},
+                }
+            else:
+                run.status = status
+                run.result = result
+                run.error = error
+            run.generation += 1
+            payload = self._event_snapshot_locked(run)
+            self._runs_changed.notify_all()
+        self._notify(run, "tool_run_finished", payload)
+        with self._runs_lock:
+            run.sink = None
+            self._completed_run_ids.append(run.run_id)
+            while len(self._completed_run_ids) > _MAX_RETAINED_DETACHED_JOBS:
+                completed_run_id = self._completed_run_ids.popleft()
+                self._runs.pop(completed_run_id, None)
 
-    def _snapshot(self, job: _DetachedJob) -> dict[str, Any]:
-        with self._jobs_lock:
-            return self._snapshot_locked(job)
+    def _event_snapshot(self, run: _ToolRun) -> dict[str, Any]:
+        with self._runs_lock:
+            return self._event_snapshot_locked(run)
 
     @staticmethod
-    def _snapshot_locked(job: _DetachedJob) -> dict[str, Any]:
+    def _event_snapshot_locked(run: _ToolRun) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "job_id": job.job_id,
-            "name": job.name,
-            "args": job.args,
-            "status": job.status,
-            "output_tail": job.output_tail,
-            "truncated": job.truncated,
+            "run_id": run.run_id,
+            "job_id": run.run_id,
+            "tool_name": run.name,
+            "name": run.name,
+            "status": run.status,
+            "output_tail": run.output_tail,
+            "truncated": run.truncated,
+            "generation": run.generation,
         }
-        if job.status == "succeeded":
-            payload["result"] = job.result
-        elif job.status == "failed":
-            payload["error"] = dict(job.error or {})
+        if run.status == "succeeded":
+            payload["result"] = run.result
+        elif run.status in {"failed", "cancelled"}:
+            payload["error"] = dict(run.error or {})
         return payload
 
     @staticmethod
-    def _notify(job: _DetachedJob, kind: str, payload: dict[str, Any]) -> None:
-        if job.sink is None:
+    def _status_locked(run: _ToolRun) -> dict[str, Any]:
+        return {
+            "run_id": run.run_id,
+            "tool_name": run.name,
+            "status": run.status,
+        }
+
+    def _terminal_snapshot_locked(self, run: _ToolRun) -> dict[str, Any]:
+        payload = self._status_locked(run)
+        payload.update(
+            {
+                "output_tail": run.output_tail,
+                "truncated": run.truncated,
+            }
+        )
+        if run.status == "succeeded":
+            payload["result"] = run.result
+        else:
+            payload["error"] = dict(run.error or {})
+        return payload
+
+    def _visible_run_locked(self, run_id: str, session_id: str) -> _ToolRun:
+        run = self._runs.get(run_id) if isinstance(run_id, str) else None
+        if run is None or not self._is_owner_or_ancestor(
+            session_id, run.owner_session_id
+        ):
+            raise ToolboxError("unknown_tool_run", f"unknown tool run: {run_id}")
+        return run
+
+    def _is_owner_or_ancestor(self, candidate: str, owner: str) -> bool:
+        current: str | None = owner
+        while current is not None:
+            if current == candidate:
+                return True
+            try:
+                current = self.kernel.session_metadata(current)["parent_session_id"]
+            except ToolboxError:
+                return False
+        return False
+
+    @staticmethod
+    def _notify(run: _ToolRun, kind: str, payload: dict[str, Any]) -> None:
+        if run.sink is None:
             return
         try:
-            job.sink(kind, payload)
+            run.sink(kind, payload)
         except Exception:
             pass
 

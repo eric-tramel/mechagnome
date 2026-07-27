@@ -28,6 +28,7 @@ _ERROR_MESSAGES = {
     "model_provider_failed": "model provider request failed",
     "invalid_model_provider": "model provider must support cancellation",
     "model_provider_protocol": "model provider connection failed",
+    "tool_run_unavailable": "tool run controls are unavailable in this context",
 }
 
 
@@ -120,6 +121,10 @@ class _CompletionProvider(Protocol):
 
     def prompt_session(self, args: dict[str, Any]) -> Any:
         """Continue, spawn, fork, or inspect a durable conversation."""
+        ...
+
+    def tool_run(self, args: dict[str, Any]) -> Any:
+        """Start or control one process-lifetime detached tool invocation."""
         ...
 
     def for_origin(self, call_id: str) -> _CompletionProvider:
@@ -503,6 +508,18 @@ class ModelSession:
         session_prompt_canceller: (
             Callable[[InvocationScope, str | None], None] | None
         ) = None,
+        tool_run_controller: (
+            Callable[
+                [
+                    InvocationScope,
+                    str | None,
+                    dict[str, Any],
+                    _BoundedModelProvider,
+                ],
+                Any,
+            ]
+            | None
+        ) = None,
     ) -> _BoundedModelProvider:
         active_scope = (
             scope
@@ -515,6 +532,7 @@ class ModelSession:
                 active_scope,
                 session_prompter=session_prompter,
                 session_prompt_canceller=session_prompt_canceller,
+                tool_run_controller=tool_run_controller,
             )
         )
 
@@ -609,6 +627,18 @@ class _SessionCompletionProvider:
         session_prompt_canceller: (
             Callable[[InvocationScope, str | None], None] | None
         ) = None,
+        tool_run_controller: (
+            Callable[
+                [
+                    InvocationScope,
+                    str | None,
+                    dict[str, Any],
+                    _BoundedModelProvider,
+                ],
+                Any,
+            ]
+            | None
+        ) = None,
         session_prompt_state: _SessionPromptState | None = None,
     ) -> None:
         self._provider = provider
@@ -616,6 +646,7 @@ class _SessionCompletionProvider:
         self._origin_call_id = origin_call_id
         self._session_prompter = session_prompter
         self._session_prompt_canceller = session_prompt_canceller
+        self._tool_run_controller = tool_run_controller
         self._session_prompt_state = session_prompt_state or _SessionPromptState()
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
@@ -632,6 +663,7 @@ class _SessionCompletionProvider:
             call_id,
             self._session_prompter,
             self._session_prompt_canceller,
+            self._tool_run_controller,
             self._session_prompt_state,
         )
 
@@ -642,8 +674,24 @@ class _SessionCompletionProvider:
             self._origin_call_id,
             self._session_prompter,
             self._session_prompt_canceller,
+            self._tool_run_controller,
             self._session_prompt_state,
         )
+
+    def for_tool_run(self, scope: InvocationScope) -> _SessionCompletionProvider:
+        """Bind an independent ToolRun while retaining the host capabilities."""
+        return _SessionCompletionProvider(
+            self._provider,
+            scope,
+            self._origin_call_id,
+            self._session_prompter,
+            self._session_prompt_canceller,
+            self._tool_run_controller,
+        )
+
+    def release_tool_run(self, session_id: str) -> None:
+        """Release transport bindings owned by a terminal ToolRun trace."""
+        self._provider._release_session(session_id)
 
     def prompt_session(self, args: dict[str, Any]) -> Any:
         if self._session_prompter is None:
@@ -659,6 +707,23 @@ class _SessionCompletionProvider:
             )
         finally:
             self._session_prompt_state.exit(self._origin_call_id)
+
+    def tool_run(
+        self,
+        args: dict[str, Any],
+        *,
+        bounded_provider: _BoundedModelProvider | None = None,
+    ) -> Any:
+        if self._tool_run_controller is None:
+            raise _error("tool_run_unavailable")
+        if bounded_provider is None:
+            bounded_provider = _BoundedModelProvider(self)
+        return self._tool_run_controller(
+            self._scope,
+            self._origin_call_id,
+            args,
+            bounded_provider,
+        )
 
     def cancel_current(self) -> None:
         if self._session_prompt_canceller is not None:
@@ -731,6 +796,9 @@ class _UnavailableModelProvider:
     def prompt_session(self, args: dict[str, Any]) -> Any:
         raise _error("model_provider_unavailable")
 
+    def tool_run(self, args: dict[str, Any]) -> Any:
+        raise _error("tool_run_unavailable")
+
     def for_origin(self, call_id: str) -> _UnavailableModelProvider:
         return self
 
@@ -786,15 +854,30 @@ class _BoundedModelProvider:
             raise _error("invalid_model_request")
         result = self._provider.prompt_session(args)
         try:
-            json.dumps(
-                result,
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
+            try:
+                json.dumps(
+                    result,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                json.dumps(
+                    result,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
         except (TypeError, ValueError, UnicodeError) as error:
             raise _error("model_provider_failed") from error
         return result
+
+    def tool_run(self, args: dict[str, Any]) -> Any:
+        if not isinstance(args, dict):
+            raise _error("invalid_model_request")
+        if isinstance(self._provider, _SessionCompletionProvider):
+            return self._provider.tool_run(args, bounded_provider=self)
+        return self._provider.tool_run(args)
 
     def for_origin(self, call_id: str) -> _BoundedModelProvider:
         provider = self._provider.for_origin(call_id)
@@ -803,6 +886,16 @@ class _BoundedModelProvider:
     def for_scope(self, scope: InvocationScope) -> _BoundedModelProvider:
         provider = self._provider.for_scope(scope)
         return _BoundedModelProvider(provider, budget=self._budget)
+
+    def for_tool_run(self, scope: InvocationScope) -> _BoundedModelProvider:
+        fork = getattr(self._provider, "for_tool_run", None)
+        provider = fork(scope) if callable(fork) else self._provider.for_scope(scope)
+        return _BoundedModelProvider(provider, budget=self._budget)
+
+    def release_tool_run(self, session_id: str) -> None:
+        release = getattr(self._provider, "release_tool_run", None)
+        if callable(release):
+            release(session_id)
 
     def cancel_current(self) -> None:
         self._provider.cancel_current()
@@ -840,12 +933,20 @@ def _bind_model_provider(
 
 def _encode_frame(payload: dict[str, Any]) -> bytes:
     try:
-        data = json.dumps(
-            payload,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        try:
+            data = json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except UnicodeEncodeError:
+            data = json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
     except (TypeError, ValueError, UnicodeError) as error:
         raise _error("model_provider_protocol") from error
     if len(data) > _MAX_MODEL_FRAME_BYTES:
@@ -919,8 +1020,14 @@ class _ModelProviderProxy:
         return self._request("complete", messages=messages)
 
     def prompt_session(self, args: dict[str, Any]) -> Any:
+        return self._structured_request("prompt_session", args)
+
+    def tool_run(self, args: dict[str, Any]) -> Any:
+        return self._structured_request("tool_run", args)
+
+    def _structured_request(self, operation: str, args: dict[str, Any]) -> Any:
         payload = {
-            "op": "prompt_session",
+            "op": operation,
             "args": args,
             "origin_call_id": self._origin_call_id,
         }
@@ -1035,7 +1142,7 @@ class _ModelProviderBroker:
             {"op", "messages", "origin_call_id"}
             if operation == "complete"
             else {"op", "args", "origin_call_id"}
-            if operation == "prompt_session"
+            if operation in {"prompt_session", "tool_run"}
             else set()
         )
         if set(request) != expected or (
@@ -1053,9 +1160,14 @@ class _ModelProviderBroker:
                     "ok": True,
                     "result": provider.prompt_session(request["args"]),
                 }
+            if operation == "tool_run":
+                return {
+                    "ok": True,
+                    "result": provider.tool_run(request["args"]),
+                }
             text = provider.complete(request["messages"])
         except ToolboxError as error:
-            if operation == "prompt_session":
+            if operation in {"prompt_session", "tool_run"}:
                 return {"ok": False, "error": error.to_dict()["error"]}
             code = (
                 error.code if error.code in _ERROR_MESSAGES else "model_provider_failed"

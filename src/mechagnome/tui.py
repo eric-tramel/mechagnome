@@ -242,7 +242,13 @@ def _summarize_tool_images(value: Any) -> Any:
 class ToolEvent(Collapsible):
     """One quiet, expandable tool invocation or observation."""
 
-    SYMBOLS = {"call": "→", "response": "✓", "error": "✕", "handoff": "↗"}
+    SYMBOLS = {
+        "call": "→",
+        "response": "✓",
+        "error": "✕",
+        "cancelled": "■",
+        "handoff": "↗",
+    }
     SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     MAX_DETACHED_TAIL_BYTES = 16 * 1024
 
@@ -356,11 +362,18 @@ class ToolEvent(Collapsible):
             str(payload.get("output_tail") or ""),
             truncated=bool(payload.get("truncated")),
         )
-        succeeded = payload.get("status") == "succeeded"
-        self.kind = "response" if succeeded else "error"
+        status = payload.get("status")
+        succeeded = status == "succeeded"
+        self.kind = (
+            "response"
+            if succeeded
+            else "cancelled"
+            if status == "cancelled"
+            else "error"
+        )
         self.remove_class("tool-call")
         self.add_class(f"tool-{self.kind}")
-        label = "response" if succeeded else "error"
+        label = "response" if succeeded else str(status or "error")
         value = payload.get("result") if succeeded else payload.get("error")
         if succeeded:
             value = _summarize_tool_images(value)
@@ -376,7 +389,7 @@ class ToolEvent(Collapsible):
         self.outcome_summary = " · parent session"
         self.detail = (
             f"{self._detached_detail()}\n\nstatus\n"
-            "no longer tracked in this compacted tab; job remains owned by "
+            "no longer tracked in this compacted tab; run remains owned by "
             f"parent session {parent_session_id}"
         )
         self.detail_widget.update(Text(self.detail, style="dim"))
@@ -388,7 +401,7 @@ class ToolEvent(Collapsible):
             output = f"… output truncated to latest tail …\n{output}"
         return (
             f"arguments\n{self.call_detail}\n\n"
-            f"job\n{self.detached_job_id or 'starting'}\n\noutput\n{output}"
+            f"run\n{self.detached_job_id or 'starting'}\n\noutput\n{output}"
         )
 
     def _render_title(self, symbol: str) -> Text:
@@ -584,6 +597,7 @@ class SessionTab:
     forwarded_children: dict[str, str] = field(default_factory=dict)
     active_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
     detached_tool_events: dict[str, ToolEvent] = field(default_factory=dict)
+    tool_run_generations: dict[str, int] = field(default_factory=dict)
     ignored_detached_jobs: set[str] = field(default_factory=set)
     viewed_session_id: str | None = None
     viewed_session_after: int = 0
@@ -1594,6 +1608,10 @@ class ToolboxApp(App[None]):
         color: #b98989;
     }
 
+    .tool-cancelled CollapsibleTitle {
+        color: #a99b7a;
+    }
+
     .tool-event Contents {
         padding: 0 0 0 2;
     }
@@ -2016,7 +2034,7 @@ class ToolboxApp(App[None]):
 
         def relay(event: AgentEvent) -> None:
             nonlocal error_reported
-            if event.kind.startswith("detached_"):
+            if event.kind.startswith(("detached_", "tool_run_")):
                 self._stage_detached_event(state, event)
                 return
             if event.kind == "model_delta":
@@ -2156,17 +2174,28 @@ class ToolboxApp(App[None]):
             self._set_status("stopped", state)
 
     def _display_detached_event(self, state: SessionTab, event: AgentEvent) -> None:
-        job_id = event.payload.get("job_id")
+        job_id = event.payload.get("run_id") or event.payload.get("job_id")
         if not isinstance(job_id, str):
             return
-        terminal = event.payload.get("status") in {"succeeded", "failed"}
+        generation = event.payload.get("generation")
+        if isinstance(generation, int):
+            if generation <= state.tool_run_generations.get(job_id, -1):
+                return
+            state.tool_run_generations[job_id] = generation
+        terminal = event.payload.get("status") in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }
         if job_id in state.ignored_detached_jobs:
             if terminal:
                 state.ignored_detached_jobs.discard(job_id)
             return
         displayed = state.detached_tool_events.get(job_id)
         if displayed is None:
-            name = str(event.payload.get("name") or "tool")
+            name = str(
+                event.payload.get("tool_name") or event.payload.get("name") or "tool"
+            )
             args = event.payload.get("args")
             displayed = state.chat.write_tool(
                 "call",
@@ -2190,12 +2219,26 @@ class ToolboxApp(App[None]):
 
     def _stage_detached_event(self, state: SessionTab, event: AgentEvent) -> None:
         """Coalesce worker-thread updates without waiting for the UI loop."""
-        job_id = event.payload.get("job_id")
+        job_id = event.payload.get("run_id") or event.payload.get("job_id")
         if not isinstance(job_id, str):
             return
         with self._detached_event_lock:
             if self._accept_background_events:
-                self._staged_detached_events[(state.pane_id, job_id)] = (state, event)
+                key = (state.pane_id, job_id)
+                previous = self._staged_detached_events.get(key)
+                generation = event.payload.get("generation")
+                previous_generation = (
+                    previous[1].payload.get("generation")
+                    if previous is not None
+                    else None
+                )
+                if (
+                    isinstance(generation, int)
+                    and isinstance(previous_generation, int)
+                    and generation <= previous_generation
+                ):
+                    return
+                self._staged_detached_events[key] = (state, event)
 
     def _flush_staged_detached_events(self) -> None:
         with self._detached_event_lock:

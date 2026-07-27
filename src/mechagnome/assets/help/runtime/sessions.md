@@ -39,7 +39,8 @@ walking the parent chain rather than stored separately.
 - `ctx.sessions.set_description(description, *, session_id=None,
   expected_revision=None)` sets or clears a description.
 - `ctx.sessions.get(session_id=None)` returns a `ToolSession` handle.
-- `await ctx.sessions.inspect(job_id)` inspects a detached prompt job.
+- `await ctx.sessions.inspect(job_id)` is the schema-14 compatibility path for
+  old detached prompt handles; new code uses ToolRun operations.
 
 A `ToolSession` exposes `id`, `kind`, `parent_id`, `root_id`, `title`,
 `description`, `origin_session_id`, `origin_call_id`, `metadata`, `read()`,
@@ -51,7 +52,7 @@ async def main(input, ctx):
     return await session.prompt(
         input["prompt"],
         mode=input.get("mode", "continue"),
-        detach=input.get("detach", False),
+        detach=False,
     )
 ```
 
@@ -94,9 +95,10 @@ outcome = await source.prompt(
 )
 ```
 
-Foreground calls return `session_id`, `status`, and `result`. Detached calls
-return `job_id`, `session_id`, and `status`; inspect the job later through
-`ctx.sessions.inspect(job_id)`. A session cannot continue itself from one of
+Foreground calls return `session_id`, `status`, and `result`. To run any tool,
+including `run_agent`, independently, use
+`await ctx.call_tool(name, args, detach=True)` and control the returned `run_id`
+through `get_tool_run`, `wait_tool_run`, and `cancel_tool_run`. A session cannot continue itself from one of
 its active tool calls and returns `conversation_busy`. Spawn remains valid from
 an active tool call because it prompts a different child session. Forks exclude
 an unfinished active turn and snapshot the latest completed boundary.
