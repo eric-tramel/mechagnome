@@ -115,9 +115,12 @@ restart, at most four run concurrently, and app shutdown stops unfinished jobs.
 The latest 64 completed handles remain inspectable; older completed handles are
 evicted. Each result is limited to 1 MiB; an oversized result becomes a
 structured `detached_result_too_large` failure. There is no public per-job
-cancel operation. Escape stops only the
-foreground rollout, while clearing or ending a TUI session hides its detached
-rows without cancelling the underlying jobs as long as the app remains open.
+cancel operation. The first Escape stops only the foreground rollout after its
+current model response and requested tools finish. A second Escape while it is
+stopping immediately cancels the model stream, foreground child agents, and
+foreground tool processes. Detached jobs remain unaffected. Clearing or ending
+a TUI session hides its detached rows without cancelling the underlying jobs as
+long as the app remains open.
 Ending the final tab exits the app and triggers shutdown. Programmatic `Harness`
 owners must call `close()` to stop background work.
 

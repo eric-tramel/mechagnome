@@ -134,6 +134,9 @@ class IsolatedToolRunner:
         self.timeout = timeout
         self._jobs: dict[str, _DetachedJob] = {}
         self._jobs_lock = Lock()
+        self._foreground_lock = Lock()
+        self._foreground_processes: dict[str, set[subprocess.Popen[bytes]]] = {}
+        self._foreground_cancelled: set[str] = set()
         self._closed = False
 
     def start_detached(
@@ -263,6 +266,7 @@ class IsolatedToolRunner:
                 model_provider=None,
                 scope=scope,
                 on_output=lambda text: self._append_job_output(job, text),
+                foreground=False,
             )
         except Exception as error:
             if job.cancelled.is_set():
@@ -403,6 +407,19 @@ class IsolatedToolRunner:
             model_provider=model_provider,
         )
 
+    def cancel_foreground(self, session_id: str) -> None:
+        """Immediately kill every foreground worker owned by one conversation."""
+        with self._foreground_lock:
+            self._foreground_cancelled.add(session_id)
+            processes = tuple(self._foreground_processes.get(session_id, ()))
+        for process in processes:
+            self._signal_process_group(process, signal.SIGKILL)
+
+    def reset_foreground_cancellation(self, session_id: str) -> None:
+        """Clear a completed rollout's process-registration cancellation latch."""
+        with self._foreground_lock:
+            self._foreground_cancelled.discard(session_id)
+
     def _call(
         self,
         name: str,
@@ -414,6 +431,7 @@ class IsolatedToolRunner:
         model_provider: _CompletionProvider | None,
         scope: InvocationScope | None = None,
         on_output: Callable[[str], None] | None = None,
+        foreground: bool = True,
     ) -> JsonValue:
         self._validate_model_provider(model_provider)
         if cancelled is not None and cancelled():
@@ -496,6 +514,8 @@ class IsolatedToolRunner:
                         start_new_session=True,
                         pass_fds=pass_fds,
                     )
+                    if foreground:
+                        self._register_foreground(session_id, process)
                 except OSError as error:
                     raise ToolboxError(
                         "session_cwd_unavailable",
@@ -559,7 +579,12 @@ class IsolatedToolRunner:
                 if provider_was_cancelled:
                     self._cancel_model_provider(model_provider)
                 if process is not None and (process_active or on_output is not None):
-                    self._stop_process_group(process)
+                    if foreground and self._foreground_was_cancelled(session_id):
+                        self._kill_process_group(process)
+                    else:
+                        self._stop_process_group(process)
+                if process is not None and foreground:
+                    self._unregister_foreground(session_id, process)
                 if process is not None:
                     try:
                         self._relay(session_id, after, on_event)
@@ -709,6 +734,48 @@ class IsolatedToolRunner:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 pass
+
+    @staticmethod
+    def _signal_process_group(
+        process: subprocess.Popen[bytes], signal_number: signal.Signals
+    ) -> None:
+        try:
+            os.killpg(process.pid, signal_number)
+        except (PermissionError, ProcessLookupError):
+            pass
+
+    @classmethod
+    def _kill_process_group(cls, process: subprocess.Popen[bytes]) -> None:
+        cls._signal_process_group(process, signal.SIGKILL)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _register_foreground(
+        self, session_id: str, process: subprocess.Popen[bytes]
+    ) -> None:
+        with self._foreground_lock:
+            self._foreground_processes.setdefault(session_id, set()).add(process)
+            cancelled = session_id in self._foreground_cancelled
+        if cancelled:
+            self._signal_process_group(process, signal.SIGKILL)
+
+    def _unregister_foreground(
+        self, session_id: str, process: subprocess.Popen[bytes]
+    ) -> None:
+        with self._foreground_lock:
+            processes = self._foreground_processes.get(session_id)
+            if processes is None:
+                return
+            processes.discard(process)
+            if not processes:
+                del self._foreground_processes[session_id]
+
+    def _foreground_was_cancelled(self, session_id: str) -> bool:
+        with self._foreground_lock:
+            return session_id in self._foreground_cancelled
 
     def _relay(
         self,

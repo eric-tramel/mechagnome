@@ -67,6 +67,7 @@ _MAX_RETAINED_DETACHED_AGENT_JOBS = 64
 _MAX_DETACHED_AGENT_RESULT_BYTES = 1024 * 1024
 _MAX_ACTIVE_FOREGROUND_AGENTS = 16
 _MAX_AGENT_LAUNCHES_PER_ROLLOUT = 64
+_CANCELLED_PROMPT_HEADER = "<user cancelled previous turn>\n\n"
 
 
 def _parse_call_tool_request(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -168,24 +169,75 @@ def _parse_session_prompt_request(args: dict[str, Any]) -> tuple[str, dict[str, 
 class RunCancelled(ToolboxError):
     """Raised when the user stops the active rollout."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        mode: str = "force",
+        user_initiated: bool = False,
+        partial_text: str = "",
+    ) -> None:
         super().__init__("cancelled", "rollout stopped")
+        self.mode = mode
+        self.user_initiated = user_initiated
+        self.partial_text = partial_text
+
+    def event_payload(self) -> dict[str, Any]:
+        payload = self.to_dict()["error"]
+        payload.update(
+            {
+                "mode": self.mode,
+                "user_initiated": self.user_initiated,
+                "partial_text": self.partial_text,
+            }
+        )
+        return payload
 
 
-class _CancellationToken:
+class _RolloutReservation:
     def __init__(self) -> None:
-        self._event = Event()
+        self._graceful = Event()
+        self._force = Event()
+        self._lock = Lock()
+        self._user_initiated = False
 
-    def cancel(self) -> None:
-        self._event.set()
+    def request_graceful(self, *, user_initiated: bool) -> bool:
+        with self._lock:
+            if self._force.is_set() or self._graceful.is_set():
+                return False
+            self._user_initiated = self._user_initiated or user_initiated
+            self._graceful.set()
+            return True
+
+    def cancel(self, *, user_initiated: bool = False) -> None:
+        with self._lock:
+            self._user_initiated = self._user_initiated or user_initiated
+            self._force.set()
+
+    @property
+    def graceful_requested(self) -> bool:
+        return self._graceful.is_set()
 
     @property
     def cancelled(self) -> bool:
-        return self._event.is_set()
+        return self._force.is_set()
 
-    def check(self) -> None:
+    def check(self, *, partial_text: str = "") -> None:
         if self.cancelled:
-            raise RunCancelled
+            raise self.cancelled_error(partial_text=partial_text)
+
+    def cancelled_error(self, *, partial_text: str = "") -> RunCancelled:
+        with self._lock:
+            user_initiated = self._user_initiated
+        return RunCancelled(
+            mode="force",
+            user_initiated=user_initiated,
+            partial_text=partial_text,
+        )
+
+    def graceful_error(self) -> RunCancelled:
+        with self._lock:
+            user_initiated = self._user_initiated
+        return RunCancelled(mode="graceful", user_initiated=user_initiated)
 
 
 class _AgentLaunchBudget:
@@ -674,13 +726,19 @@ def _parent_session_message(parent_session_id: str) -> dict[str, Any]:
     }
 
 
-def _session_messages(
+@dataclass(frozen=True)
+class _SessionReplay:
+    messages: list[dict[str, Any]]
+    cancelled_prompt_pending: bool
+
+
+def _session_replay(
     kernel: Kernel,
     session_id: str,
     *,
     through_seq: int | None = None,
     _seen: set[str] | None = None,
-) -> list[dict[str, Any]]:
+) -> _SessionReplay:
     """Rebuild one conversation, including any immutable fork snapshot."""
     seen = set() if _seen is None else _seen
     if session_id in seen:
@@ -689,20 +747,24 @@ def _session_messages(
     metadata = kernel.session_metadata(session_id)
     source_id = metadata["context_source_session_id"]
     source_seq = metadata["context_through_seq"]
-    messages = (
-        _session_messages(
+    source_replay = (
+        _session_replay(
             kernel,
             str(source_id),
             through_seq=int(source_seq),
             _seen=seen,
         )
         if source_id is not None
-        else []
+        else _SessionReplay([], False)
     )
+    messages = list(source_replay.messages)
     seen.remove(session_id)
 
     call_names: dict[str, str] = {}
+    pending_call_ids: set[str] = set()
     prompt_start: int | None = None
+    safe_length = len(messages)
+    cancelled_prompt_pending = source_replay.cancelled_prompt_pending
     after = 0
     while True:
         page = kernel.read_session(session_id, after=after, limit=100)
@@ -714,12 +776,24 @@ def _session_messages(
             after = event["seq"]
             payload = event["payload"]
             if event["kind"] == "user":
+                external_user = payload.get("origin_session_id") is None
+                content = (
+                    _CANCELLED_PROMPT_HEADER + payload["content"]
+                    if payload.get("cancelled_previous_turn") is True
+                    or (cancelled_prompt_pending and external_user)
+                    else payload["content"]
+                )
+                if external_user:
+                    cancelled_prompt_pending = False
                 prompt_start = len(messages)
-                messages.append({"role": "user", "content": payload["content"]})
+                messages.append({"role": "user", "content": content})
+                safe_length = len(messages)
+                pending_call_ids.clear()
             elif event["kind"] == "model":
                 calls = payload.get("calls") or []
                 for call in calls:
                     call_names[call["id"]] = call["name"]
+                pending_call_ids = {call["id"] for call in calls}
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
                     "content": payload.get("text"),
@@ -734,6 +808,8 @@ def _session_messages(
                 if payload.get("response_items"):
                     assistant_message["response_items"] = payload["response_items"]
                 messages.append(assistant_message)
+                if not pending_call_ids:
+                    safe_length = len(messages)
             elif event["kind"] == "tool_observation":
                 call_id = payload["model_call_id"]
                 messages.append(
@@ -744,13 +820,40 @@ def _session_messages(
                         "content": payload["observation"],
                     }
                 )
+                pending_call_ids.discard(call_id)
+                if not pending_call_ids:
+                    safe_length = len(messages)
             elif event["kind"] == "final":
                 prompt_start = None
-            elif event["kind"] == "cancelled" and prompt_start is not None:
-                del messages[prompt_start:]
+                safe_length = len(messages)
+                pending_call_ids.clear()
+            elif event["kind"] == "cancelled":
+                if prompt_start is not None:
+                    if payload.get("mode") in {"graceful", "force"}:
+                        del messages[safe_length:]
+                    else:
+                        del messages[prompt_start:]
                 prompt_start = None
+                pending_call_ids.clear()
+                if payload.get("user_initiated") is True:
+                    cancelled_prompt_pending = True
         if reached_boundary or page["next_after"] is None:
-            return messages
+            return _SessionReplay(messages, cancelled_prompt_pending)
+
+
+def _session_messages(
+    kernel: Kernel,
+    session_id: str,
+    *,
+    through_seq: int | None = None,
+    _seen: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    return _session_replay(
+        kernel,
+        session_id,
+        through_seq=through_seq,
+        _seen=_seen,
+    ).messages
 
 
 class Conversation:
@@ -765,6 +868,7 @@ class Conversation:
         tool_runner: IsolatedToolRunner,
         _agent_coordinator: _AgentCoordinator,
         messages: list[dict[str, Any]] | None = None,
+        _cancelled_prompt_pending: bool = False,
     ) -> None:
         self.kernel = kernel
         self.model_session = model_session
@@ -779,24 +883,23 @@ class Conversation:
         if parent_session_id is not None:
             self.messages.insert(0, _parent_session_message(parent_session_id))
         self._run_lock = Lock()
-        self._current_token: _CancellationToken | None = None
+        self._current_token: _RolloutReservation | None = None
         self._current_agent_budget: _AgentLaunchBudget | None = None
+        self._cancelled_prompt_pending = _cancelled_prompt_pending
+        self._inherited_cancelled_prompt_pending = _cancelled_prompt_pending
         self._foreground_children: set[Conversation] = set()
         self._foreground_children_by_origin: dict[str | None, set[Conversation]] = {}
         self._active_tool_session_prompts: dict[str | None, int] = {}
         self._cancelled_tool_prompt_origins: set[str | None] = set()
         self._closed = False
 
-    def send(
+    def _reserve_rollout(
         self,
-        prompt: str,
         *,
-        on_event: EventSink | None = None,
         _agent_budget: _AgentLaunchBudget | None = None,
-        _prompt_origin: tuple[str, str | None] | None = None,
-    ) -> RunResult:
-        """Send one user message and run until the model returns final text."""
-        token = _CancellationToken()
+    ) -> _RolloutReservation:
+        """Reserve one rollout synchronously before its worker is dispatched."""
+        token = _RolloutReservation()
         self._agent_coordinator.enter_rollout(self.session_id)
         try:
             with self._run_lock:
@@ -809,12 +912,37 @@ class Conversation:
                 self._current_token = token
                 self._current_agent_budget = _agent_budget or _AgentLaunchBudget()
                 self._refresh_messages()
-            message_start = len(self.messages)
+        except Exception:
+            with self._run_lock:
+                if self._current_token is token:
+                    self._current_token = None
+                    self._current_agent_budget = None
+            self._agent_coordinator.exit_rollout(self.session_id)
+            raise
+        return token
+
+    def send(
+        self,
+        prompt: str,
+        *,
+        on_event: EventSink | None = None,
+        _agent_budget: _AgentLaunchBudget | None = None,
+        _prompt_origin: tuple[str, str | None] | None = None,
+        _rollout: _RolloutReservation | None = None,
+    ) -> RunResult:
+        """Send one user message and run until the model returns final text."""
+        token = _rollout or self._reserve_rollout(_agent_budget=_agent_budget)
+        with self._run_lock:
+            if self._current_token is not token:
+                raise ToolboxError(
+                    "conversation_busy", "rollout reservation is no longer active"
+                )
+        try:
             try:
                 return self._run(prompt, on_event, token, _prompt_origin)
             except RunCancelled as error:
-                del self.messages[message_start:]
-                self._append(on_event, "cancelled", error.to_dict()["error"])
+                self._append(on_event, "cancelled", error.event_payload())
+                self._refresh_messages()
                 raise
         finally:
             with self._run_lock:
@@ -823,13 +951,22 @@ class Conversation:
                         self.model_session.reset_cancellation()
                     except Exception:
                         pass
+                    reset_tools = getattr(
+                        self.tool_runner, "reset_foreground_cancellation", None
+                    )
+                    if callable(reset_tools):
+                        reset_tools(self.session_id)
                     self._current_token = None
                     self._current_agent_budget = None
             self._agent_coordinator.exit_rollout(self.session_id)
 
     def _refresh_messages(self) -> None:
         """Refresh this handle from durable history while its rollout is reserved."""
-        messages = _session_messages(self.kernel, self.session_id)
+        replay = _session_replay(self.kernel, self.session_id)
+        messages = replay.messages
+        self._cancelled_prompt_pending = (
+            replay.cancelled_prompt_pending or self._inherited_cancelled_prompt_pending
+        )
         parent_session_id = self.kernel.session_metadata(self.session_id)[
             "parent_session_id"
         ]
@@ -842,13 +979,21 @@ class Conversation:
         with self._run_lock:
             return self._current_agent_budget or _AgentLaunchBudget()
 
-    def cancel(self) -> bool:
+    def request_graceful_stop(self, *, user_initiated: bool = False) -> bool:
+        """Stop after the active model turn and its requested tools finish."""
+        with self._run_lock:
+            token = self._current_token
+            if token is None:
+                return False
+            return token.request_graceful(user_initiated=user_initiated)
+
+    def cancel(self, *, user_initiated: bool = False) -> bool:
         """Request cancellation of the active model or tool rollout."""
         with self._run_lock:
             token = self._current_token
             if token is None:
                 return False
-            self._cancel_locked(token)
+            self._cancel_locked(token, user_initiated=user_initiated)
             return True
 
     def close(self) -> None:
@@ -864,8 +1009,16 @@ class Conversation:
                     child.close()
         self.model_session.close()
 
-    def _cancel_locked(self, token: _CancellationToken) -> None:
-        token.cancel()
+    def _cancel_locked(
+        self,
+        token: _RolloutReservation,
+        *,
+        user_initiated: bool = False,
+    ) -> None:
+        token.cancel(user_initiated=user_initiated)
+        cancel_tools = getattr(self.tool_runner, "cancel_foreground", None)
+        if callable(cancel_tools):
+            cancel_tools(self.session_id)
         for child in tuple(self._foreground_children):
             child.close()
         try:
@@ -941,11 +1094,19 @@ class Conversation:
         self,
         prompt: str,
         on_event: EventSink | None,
-        token: _CancellationToken,
+        token: _RolloutReservation,
         prompt_origin: tuple[str, str | None] | None,
     ) -> RunResult:
-        self.messages.append({"role": "user", "content": prompt})
+        decorate_prompt = self._cancelled_prompt_pending and prompt_origin is None
+        transmitted_prompt = (
+            _CANCELLED_PROMPT_HEADER + prompt if decorate_prompt else prompt
+        )
+        self.messages.append({"role": "user", "content": transmitted_prompt})
         user_payload: dict[str, Any] = {"content": prompt}
+        if decorate_prompt:
+            user_payload["cancelled_previous_turn"] = True
+            self._cancelled_prompt_pending = False
+            self._inherited_cancelled_prompt_pending = False
         if prompt_origin is not None:
             user_payload["origin_session_id"] = prompt_origin[0]
             user_payload["origin_call_id"] = prompt_origin[1]
@@ -957,10 +1118,11 @@ class Conversation:
             try:
                 turn = self._respond(tools, on_event, token)
             except Exception as error:
-                if token.cancelled or isinstance(error, RunCancelled):
-                    raise RunCancelled from error
+                if isinstance(error, RunCancelled):
+                    raise
+                if token.cancelled:
+                    raise token.cancelled_error() from error
                 raise
-            token.check()
             calls = [
                 {"id": call.id, "name": call.name, "args": call.args}
                 for call in turn.calls
@@ -981,6 +1143,8 @@ class Conversation:
             if not turn.calls:
                 answer = turn.text or ""
                 return RunResult(self.session_id, answer, turn_number)
+
+            token.check()
 
             if len(turn.calls) > self.max_calls_per_turn:
                 observations: list[JsonValue] = [
@@ -1015,12 +1179,14 @@ class Conversation:
                         "content": observation,
                     }
                 )
+            if token.graceful_requested:
+                raise token.graceful_error()
 
     async def _execute_all(
         self,
         calls: tuple[ToolCall, ...],
         sink: EventSink | None,
-        token: _CancellationToken,
+        token: _RolloutReservation,
     ) -> list[JsonValue]:
         """Run one model-requested tool batch concurrently."""
         ordered_sink = (
@@ -1043,28 +1209,43 @@ class Conversation:
         self,
         tools: list[dict[str, Any]],
         sink: EventSink | None,
-        token: _CancellationToken,
+        token: _RolloutReservation,
     ) -> ModelTurn:
         token.check()
         self._emit_transient(sink, "model_started", {})
         completed: ModelTurn | None = None
-        for event in self.model_session._stream_with_recorded_input(
-            self.messages,
-            tools,
-            on_record=lambda kind, payload, seq: self._emit_model_record(
-                sink, kind, payload, seq
-            ),
-            cancelled=lambda: token.cancelled,
-        ):
-            token.check()
-            if event.text_delta:
-                self._emit_transient(sink, "model_delta", {"text": event.text_delta})
-            if event.turn is not None:
-                if completed is not None:
-                    raise ToolboxError(
-                        "invalid_model_stream", "model stream completed more than once"
+        partial_text: list[str] = []
+        try:
+            for event in self.model_session._stream_with_recorded_input(
+                self.messages,
+                tools,
+                on_record=lambda kind, payload, seq: self._emit_model_record(
+                    sink, kind, payload, seq
+                ),
+                cancelled=lambda: token.cancelled,
+            ):
+                if event.text_delta:
+                    partial_text.append(event.text_delta)
+                    if token.cancelled:
+                        raise token.cancelled_error(partial_text="".join(partial_text))
+                    self._emit_transient(
+                        sink, "model_delta", {"text": event.text_delta}
                     )
-                completed = event.turn
+                if event.turn is not None:
+                    if completed is not None:
+                        raise ToolboxError(
+                            "invalid_model_stream",
+                            "model stream completed more than once",
+                        )
+                    completed = event.turn
+        except Exception as error:
+            if isinstance(error, RunCancelled):
+                raise
+            if token.cancelled:
+                raise token.cancelled_error(
+                    partial_text="".join(partial_text)
+                ) from error
+            raise
         if completed is None:
             raise ToolboxError(
                 "invalid_model_stream", "model stream ended without a completed turn"
@@ -1082,7 +1263,7 @@ class Conversation:
         self,
         call: ToolCall,
         sink: EventSink | None,
-        token: _CancellationToken,
+        token: _RolloutReservation,
     ) -> JsonValue:
         if call.name not in MODEL_ACTION_NAMES:
             return {
@@ -1151,7 +1332,9 @@ class Conversation:
                 )
             return self.tool_runner.call(call.name, effective_args, **call_kwargs)
         except ToolboxError as error:
-            if token.cancelled or error.code == "cancelled":
+            if token.cancelled:
+                raise token.cancelled_error() from error
+            if error.code == "cancelled":
                 raise RunCancelled from error
             return error.to_dict()
         except Exception as error:  # Generated tools may raise anything.
@@ -1288,13 +1471,15 @@ class Harness:
             )
         model_session = provider.start_session(session_id=session_id)
         identifier = model_session.session_id
+        replay = _session_replay(self.kernel, identifier)
         return Conversation(
             self.kernel,
             model_session,
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
             _agent_coordinator=self._agent_coordinator,
-            messages=self._session_messages(identifier),
+            messages=replay.messages,
+            _cancelled_prompt_pending=replay.cancelled_prompt_pending,
         )
 
     def start_child(self, parent: Conversation) -> Conversation:
@@ -1313,6 +1498,7 @@ class Harness:
             max_calls_per_turn=self.max_calls_per_turn,
             tool_runner=self.tool_runner,
             _agent_coordinator=self._agent_coordinator,
+            _cancelled_prompt_pending=parent._cancelled_prompt_pending,
         )
 
     def _session_messages(self, session_id: str) -> list[dict[str, Any]]:

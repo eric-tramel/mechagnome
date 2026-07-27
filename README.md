@@ -87,7 +87,11 @@ those effort levels.
 
 TUI commands:
 
-- `Esc` stops the active tab's model stream or tool rollout.
+- `Esc` stops the active tab after its current agent turn (the model response
+  and requested foreground tools). Press it again while `stopping…` to
+  immediately cancel the model stream, foreground child agents, and foreground
+  tool processes. Forced partial model text remains in session history, and the
+  next transmitted user prompt is marked as following a cancelled turn.
 - `Ctrl+B` toggles the sidebar, which starts open. Its toolbox picker replaces
   the active stack with another registered toolbox; selecting a tool name opens
   that tool directly in tool management.

@@ -38,6 +38,51 @@ def kernel_at(tmp_path: Path, **kwargs: Any) -> Kernel:
     return Kernel(tmp_path / "toolbox.db", **kwargs)
 
 
+class _FakeProcess:
+    pid = 4242
+
+    def poll(self) -> int | None:
+        return None
+
+    def wait(self, timeout: float) -> int:
+        return 0
+
+
+def test_foreground_force_cancel_signals_sigkill_first(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    runner = IsolatedToolRunner(kernel_at(tmp_path))
+    process = _FakeProcess()
+    signals: list[signal.Signals | int] = []
+    monkeypatch.setattr(
+        isolation_module.os,
+        "killpg",
+        lambda pid, signal_number: signals.append(signal_number),
+    )
+
+    runner._register_foreground("session", process)  # type: ignore[arg-type]
+    runner.cancel_foreground("session")
+
+    assert signals == [signal.SIGKILL]
+
+
+def test_normal_process_cleanup_still_signals_sigterm_first(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    runner = IsolatedToolRunner(kernel_at(tmp_path))
+    process = _FakeProcess()
+    signals: list[signal.Signals | int] = []
+    monkeypatch.setattr(
+        isolation_module.os,
+        "killpg",
+        lambda pid, signal_number: signals.append(signal_number),
+    )
+
+    runner._stop_process_group(process)  # type: ignore[arg-type]
+
+    assert signals[0] == signal.SIGTERM
+
+
 class AnnotationOnlyProvider:
     """Fail loudly if an annotation-only session handle tries to prompt."""
 
