@@ -46,6 +46,7 @@ from mechagnome import (
 from mechagnome import __main__ as cli
 from mechagnome import openrouter as openrouter_module
 from mechagnome import tui as tui_module
+from mechagnome.bootstrap import CORE_NAMES
 from mechagnome.harness import AgentEvent
 from mechagnome.isolation import IsolatedToolRunner
 from mechagnome.openrouter import (
@@ -319,15 +320,7 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert "async def main(input, ctx)" in system_prompt
     assert "Await ctx.call_tool" in " ".join(system_prompt.split())
     tools = {tool["name"]: tool for tool in captured["body"]["tools"]}
-    assert list(tools) == [
-        "help",
-        "list_tools",
-        "list_tool_namespaces",
-        "search_tools",
-        "view_tool",
-        "write_tool",
-        "call_tool",
-    ]
+    assert tuple(tools) == CORE_NAMES
     write_schema = tools["write_tool"]["parameters"]["properties"]["input_schema"]
     namespaces_schema = tools["write_tool"]["parameters"]["properties"]["namespaces"]
     namespace_filter = tools["search_tools"]["parameters"]["properties"]["namespace"]
@@ -700,7 +693,7 @@ def test_openrouter_adapter_serializes_prior_tool_results(tmp_path: Path) -> Non
     assert model.respond(messages, kernel.tool_definitions()).text == "Ready."
 
 
-def test_openrouter_preserves_reasoning_across_tool_continuation(
+def test_openrouter_does_not_replay_reasoning_across_tool_continuation(
     tmp_path: Path,
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
@@ -739,8 +732,8 @@ def test_openrouter_preserves_reasoning_across_tool_continuation(
                     "item": response_call,
                 },
             )
-        assert body["input"][-3] == detail
         assert body["input"][-2] == response_call
+        assert detail not in body["input"]
         assert body["reasoning"] == {"effort": "high"}
         return sse_response(
             {
@@ -1947,7 +1940,9 @@ def test_tool_timeout_cancels_and_resets_cooperative_model_provider(
         },
     )
     provider = BlockingProvider()
-    runner = IsolatedToolRunner(kernel, timeout=0.2)
+    # Allow process startup under a loaded test runner; the provider itself
+    # remains blocked until the runner's timeout cancellation is delivered.
+    runner = IsolatedToolRunner(kernel, timeout=1)
 
     with pytest.raises(ToolboxError) as error:
         runner.call_with_model_provider(

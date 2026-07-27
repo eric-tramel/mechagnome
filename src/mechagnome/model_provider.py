@@ -118,8 +118,8 @@ class _CompletionProvider(Protocol):
         """Return text for a validated chat-message sequence."""
         ...
 
-    def run_agent(self, prompt: str) -> str:
-        """Run a tool-capable child agent in a durable conversation session."""
+    def prompt_session(self, args: dict[str, Any]) -> Any:
+        """Continue, spawn, fork, or inspect a durable conversation."""
         ...
 
     def for_origin(self, call_id: str) -> _CompletionProvider:
@@ -166,7 +166,27 @@ class ToolModelProvider:
 
     async def run_agent(self, prompt: str) -> str:
         """Run a tool-capable agent in a durable child session."""
-        return await asyncio.to_thread(self._capability.run_agent, prompt)
+        if not isinstance(prompt, str) or not prompt:
+            raise _error("invalid_model_request")
+        try:
+            result = await asyncio.to_thread(
+                self._capability.prompt_session,
+                {"prompt": prompt, "mode": "spawn", "detach": False},
+            )
+        except ToolboxError as error:
+            code = (
+                error.code if error.code in _ERROR_MESSAGES else "model_provider_failed"
+            )
+            raise _error(code) from error
+        except Exception as error:
+            raise _error("model_provider_failed") from error
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "succeeded"
+            or not isinstance(result.get("result"), str)
+        ):
+            raise _error("model_provider_failed")
+        return result["result"]
 
 
 _USE_ROOT_TRANSPORT = object()
@@ -248,7 +268,10 @@ class ModelProvider:
         *,
         session_id: str | None = None,
         parent_scope: InvocationScope | None = None,
+        origin_scope: InvocationScope | None = None,
         origin_call_id: str | None = None,
+        context_source_session_id: str | None = None,
+        context_through_seq: int | None = None,
     ) -> ModelSession:
         """Create a root/child conversation or resume an existing root."""
         if parent_scope is not None:
@@ -259,7 +282,10 @@ class ModelProvider:
             identifier = self.kernel.create_child_session(
                 parent_scope,
                 kind="conversation",
+                origin_scope=origin_scope,
                 origin_call_id=origin_call_id,
+                context_source_session_id=context_source_session_id,
+                context_through_seq=context_through_seq,
             )
         else:
             identifier = self.kernel.create_session(session_id, kind="conversation")
@@ -471,7 +497,12 @@ class ModelSession:
         self,
         scope: InvocationScope | None = None,
         *,
-        agent_runner: Callable[[InvocationScope, str | None, str], str] | None = None,
+        session_prompter: (
+            Callable[[InvocationScope, str | None, dict[str, Any]], Any] | None
+        ) = None,
+        session_prompt_canceller: (
+            Callable[[InvocationScope, str | None], None] | None
+        ) = None,
     ) -> _BoundedModelProvider:
         active_scope = (
             scope
@@ -482,7 +513,8 @@ class ModelSession:
             _SessionCompletionProvider(
                 self.provider,
                 active_scope,
-                agent_runner=agent_runner,
+                session_prompter=session_prompter,
+                session_prompt_canceller=session_prompt_canceller,
             )
         )
 
@@ -539,6 +571,30 @@ def _model_payload(turn: ModelTurn) -> dict[str, Any]:
     return payload
 
 
+class _SessionPromptState:
+    """Track active brokered session prompts across provider binding clones."""
+
+    def __init__(self) -> None:
+        self._active: dict[str | None, int] = {}
+        self._lock = Lock()
+
+    def enter(self, origin_call_id: str | None) -> None:
+        with self._lock:
+            self._active[origin_call_id] = self._active.get(origin_call_id, 0) + 1
+
+    def exit(self, origin_call_id: str | None) -> None:
+        with self._lock:
+            remaining = self._active[origin_call_id] - 1
+            if remaining:
+                self._active[origin_call_id] = remaining
+            else:
+                del self._active[origin_call_id]
+
+    def active_origins(self) -> tuple[str | None, ...]:
+        with self._lock:
+            return tuple(self._active)
+
+
 class _SessionCompletionProvider:
     """Restricted child-session capability bound to trusted host context."""
 
@@ -547,12 +603,20 @@ class _SessionCompletionProvider:
         provider: ModelProvider,
         scope: InvocationScope,
         origin_call_id: str | None = None,
-        agent_runner: Callable[[InvocationScope, str | None, str], str] | None = None,
+        session_prompter: (
+            Callable[[InvocationScope, str | None, dict[str, Any]], Any] | None
+        ) = None,
+        session_prompt_canceller: (
+            Callable[[InvocationScope, str | None], None] | None
+        ) = None,
+        session_prompt_state: _SessionPromptState | None = None,
     ) -> None:
         self._provider = provider
         self._scope = scope
         self._origin_call_id = origin_call_id
-        self._agent_runner = agent_runner
+        self._session_prompter = session_prompter
+        self._session_prompt_canceller = session_prompt_canceller
+        self._session_prompt_state = session_prompt_state or _SessionPromptState()
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         return self._provider._complete(
@@ -566,7 +630,9 @@ class _SessionCompletionProvider:
             self._provider,
             self._scope,
             call_id,
-            self._agent_runner,
+            self._session_prompter,
+            self._session_prompt_canceller,
+            self._session_prompt_state,
         )
 
     def for_scope(self, scope: InvocationScope) -> _SessionCompletionProvider:
@@ -574,23 +640,30 @@ class _SessionCompletionProvider:
             self._provider,
             scope,
             self._origin_call_id,
-            self._agent_runner,
+            self._session_prompter,
+            self._session_prompt_canceller,
+            self._session_prompt_state,
         )
 
-    def run_agent(self, prompt: str) -> str:
-        if not isinstance(prompt, str) or not prompt:
-            raise _error("invalid_model_request")
-        if self._agent_runner is None:
+    def prompt_session(self, args: dict[str, Any]) -> Any:
+        if self._session_prompter is None:
             raise _error("model_provider_unavailable")
         if not self._provider.allow_tool_agents:
             raise _error("model_provider_unavailable")
-        return self._agent_runner(
-            self._scope,
-            self._origin_call_id,
-            prompt,
-        )
+        self._session_prompt_state.enter(self._origin_call_id)
+        try:
+            return self._session_prompter(
+                self._scope,
+                self._origin_call_id,
+                args,
+            )
+        finally:
+            self._session_prompt_state.exit(self._origin_call_id)
 
     def cancel_current(self) -> None:
+        if self._session_prompt_canceller is not None:
+            for origin_call_id in self._session_prompt_state.active_origins():
+                self._session_prompt_canceller(self._scope, origin_call_id)
         ModelSession(self._provider, self._scope.session_id).cancel_current()
 
     def reset_cancellation(self) -> None:
@@ -602,7 +675,7 @@ class _SessionCompletionProvider:
         targets = []
         if self._provider.completion_transport is not None:
             targets.append(session._completion_transport)
-        if self._agent_runner is not None and self._provider.allow_tool_agents:
+        if self._session_prompter is not None and self._provider.allow_tool_agents:
             targets.append(session.transport)
         return all(
             all(
@@ -655,7 +728,7 @@ class _UnavailableModelProvider:
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         raise _error("model_provider_unavailable")
 
-    def run_agent(self, prompt: str) -> str:
+    def prompt_session(self, args: dict[str, Any]) -> Any:
         raise _error("model_provider_unavailable")
 
     def for_origin(self, call_id: str) -> _UnavailableModelProvider:
@@ -707,21 +780,20 @@ class _BoundedModelProvider:
             raise _error("model_provider_limit")
         return result
 
-    def run_agent(self, prompt: str) -> str:
+    def prompt_session(self, args: dict[str, Any]) -> Any:
         self._budget.consume()
-        if not isinstance(prompt, str) or not prompt:
+        if not isinstance(args, dict):
             raise _error("invalid_model_request")
+        result = self._provider.prompt_session(args)
         try:
-            result = self._provider.run_agent(prompt)
-        except ToolboxError as error:
-            code = (
-                error.code if error.code in _ERROR_MESSAGES else "model_provider_failed"
-            )
-            raise _error(code) from error
-        except Exception as error:
+            json.dumps(
+                result,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as error:
             raise _error("model_provider_failed") from error
-        if not isinstance(result, str):
-            raise _error("model_provider_failed")
         return result
 
     def for_origin(self, call_id: str) -> _BoundedModelProvider:
@@ -846,27 +918,48 @@ class _ModelProviderProxy:
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         return self._request("complete", messages=messages)
 
-    def run_agent(self, prompt: str) -> str:
-        return self._request("run_agent", prompt=prompt)
+    def prompt_session(self, args: dict[str, Any]) -> Any:
+        payload = {
+            "op": "prompt_session",
+            "args": args,
+            "origin_call_id": self._origin_call_id,
+        }
+        with self._lock:
+            _send_frame(self._connection, payload)
+            response = _receive_frame(self._connection)
+        if response is None or response.get("ok") not in {True, False}:
+            raise _error("model_provider_protocol")
+        if response["ok"] is True:
+            if set(response) != {"ok", "result"}:
+                raise _error("model_provider_protocol")
+            return response["result"]
+        if set(response) != {"ok", "error"} or not isinstance(
+            response.get("error"), dict
+        ):
+            raise _error("model_provider_protocol")
+        failure = response["error"]
+        if (
+            set(failure) != {"code", "message", "details"}
+            or not isinstance(failure.get("code"), str)
+            or not isinstance(failure.get("message"), str)
+            or not isinstance(failure.get("details"), dict)
+        ):
+            raise _error("model_provider_protocol")
+        raise ToolboxError(failure["code"], failure["message"], **failure["details"])
 
     def _request(
         self,
         operation: str,
         *,
         messages: Sequence[Mapping[str, str]] | None = None,
-        prompt: str | None = None,
     ) -> str:
         payload: dict[str, Any] = {
             "op": operation,
             "origin_call_id": self._origin_call_id,
         }
-        if operation == "complete":
-            assert messages is not None
-            payload["messages"] = _normalized_messages(messages)
-        else:
-            if not isinstance(prompt, str) or not prompt:
-                raise _error("invalid_model_request")
-            payload["prompt"] = prompt
+        assert operation == "complete"
+        assert messages is not None
+        payload["messages"] = _normalized_messages(messages)
         with self._lock:
             _send_frame(self._connection, payload)
             response = _receive_frame(self._connection)
@@ -941,8 +1034,8 @@ class _ModelProviderBroker:
         expected = (
             {"op", "messages", "origin_call_id"}
             if operation == "complete"
-            else {"op", "prompt", "origin_call_id"}
-            if operation == "run_agent"
+            else {"op", "args", "origin_call_id"}
+            if operation == "prompt_session"
             else set()
         )
         if set(request) != expected or (
@@ -955,12 +1048,15 @@ class _ModelProviderBroker:
             origin_call_id = request["origin_call_id"]
             if origin_call_id is not None:
                 provider = provider.for_origin(origin_call_id)
-            text = (
-                provider.complete(request["messages"])
-                if operation == "complete"
-                else provider.run_agent(request["prompt"])
-            )
+            if operation == "prompt_session":
+                return {
+                    "ok": True,
+                    "result": provider.prompt_session(request["args"]),
+                }
+            text = provider.complete(request["messages"])
         except ToolboxError as error:
+            if operation == "prompt_session":
+                return {"ok": False, "error": error.to_dict()["error"]}
             code = (
                 error.code if error.code in _ERROR_MESSAGES else "model_provider_failed"
             )

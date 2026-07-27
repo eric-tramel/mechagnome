@@ -34,9 +34,10 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 13
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
-_SESSION_ANNOTATION_FIELDS = frozenset({"title", "description"})
+_SESSION_METADATA_LIMITS = {"title": 256, "description": 4096}
+_SESSION_ANNOTATION_FIELDS = frozenset(_SESSION_METADATA_LIMITS)
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _TOOLBOX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 _NAMESPACE_PATH = re.compile(NAMESPACE_PATH_PATTERN)
@@ -115,13 +116,182 @@ def _json(value: Any) -> str:
         ) from error
 
 
-class SessionAccess:
-    """Bounded session access exposed to every tool."""
+def _normalize_session_metadata(changes: Any) -> dict[str, str | None]:
+    """Validate and normalize mutable session display metadata."""
+    if not isinstance(changes, dict) or not changes:
+        raise ToolboxError(
+            "invalid_session_metadata",
+            "session metadata update requires title or description",
+        )
+    if not all(isinstance(name, str) for name in changes):
+        raise ToolboxError(
+            "invalid_session_metadata",
+            "session metadata keys must be strings",
+        )
+    unknown = set(changes) - _SESSION_METADATA_LIMITS.keys()
+    if unknown:
+        raise ToolboxError(
+            "invalid_session_metadata",
+            f"unsupported session metadata: {', '.join(sorted(unknown))}",
+        )
+    normalized: dict[str, str | None] = {}
+    for name, value in changes.items():
+        if value is not None and not isinstance(value, str):
+            raise ToolboxError(
+                "invalid_session_metadata",
+                f"session {name} must be a string or null",
+            )
+        if value is not None:
+            try:
+                size = len(value.encode("utf-8"))
+            except UnicodeError as error:
+                raise ToolboxError(
+                    "invalid_session_metadata",
+                    f"session {name} is not valid UTF-8",
+                ) from error
+            if size > _SESSION_METADATA_LIMITS[name]:
+                raise ToolboxError(
+                    "invalid_session_metadata",
+                    f"session {name} exceeds {_SESSION_METADATA_LIMITS[name]} bytes",
+                )
+        normalized[name] = value
+    return normalized
 
-    def __init__(self, kernel: Kernel, session_id: str, call_id: str) -> None:
+
+class ToolSession:
+    """One durable session exposed through the authored-tool context."""
+
+    def __init__(
+        self,
+        kernel: Kernel,
+        provider: _BoundedModelProvider,
+        metadata: dict[str, Any],
+        caller_session_id: str,
+        actor_call_id: str | None = None,
+    ) -> None:
         self._kernel = kernel
+        self._provider = provider
+        self._metadata = metadata
+        self._caller_session_id = caller_session_id
+        self._actor_call_id = actor_call_id
+        self.id = str(metadata["id"])
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Return durable identity, lineage, and inherited-context metadata."""
+        return dict(self._metadata)
+
+    @property
+    def kind(self) -> str:
+        return str(self.metadata["kind"])
+
+    @property
+    def parent_id(self) -> str | None:
+        value = self.metadata["parent_session_id"]
+        return None if value is None else str(value)
+
+    @property
+    def root_id(self) -> str:
+        return str(self.metadata["root_session_id"])
+
+    @property
+    def origin_session_id(self) -> str | None:
+        value = self.metadata["origin_session_id"]
+        return None if value is None else str(value)
+
+    @property
+    def origin_call_id(self) -> str | None:
+        value = self.metadata["origin_call_id"]
+        return None if value is None else str(value)
+
+    @property
+    def title(self) -> str | None:
+        value = self.metadata["title"]
+        return None if value is None else str(value)
+
+    @property
+    def description(self) -> str | None:
+        value = self.metadata["description"]
+        return None if value is None else str(value)
+
+    def update_metadata(
+        self,
+        *,
+        expected_revision: int | None = None,
+        **changes: str | None,
+    ) -> dict[str, Any]:
+        """Update human-facing metadata and refresh this handle's snapshot."""
+        self._metadata = self._kernel._update_session_metadata(
+            self.id,
+            changes,
+            caller_session_id=self._caller_session_id,
+            actor_call_id=self._actor_call_id,
+            expected_revision=expected_revision,
+        )
+        return self.metadata
+
+    def read(self, after: int = 0, limit: int = 50) -> dict[str, Any]:
+        """Read a page of committed events from this session."""
+        return self._kernel.read_session(self.id, after=after, limit=limit)
+
+    async def prompt(
+        self,
+        prompt: str,
+        *,
+        mode: str = "continue",
+        detach: bool = False,
+        metadata: dict[str, str | None] | None = None,
+    ) -> JsonValue:
+        """Continue, spawn from, or fork this durable conversation."""
+        request: dict[str, Any] = {
+            "session_id": self.id,
+            "prompt": prompt,
+            "mode": mode,
+            "detach": detach,
+        }
+        if metadata is not None:
+            request["metadata"] = metadata
+        return await asyncio.to_thread(
+            self._provider.prompt_session,
+            request,
+        )
+
+
+class SessionAccess:
+    """Bounded durable-session access exposed to every authored tool."""
+
+    def __init__(
+        self,
+        kernel: Kernel,
+        session_id: str,
+        call_id: str,
+        provider: _BoundedModelProvider,
+    ) -> None:
+        self._kernel = kernel
+        self._provider = provider
         self._call_id = call_id
         self.id = session_id
+
+    def get(self, session_id: str | None = None) -> ToolSession:
+        """Return a stable handle for the current or selected durable session."""
+        identifier = self.id if session_id is None else session_id
+        if not isinstance(identifier, str) or not identifier:
+            raise ToolboxError("unknown_session", f"unknown session: {identifier}")
+        metadata = self._kernel.session_metadata(identifier)
+        return ToolSession(
+            self._kernel,
+            self._provider,
+            metadata,
+            self.id,
+            self._call_id,
+        )
+
+    async def inspect(self, job_id: str) -> JsonValue:
+        """Inspect one detached session-prompt job visible to this call tree."""
+        return await asyncio.to_thread(
+            self._provider.prompt_session,
+            {"job_id": job_id},
+        )
 
     def list(self, limit: int = 20, cursor: int = 0) -> dict[str, Any]:
         """List saved sessions in reverse creation order."""
@@ -193,12 +363,11 @@ class ToolContext:
         self._depth = depth
         self._logical_slot = logical_slot
         self.caller_session_id = state.session_id
-        self.sessions = SessionAccess(kernel, state.session_id, call_id)
         from mechagnome.model_provider import ToolModelProvider
 
-        self.model_provider = ToolModelProvider(
-            state.model_provider.for_origin(call_id)
-        )
+        provider = state.model_provider.for_origin(call_id)
+        self.sessions = SessionAccess(kernel, state.session_id, call_id, provider)
+        self.model_provider = ToolModelProvider(provider)
 
     @property
     def kernel(self) -> _KernelCapability:
@@ -486,6 +655,15 @@ class Kernel:
                     if version == 9:
                         self._migrate_v9(connection)
                         version = 10
+                    if version == 10:
+                        self._migrate_v10(connection)
+                        version = 11
+                    if version == 11:
+                        self._migrate_v11(connection)
+                        version = 12
+                    if version == 12:
+                        self._migrate_v12(connection)
+                        version = 13
                     if version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -586,9 +764,53 @@ class Kernel:
         for row in connection.execute("SELECT id FROM toolboxes").fetchall():
             self._seed_missing_core(connection, str(row["id"]))
 
+    def _migrate_v9(self, connection: sqlite3.Connection) -> None:
+        """Reserve and seed the run_agent core slot."""
+        self._reserve_new_core_names(connection, ("run_agent",))
+        for row in connection.execute("SELECT id FROM toolboxes").fetchall():
+            self._seed_missing_core(connection, str(row["id"]))
+
+    def _migrate_v10(self, connection: sqlite3.Connection) -> None:
+        """Add durable origin and fork-context metadata to sessions."""
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        if "origin_session_id" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN origin_session_id TEXT "
+                "REFERENCES sessions(id)"
+            )
+        if "context_source_session_id" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN context_source_session_id TEXT "
+                "REFERENCES sessions(id)"
+            )
+        if "context_through_seq" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN context_through_seq INTEGER"
+            )
+        connection.execute(
+            "UPDATE sessions SET origin_session_id = parent_session_id "
+            "WHERE origin_call_id IS NOT NULL AND origin_session_id IS NULL"
+        )
+        connection.execute("DROP TRIGGER IF EXISTS sessions_lineage_immutable")
+        self._create_session_indexes_and_triggers(connection)
+
     @staticmethod
-    def _migrate_v9(connection: sqlite3.Connection) -> None:
-        """Add mutable, revisioned annotations to durable sessions."""
+    def _migrate_v11(connection: sqlite3.Connection) -> None:
+        """Add mutable, human-facing session metadata."""
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        if "title" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+        if "description" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN description TEXT")
+
+    def _migrate_v12(self, connection: sqlite3.Connection) -> None:
+        """Add revisioned annotations and ensure the run_agent core slot."""
         columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(sessions)")
@@ -603,6 +825,9 @@ class Kernel:
                 "DEFAULT 0 CHECK(typeof(annotation_revision) = 'integer' "
                 "AND annotation_revision >= 0)"
             )
+        self._reserve_new_core_names(connection, ("run_agent",))
+        for row in connection.execute("SELECT id FROM toolboxes").fetchall():
+            self._seed_missing_core(connection, str(row["id"]))
 
     @staticmethod
     def _reserve_new_core_names(
@@ -686,18 +911,55 @@ class Kernel:
             "CREATE INDEX IF NOT EXISTS sessions_parent_created "
             "ON sessions(parent_session_id, created_at DESC)"
         )
+        available = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        candidates = (
+            "parent_session_id",
+            "kind",
+            "origin_session_id",
+            "origin_call_id",
+            "context_source_session_id",
+            "context_through_seq",
+        )
+        immutable = tuple(name for name in candidates if name in available)
+        updated = ", ".join(immutable)
+        changed = " OR ".join(f"OLD.{name} IS NOT NEW.{name}" for name in immutable)
         connection.execute(
-            """
+            f"""
             CREATE TRIGGER IF NOT EXISTS sessions_lineage_immutable
-            BEFORE UPDATE OF parent_session_id, kind, origin_call_id ON sessions
-            WHEN OLD.parent_session_id IS NOT NEW.parent_session_id
-              OR OLD.kind IS NOT NEW.kind
-              OR OLD.origin_call_id IS NOT NEW.origin_call_id
+            BEFORE UPDATE OF {updated} ON sessions
+            WHEN {changed}
             BEGIN
                 SELECT RAISE(ABORT, 'session lineage is immutable');
             END
             """
         )
+        if {
+            "parent_session_id",
+            "context_source_session_id",
+            "context_through_seq",
+        } <= available:
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS sessions_context_valid
+                BEFORE INSERT ON sessions
+                WHEN (
+                    NEW.context_source_session_id IS NULL
+                    AND NEW.context_through_seq IS NOT NULL
+                ) OR (
+                    NEW.context_source_session_id IS NOT NULL
+                    AND NEW.context_through_seq IS NULL
+                ) OR (
+                    NEW.context_source_session_id IS NOT NULL
+                    AND NEW.context_source_session_id IS NOT NEW.parent_session_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid session context');
+                END
+                """
+            )
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
@@ -765,13 +1027,25 @@ class Kernel:
                 parent_session_id TEXT REFERENCES sessions(id),
                 kind TEXT NOT NULL DEFAULT 'generic'
                     CHECK(kind IN ('generic', 'conversation', 'completion')),
+                origin_session_id TEXT REFERENCES sessions(id),
                 origin_call_id TEXT,
+                context_source_session_id TEXT REFERENCES sessions(id),
+                context_through_seq INTEGER
+                    CHECK(context_through_seq IS NULL OR context_through_seq >= 0),
                 title TEXT,
                 description TEXT,
                 annotation_revision INTEGER NOT NULL DEFAULT 0
                     CHECK(typeof(annotation_revision) = 'integer'
                         AND annotation_revision >= 0),
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                CHECK(
+                    (context_source_session_id IS NULL) =
+                    (context_through_seq IS NULL)
+                ),
+                CHECK(
+                    context_source_session_id IS NULL
+                    OR context_source_session_id = parent_session_id
+                )
             )
             """,
             """
@@ -921,7 +1195,10 @@ class Kernel:
             "legacy_sessions",
         ):
             connection.execute(f"DROP TABLE {table}")
-        self._reserve_new_core_names(connection, ("list_tools", "list_tool_namespaces"))
+        self._reserve_new_core_names(
+            connection,
+            ("list_tools", "list_tool_namespaces", "delete_tool", "run_agent"),
+        )
         self._seed_missing_core(connection, toolbox_id)
         self._backfill_namespaces(connection)
 
@@ -1192,25 +1469,58 @@ class Kernel:
 
     def create_child_session(
         self,
-        scope: InvocationScope,
+        parent_scope: InvocationScope,
         *,
         kind: str,
+        origin_scope: InvocationScope | None = None,
         origin_call_id: str | None = None,
+        context_source_session_id: str | None = None,
+        context_through_seq: int | None = None,
     ) -> str:
         """Create a host-identified child inheriting one frozen invocation scope."""
         if kind not in _SESSION_KINDS:
             raise ToolboxError("invalid_session_kind", f"invalid child kind: {kind}")
+        if (context_source_session_id is None) != (context_through_seq is None):
+            raise ToolboxError(
+                "invalid_session_context",
+                "fork context requires both a source session and event sequence",
+            )
+        if context_through_seq is not None and (
+            isinstance(context_through_seq, bool)
+            or not isinstance(context_through_seq, int)
+            or context_through_seq < 0
+        ):
+            raise ToolboxError(
+                "invalid_session_context",
+                "fork context sequence must be a non-negative integer",
+            )
+        caller_scope = origin_scope or parent_scope
         identifier = uuid.uuid4().hex
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 parent = connection.execute(
-                    "SELECT 1 FROM sessions WHERE id = ?", (scope.session_id,)
+                    "SELECT 1 FROM sessions WHERE id = ?", (parent_scope.session_id,)
                 ).fetchone()
                 if parent is None:
                     raise ToolboxError(
-                        "unknown_session", f"unknown session: {scope.session_id}"
+                        "unknown_session", f"unknown session: {parent_scope.session_id}"
                     )
+                if context_source_session_id is not None:
+                    if context_source_session_id != parent_scope.session_id:
+                        raise ToolboxError(
+                            "invalid_session_context",
+                            "fork context must come from the child session's parent",
+                        )
+                    latest = self._latest_completed_sequence(
+                        connection, context_source_session_id
+                    )
+                    if context_through_seq != latest:
+                        raise ToolboxError(
+                            "invalid_session_context",
+                            "fork context must end at the latest completed turn",
+                            latest_completed_seq=latest,
+                        )
                 if origin_call_id is not None:
                     origin = connection.execute(
                         """
@@ -1241,7 +1551,7 @@ class Kernel:
                                 )
                           )
                         """,
-                        (scope.session_id, origin_call_id),
+                        (caller_scope.session_id, origin_call_id),
                     ).fetchone()
                     if origin is None:
                         raise ToolboxError(
@@ -1251,15 +1561,20 @@ class Kernel:
                 connection.execute(
                     """
                     INSERT INTO sessions (
-                        id, cwd, parent_session_id, kind, origin_call_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        id, cwd, parent_session_id, kind, origin_session_id,
+                        origin_call_id, context_source_session_id,
+                        context_through_seq, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         identifier,
-                        scope.cwd,
-                        scope.session_id,
+                        parent_scope.cwd,
+                        parent_scope.session_id,
                         kind,
+                        caller_scope.session_id if origin_call_id is not None else None,
                         origin_call_id,
+                        context_source_session_id,
+                        context_through_seq,
                         _now(),
                     ),
                 )
@@ -1270,7 +1585,7 @@ class Kernel:
                     """,
                     [
                         (identifier, position, toolbox_id)
-                        for position, toolbox_id in enumerate(scope.toolbox_ids)
+                        for position, toolbox_id in enumerate(parent_scope.toolbox_ids)
                     ],
                 )
                 connection.commit()
@@ -1278,6 +1593,27 @@ class Kernel:
                 connection.rollback()
                 raise
         return identifier
+
+    @staticmethod
+    def _latest_completed_sequence(
+        connection: sqlite3.Connection, session_id: str
+    ) -> int:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS seq FROM events "
+            "WHERE session_id = ? AND kind IN ('final', 'cancelled')",
+            (session_id,),
+        ).fetchone()
+        return int(row["seq"])
+
+    def latest_completed_sequence(self, session_id: str) -> int:
+        """Return the durable boundary of the latest completed conversation turn."""
+        with closing(self._connect()) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if exists is None:
+                raise ToolboxError("unknown_session", f"unknown session: {session_id}")
+            return self._latest_completed_sequence(connection, session_id)
 
     def active_toolboxes(self, session_id: str) -> list[dict[str, Any]]:
         """Return one session's ordered toolbox selection."""
@@ -1517,7 +1853,9 @@ class Kernel:
             rows = connection.execute(
                 """
                 SELECT sessions.id, sessions.cwd, sessions.parent_session_id,
-                       sessions.kind, sessions.origin_call_id, sessions.title,
+                       sessions.kind, sessions.origin_session_id,
+                       sessions.origin_call_id, sessions.context_source_session_id,
+                       sessions.context_through_seq, sessions.title,
                        sessions.description, sessions.annotation_revision,
                        sessions.created_at,
                        COUNT(events.id) AS event_count
@@ -1571,8 +1909,9 @@ class Kernel:
         """Return session metadata from an existing connection snapshot."""
         row = connection.execute(
             """
-            SELECT id, cwd, parent_session_id, kind, origin_call_id, title,
-                   description, annotation_revision, created_at
+            SELECT id, cwd, parent_session_id, kind, origin_session_id,
+                   origin_call_id, context_source_session_id, context_through_seq,
+                   title, description, annotation_revision, created_at
             FROM sessions WHERE id = ?
             """,
             (session_id,),
@@ -1602,6 +1941,25 @@ class Kernel:
                 f"session {field} must be a string or None",
                 field=field,
             )
+        return self._update_session_metadata(
+            session_id,
+            {field: value},
+            caller_session_id=actor_session_id,
+            actor_call_id=actor_call_id,
+            expected_revision=expected_revision,
+        )
+
+    def _update_session_metadata(
+        self,
+        session_id: str,
+        changes: dict[str, Any],
+        *,
+        caller_session_id: str,
+        actor_call_id: str | None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically update revisioned display metadata within one session tree."""
+        normalized = _normalize_session_metadata(changes)
         if expected_revision is not None and (
             isinstance(expected_revision, bool)
             or not isinstance(expected_revision, int)
@@ -1615,8 +1973,17 @@ class Kernel:
         with closing(self._connect()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                target_root = self._root_session_id(connection, session_id)
+                caller_root = self._root_session_id(connection, caller_session_id)
+                if target_root != caller_root:
+                    raise ToolboxError(
+                        "session_access_denied",
+                        "session metadata updates are limited to the caller's "
+                        "session tree",
+                    )
                 row = connection.execute(
-                    f"SELECT {field}, annotation_revision FROM sessions WHERE id = ?",
+                    "SELECT title, description, annotation_revision "
+                    "FROM sessions WHERE id = ?",
                     (session_id,),
                 ).fetchone()
                 if row is None:
@@ -1635,31 +2002,37 @@ class Kernel:
                         expected_revision=expected_revision,
                         actual_revision=actual_revision,
                     )
-                old_value = row[field]
-                if old_value == value:
+                changed = [
+                    (field, row[field], value)
+                    for field, value in normalized.items()
+                    if row[field] != value
+                ]
+                if not changed:
                     metadata = self._session_metadata_connection(connection, session_id)
                     connection.commit()
                     return metadata
 
-                connection.execute(
-                    f"UPDATE sessions SET {field} = ?, "
-                    "annotation_revision = annotation_revision + 1 WHERE id = ?",
-                    (value, session_id),
-                )
-                revision = actual_revision + 1
-                self._append_event_connection(
-                    connection,
-                    session_id,
-                    "session_annotation_changed",
-                    {
-                        "field": field,
-                        "old_value": old_value,
-                        "new_value": value,
-                        "annotation_revision": revision,
-                        "actor_session_id": actor_session_id,
-                        "actor_call_id": actor_call_id,
-                    },
-                )
+                revision = actual_revision
+                for field, old_value, value in changed:
+                    revision += 1
+                    connection.execute(
+                        f"UPDATE sessions SET {field} = ?, annotation_revision = ? "
+                        "WHERE id = ?",
+                        (value, revision, session_id),
+                    )
+                    self._append_event_connection(
+                        connection,
+                        session_id,
+                        "session_annotation_changed",
+                        {
+                            "field": field,
+                            "old_value": old_value,
+                            "new_value": value,
+                            "annotation_revision": revision,
+                            "actor_session_id": caller_session_id,
+                            "actor_call_id": actor_call_id,
+                        },
+                    )
                 metadata = self._session_metadata_connection(connection, session_id)
                 connection.commit()
                 return metadata
