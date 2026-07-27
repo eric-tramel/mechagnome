@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
-_SCHEMA_VERSION = 13
+_SCHEMA_VERSION = 14
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _SESSION_METADATA_LIMITS = {"title": 256, "description": 4096}
 _SESSION_ANNOTATION_FIELDS = frozenset(_SESSION_METADATA_LIMITS)
@@ -380,12 +380,19 @@ class ToolContext:
         return _KernelCapability(self)
 
     async def call_tool(
-        self, name: str, args: dict[str, Any], version: int | None = None
+        self,
+        name: str,
+        args: dict[str, Any],
+        version: int | None = None,
+        *,
+        detach: bool = False,
     ) -> JsonValue:
         """Invoke a tool through the snapshotted editable dispatcher."""
         envelope: dict[str, Any] = {"name": name, "args": args}
         if version is not None:
             envelope["version"] = version
+        if detach:
+            envelope["detach"] = True
         return await self._kernel._invoke_async(
             "call_tool",
             envelope,
@@ -448,10 +455,15 @@ class _LegacyToolContext:
         return _LegacyKernelCapability(self._context.kernel, self._loop)
 
     def call_tool(
-        self, name: str, args: dict[str, Any], version: int | None = None
+        self,
+        name: str,
+        args: dict[str, Any],
+        version: int | None = None,
+        *,
+        detach: bool = False,
     ) -> JsonValue:
         return asyncio.run_coroutine_threadsafe(
-            self._context.call_tool(name, args, version), self._loop
+            self._context.call_tool(name, args, version, detach=detach), self._loop
         ).result()
 
 
@@ -552,6 +564,69 @@ class _KernelCapability:
             version=version,
         )
 
+    def start_tool_run(
+        self, name: str, args: dict[str, Any], version: int | None = None
+    ) -> JsonValue:
+        """Detach an invocation through the host-owned ToolRun supervisor."""
+        self._require("call_tool")
+        request: dict[str, Any] = {
+            "operation": "start",
+            "name": name,
+            "args": args,
+        }
+        if version is not None:
+            request["version"] = version
+        return self._context._state.model_provider.tool_run(request)
+
+    def get_tool_run(self, run_id: str) -> JsonValue:
+        """Read lightweight ToolRun state through the get core slot."""
+        self._require("get_tool_run")
+        return self._context._state.model_provider.tool_run(
+            {"operation": "get", "run_id": run_id}
+        )
+
+    async def wait_tool_run(self, run_id: str, timeout_ms: int = 30_000) -> JsonValue:
+        """Wait without blocking the authored tool event loop."""
+        self._require("wait_tool_run")
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or not 0 <= timeout_ms <= 30_000
+        ):
+            raise ToolboxError(
+                "invalid_tool_run_request",
+                "tool run timeout_ms must be an integer from 0 through 30000",
+            )
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            remaining_ms = max(0, round((deadline - time.monotonic()) * 1000))
+            result = await asyncio.to_thread(
+                self._context._state.model_provider.tool_run,
+                {
+                    "operation": "wait",
+                    "run_id": run_id,
+                    "timeout_ms": min(100, remaining_ms),
+                },
+            )
+            if not isinstance(result, dict) or not result.get("timed_out"):
+                return result
+            if time.monotonic() >= deadline:
+                return result
+
+    def cancel_tool_run(self, run_id: str) -> JsonValue:
+        """Request ToolRun cancellation through the cancel core slot."""
+        self._require("cancel_tool_run")
+        return self._context._state.model_provider.tool_run(
+            {"operation": "cancel", "run_id": run_id}
+        )
+
+    def enclosing_conversation_session_id(self) -> str:
+        """Resolve run_agent's default target without changing SessionAccess."""
+        self._require("run_agent")
+        return self._context._kernel._nearest_conversation_session(
+            self._context._state.session_id
+        )
+
 
 class Kernel:
     """Persistent host substrate below the editable core operations."""
@@ -599,6 +674,19 @@ class Kernel:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+    def _nearest_conversation_session(self, session_id: str) -> str:
+        """Find the conversation authority enclosing an internal trace session."""
+        current: str | None = session_id
+        while current is not None:
+            metadata = self.session_metadata(current)
+            if metadata["kind"] == "conversation":
+                return current
+            current = metadata["parent_session_id"]
+        raise ToolboxError(
+            "invalid_session",
+            f"session has no enclosing conversation: {session_id}",
+        )
 
     @staticmethod
     def _is_sqlite_contention(error: sqlite3.OperationalError) -> bool:
@@ -664,6 +752,9 @@ class Kernel:
                     if version == 12:
                         self._migrate_v12(connection)
                         version = 13
+                    if version == 13:
+                        self._migrate_v13(connection)
+                        version = 14
                     if version != _SCHEMA_VERSION:
                         raise ToolboxError(
                             "unsupported_schema",
@@ -826,6 +917,15 @@ class Kernel:
                 "AND annotation_revision >= 0)"
             )
         self._reserve_new_core_names(connection, ("run_agent",))
+        for row in connection.execute("SELECT id FROM toolboxes").fetchall():
+            self._seed_missing_core(connection, str(row["id"]))
+
+    def _migrate_v13(self, connection: sqlite3.Connection) -> None:
+        """Reserve and seed the generic ToolRun lifecycle core slots."""
+        self._reserve_new_core_names(
+            connection,
+            ("get_tool_run", "wait_tool_run", "cancel_tool_run"),
+        )
         for row in connection.execute("SELECT id FROM toolboxes").fetchall():
             self._seed_missing_core(connection, str(row["id"]))
 
@@ -1197,7 +1297,15 @@ class Kernel:
             connection.execute(f"DROP TABLE {table}")
         self._reserve_new_core_names(
             connection,
-            ("list_tools", "list_tool_namespaces", "delete_tool", "run_agent"),
+            (
+                "list_tools",
+                "list_tool_namespaces",
+                "delete_tool",
+                "run_agent",
+                "get_tool_run",
+                "wait_tool_run",
+                "cancel_tool_run",
+            ),
         )
         self._seed_missing_core(connection, toolbox_id)
         self._backfill_namespaces(connection)

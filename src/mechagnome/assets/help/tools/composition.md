@@ -106,12 +106,11 @@ Nested failures propagate to the caller unless authored source catches the
 exception. Catch only failures the tool can handle meaningfully; otherwise let
 the failed call and its trace remain visible.
 
-Long-running work requested directly by the model may use the detached
-`call_tool` mode described in `help({"topic": "core"})`. Authored
-`ctx.call_tool` composition remains an awaited foreground call: a tool cannot
-detach one of its own nested calls. Models can prompt full conversations in
-foreground or detached mode through the `run_agent` core tool described in the
-same help topic. Authored tools receive its underlying generic
+Any invocation may use the detached `call_tool` mode described in
+`help({"topic": "core"})`. Authored tools pass `detach=True` to
+`ctx.call_tool`; the awaited call then returns a ToolRun handle immediately.
+Models and authored tools prompt full conversations through the `run_agent`
+core tool and detach it exactly like any other tool. Authored tools also receive its underlying generic
 `ctx.sessions.get(...).prompt(...)` API with `continue`, `spawn`, and `fork`
 modes. Because prompt outcomes include the durable `session_id`, a tool can
 immediately retrieve that handle and call

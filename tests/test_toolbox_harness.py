@@ -183,7 +183,8 @@ def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
     assert all(item["kind"] == "core" for item in kernel.bindings())
     run_agent = kernel.view_tool("run_agent")
     assert "ctx.sessions.get" in run_agent["source"]
-    assert "ctx.sessions.inspect" in run_agent["source"]
+    assert 'ctx.call_tool(\n            "wait_tool_run"' in run_agent["source"]
+    assert 'ctx.call_tool("run_agent", request, detach=True)' in run_agent["source"]
     assert "four words or fewer" in run_agent["source"]
     assert "no more than four words" in run_agent["description"]
     assert (
@@ -192,6 +193,9 @@ def test_fresh_bootstrap_is_exact_and_idempotent(tmp_path: Path) -> None:
     )
     assert "ctx.kernel.run_agent" not in run_agent["source"]
     assert not hasattr(kernel_module._KernelCapability, "run_agent")
+    with pytest.raises(ToolboxError) as unavailable:
+        kernel.call("get_tool_run", {"run_id": "missing"})
+    assert unavailable.value.code == "tool_run_unavailable"
 
     reopened = kernel_at(tmp_path)
     assert reopened.bindings() == kernel.bindings()
@@ -297,7 +301,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
     assert "```python" in authoring
     assert "## The `ctx` context object" in authoring
     for public_api in (
-        "await ctx.call_tool(name, args, version=None)",
+        "await ctx.call_tool(name, args, version=None, *, detach=False)",
         "ctx.caller_session_id",
         "ctx.sessions.current(after=0, limit=50)",
         "ctx.sessions.read(session_id, after=0, limit=50)",
@@ -319,7 +323,7 @@ def test_help_returns_complete_packaged_markdown_documents(tmp_path: Path) -> No
     assert "Each nested invocation receives its own context object" in composition
     assert "base_version" in composition
     assert "eight delegated-model attempts per top-level call tree" in composition
-    assert "remains an awaited foreground call" in composition
+    assert "pass `detach=True`" in composition
 
     assert "model_provider_unavailable" in authoring
     assert "model_provider_limit" in authoring
@@ -832,7 +836,7 @@ def test_schema_two_database_migrates_without_feedback_storage(tmp_path: Path) -
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 13
+    assert version == 14
     assert table is None
 
 
@@ -860,7 +864,7 @@ def test_schema_five_database_removes_feedback_storage(tmp_path: Path) -> None:
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'tool_feedback'"
         ).fetchone()
-    assert version == 13
+    assert version == 14
     assert table is None
 
 
@@ -1184,7 +1188,7 @@ def test_run_agent_v12_tip_migrates_to_combined_schema(tmp_path: Path) -> None:
     assert metadata["annotation_revision"] == 0
     assert reopened.view_tool("run_agent")["kind"] == "core"
     with closing(reopened._connect()) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
 
 
 def test_schema_nine_database_adds_session_annotations(tmp_path: Path) -> None:
@@ -1206,7 +1210,7 @@ def test_schema_nine_database_adds_session_annotations(tmp_path: Path) -> None:
     assert metadata["annotation_revision"] == 0
     assert reopened.read_session(session_id)["events"][0]["payload"] == {"kept": True}
     with closing(reopened._connect()) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         columns = {
             row["name"]: row
             for row in connection.execute("PRAGMA table_info(sessions)")
@@ -1267,7 +1271,60 @@ def test_schema_nine_reserves_and_seeds_run_agent_core_slot(tmp_path: Path) -> N
     assert reopened.view_tool("run_agent_legacy")["description"] == "legacy agent"
     assert reopened.view_tool("run_agent_legacy")["namespaces"] == ["legacy"]
     with closing(reopened._connect()) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+
+
+def test_schema_thirteen_reserves_and_seeds_tool_run_core_slots(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    session_id = kernel.create_session()
+    toolbox_id = kernel.active_toolboxes(session_id)[0]["id"]
+    with closing(kernel._connect()) as connection, connection:
+        for name in ("get_tool_run", "wait_tool_run", "cancel_tool_run"):
+            lineage = connection.execute(
+                "SELECT id FROM tool_lineages WHERE toolbox_id = ? AND name = ?",
+                (toolbox_id, name),
+            ).fetchone()
+            assert lineage is not None
+            lineage_id = int(lineage["id"])
+            connection.execute(
+                "DELETE FROM bindings WHERE toolbox_id = ? AND name = ?",
+                (toolbox_id, name),
+            )
+            connection.execute(
+                "DELETE FROM tool_namespaces WHERE lineage_id = ?", (lineage_id,)
+            )
+            connection.execute(
+                "DELETE FROM tool_versions WHERE lineage_id = ?", (lineage_id,)
+            )
+            connection.execute("DELETE FROM tool_lineages WHERE id = ?", (lineage_id,))
+        legacy = connection.execute(
+            "INSERT INTO tool_lineages (toolbox_id, name, created_at) "
+            "VALUES (?, 'get_tool_run', 'legacy')",
+            (toolbox_id,),
+        )
+        legacy_version = connection.execute(
+            "INSERT INTO tool_versions ("
+            "lineage_id, version, description, schema_json, source, created_at"
+            ") VALUES (?, 1, 'legacy getter', '{}', "
+            "'async def main(input, ctx): return 7', 'legacy')",
+            (int(legacy.lastrowid),),
+        )
+        connection.execute(
+            "INSERT INTO bindings (toolbox_id, name, tool_version_id) "
+            "VALUES (?, 'get_tool_run', ?)",
+            (toolbox_id, int(legacy_version.lastrowid)),
+        )
+        connection.execute("PRAGMA user_version = 13")
+
+    reopened = kernel_at(tmp_path)
+
+    for name in ("get_tool_run", "wait_tool_run", "cancel_tool_run"):
+        assert reopened.view_tool(name)["kind"] == "core"
+    assert reopened.call("get_tool_run_legacy", {}) == 7
+    with closing(reopened._connect()) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
 
 
 def test_schema_ten_backfills_session_prompt_origin_and_rebuilds_trigger(
@@ -1299,7 +1356,7 @@ def test_schema_ten_backfills_session_prompt_origin_and_rebuilds_trigger(
             "SELECT 1 FROM sqlite_master "
             "WHERE type = 'trigger' AND name = 'sessions_lineage_immutable'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
     assert trigger is not None
 
 
@@ -1319,7 +1376,7 @@ def test_schema_eleven_adds_mutable_session_display_metadata(tmp_path: Path) -> 
         columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(sessions)")
         }
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
     assert {"title", "description"} <= columns
 
 
@@ -2297,6 +2354,143 @@ def test_isolated_tools_can_run_recursive_first_class_agents(tmp_path: Path) -> 
     ] == ["user", "model", "final"]
 
 
+def test_detached_tool_model_provider_uses_enclosing_conversation(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "detached_delegate",
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.run_agent('detached child')\n",
+    )
+
+    class DetachedDelegateTransport:
+        def __init__(self) -> None:
+            self.run_id: str | None = None
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            prompt = next(
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            )
+            observations = [
+                message for message in messages if message["role"] == "tool"
+            ]
+            if prompt == "root" and not observations:
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "call_tool",
+                            {
+                                "name": "detached_delegate",
+                                "args": {},
+                                "detach": True,
+                            },
+                            "detach",
+                        ),
+                    )
+                )
+            if prompt == "root":
+                self.run_id = observations[-1]["content"]["run_id"]
+                return ModelTurn(text="delegate detached")
+            return ModelTurn(text="detached child answer")
+
+        def complete(self, messages: Any) -> str:
+            return "unused"
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+    transport = DetachedDelegateTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("root").answer == "delegate detached"
+    assert transport.run_id is not None
+    terminal = harness.tool_runner.wait_tool_run(
+        transport.run_id,
+        session_id=conversation.session_id,
+        timeout_ms=30_000,
+    )
+    assert terminal["status"] == "succeeded"
+    assert terminal["result"] == "detached child answer"
+    harness.close()
+
+
+def test_detached_tool_releases_its_trace_transport_binding(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "detached_completion",
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.complete([\n"
+        "        {'role': 'user', 'content': 'complete'},\n"
+        "    ])\n",
+    )
+
+    class LeaseTransport:
+        def __init__(self) -> None:
+            self.bound_ids: list[str] = []
+
+        def for_session(self, session_id: str) -> LeaseBoundTransport:
+            self.bound_ids.append(session_id)
+            return LeaseBoundTransport(session_id)
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            raise AssertionError("unbound transport received traffic")
+
+        def complete(self, messages: Any) -> str:
+            raise AssertionError("unbound transport received completion")
+
+    class LeaseBoundTransport:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            return ModelTurn(text="unused")
+
+        def complete(self, messages: Any) -> str:
+            return f"completed:{self.session_id}"
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+    transport = LeaseTransport()
+    provider = ModelProvider(kernel, transport)
+    harness = Harness(kernel)
+    conversation = harness.start(provider)
+    scope = kernel.snapshot_scope(conversation.session_id)
+    handle = conversation._control_tool_run(
+        scope,
+        None,
+        {"operation": "start", "name": "detached_completion", "args": {}},
+        sink=None,
+        model_provider=conversation._completion_provider(sink=None),
+    )
+    with harness.tool_runner._runs_lock:
+        trace_session_id = harness.tool_runner._runs[handle["run_id"]].trace_session_id
+
+    terminal = harness.tool_runner.wait_tool_run(
+        handle["run_id"],
+        session_id=conversation.session_id,
+        timeout_ms=30_000,
+    )
+    assert terminal["status"] == "succeeded"
+    assert trace_session_id in transport.bound_ids
+    assert all(
+        session_id != trace_session_id for _, session_id in provider._session_transports
+    )
+    harness.close()
+
+
 class SessionPromptTransport:
     def __init__(self) -> None:
         self.target_id: str | None = None
@@ -2532,7 +2726,7 @@ class UniformBoundAgentTransport:
         if prompt == "child":
             assert str(observations[-1]["content"]).startswith("# Mechagnome")
             return ModelTurn(text="child answer")
-        assert observations[-1]["content"] == "child answer"
+        assert observations[-1]["content"]["result"] == "child answer"
         return ModelTurn(text="root answer")
 
     def complete(self, messages: Any) -> str:
@@ -2678,7 +2872,9 @@ class RecursiveDetachedBoundTransport(UniformBoundAgentTransport):
                 calls=(ToolCall("run_agent", {"prompt": "child"}, "child"),)
             )
         if prompt == "root":
-            assert observations[-1]["content"] == "child detached a grandchild"
+            assert observations[-1]["content"]["result"] == (
+                "child detached a grandchild"
+            )
             return ModelTurn(text="root continued")
         if prompt == "child" and messages[-1]["role"] == "user":
             return ModelTurn(
@@ -2916,13 +3112,18 @@ def test_detached_agent_continues_and_is_inspectable_by_parent(tmp_path: Path) -
     )
     assert running["job_id"] == transport.job_id
     assert running["status"] == "running"
-    assert kernel.session_metadata(running["session_id"])["parent_session_id"] == (
+    agent_session_id = next(
+        session_id
+        for session_id in transport.action_names
+        if session_id != conversation.session_id
+    )
+    assert kernel.session_metadata(agent_session_id)["parent_session_id"] == (
         conversation.session_id
     )
-    child = kernel.session_metadata(running["session_id"])
+    child = kernel.session_metadata(agent_session_id)
     assert child["kind"] == "conversation"
     assert child["parent_session_id"] == conversation.session_id
-    assert transport.action_names[running["session_id"]] == MODEL_ACTION_NAMES
+    assert transport.action_names[agent_session_id] == MODEL_ACTION_NAMES
 
     transport.release.set()
     completed = wait_for_agent(
@@ -2932,6 +3133,7 @@ def test_detached_agent_continues_and_is_inspectable_by_parent(tmp_path: Path) -
         status="succeeded",
     )
     assert completed["result"] == "detached answer"
+    assert completed["session_id"] == agent_session_id
     assert conversation.send("inspect").answer == "inspection complete"
     harness.close()
 
@@ -2952,7 +3154,8 @@ def test_detached_agent_handle_is_visible_to_ancestors_but_not_siblings(
     handle = harness._agent_coordinator.start_detached(
         child, "detached descendant", sink=None
     )
-    assert handle["job_id"] != handle["session_id"]
+    assert handle["job_id"] == handle["run_id"]
+    assert handle["tool_name"] == "run_agent"
     assert transport.started.wait(timeout=2)
 
     assert (
@@ -3078,6 +3281,7 @@ class CancellationDomainTransport:
         self.root_blocked = threading.Event()
         self.release_detached = threading.Event()
         self.detached_id: str | None = None
+        self.cancel_observation: dict[str, Any] | None = None
 
     def for_session(self, session_id: str) -> CancellationBoundTransport:
         self.events.setdefault(session_id, threading.Event())
@@ -3121,6 +3325,20 @@ class CancellationBoundTransport:
         if prompt == "start detached":
             self.parent.detached_id = observations[-1]["content"]["job_id"]
             return ModelTurn(text="detached started")
+        if prompt == "cancel detached" and messages[-1]["role"] == "user":
+            assert self.parent.detached_id is not None
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "cancel_tool_run",
+                        {"run_id": self.parent.detached_id},
+                        "cancel-detached",
+                    ),
+                )
+            )
+        if prompt == "cancel detached":
+            self.parent.cancel_observation = observations[-1]["content"]
+            return ModelTurn(text="detached cancellation requested")
         if prompt == "detached":
             self.parent.detached_started.set()
             while not self.parent.release_detached.wait(timeout=0.01):
@@ -3158,6 +3376,40 @@ class CancellationBoundTransport:
 
     def reset_cancellation(self) -> None:
         self.parent.events[self.session_id].clear()
+
+
+class AuthoredDetachCancellationTransport(CancellationDomainTransport):
+    def for_session(self, session_id: str) -> AuthoredDetachCancellationBoundTransport:
+        self.events.setdefault(session_id, threading.Event())
+        return AuthoredDetachCancellationBoundTransport(self, session_id)
+
+
+class AuthoredDetachCancellationBoundTransport(CancellationBoundTransport):
+    parent: AuthoredDetachCancellationTransport
+
+    def respond(self, messages: Any, tools: Any) -> ModelTurn:
+        prompt = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        if prompt == "start authored detach":
+            return ModelTurn(
+                calls=(
+                    ToolCall(
+                        "call_tool",
+                        {"name": "detach_agent_then_wait", "args": {}},
+                        "launch",
+                    ),
+                )
+            )
+        if prompt == "authored detached":
+            self.parent.detached_started.set()
+            while not self.parent.release_detached.wait(timeout=0.01):
+                if self.parent.events[self.session_id].is_set():
+                    raise ToolboxError("cancelled", "detached cancelled")
+            return ModelTurn(text="authored detached complete")
+        return super().respond(messages, tools)
 
 
 def test_parent_cancellation_does_not_stop_detached_agent(tmp_path: Path) -> None:
@@ -3202,6 +3454,92 @@ def test_parent_cancellation_does_not_stop_detached_agent(tmp_path: Path) -> Non
     harness.close()
 
 
+def test_parent_tool_cancellation_does_not_stop_its_detached_agent(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "detach_agent_then_wait",
+        "import time\n\n"
+        "async def main(input, ctx):\n"
+        "    await ctx.call_tool(\n"
+        "        'run_agent', {'prompt': 'authored detached'}, detach=True\n"
+        "    )\n"
+        "    while True:\n"
+        "        time.sleep(0.01)\n",
+    )
+    transport = AuthoredDetachCancellationTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+    failures: list[Exception] = []
+
+    def launch() -> None:
+        try:
+            conversation.send("start authored detach")
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=launch)
+    thread.start()
+    assert transport.detached_started.wait(timeout=3)
+    with harness.tool_runner._runs_lock:
+        run_id = next(
+            run.run_id
+            for run in harness.tool_runner._runs.values()
+            if run.name == "run_agent"
+        )
+
+    assert conversation.cancel() is True
+    thread.join(timeout=3)
+    assert len(failures) == 1
+    assert (
+        harness.tool_runner.get_tool_run(run_id, session_id=conversation.session_id)[
+            "status"
+        ]
+        == "running"
+    )
+
+    transport.release_detached.set()
+    terminal = harness.tool_runner.wait_tool_run(
+        run_id,
+        session_id=conversation.session_id,
+        timeout_ms=30_000,
+    )
+    assert terminal["status"] == "succeeded"
+    assert terminal["result"]["result"] == "authored detached complete"
+    harness.close()
+
+
+def test_cancel_tool_run_stops_a_detached_agent(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    transport = CancellationDomainTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("start detached").answer == "detached started"
+    assert transport.detached_started.wait(timeout=2)
+    assert transport.detached_id is not None
+    assert conversation.send("cancel detached").answer == (
+        "detached cancellation requested"
+    )
+    assert transport.cancel_observation == {
+        "run_id": transport.detached_id,
+        "tool_name": "run_agent",
+        "status": "cancelling",
+        "cancellation_requested": True,
+    }
+    terminal = harness.tool_runner.wait_tool_run(
+        transport.detached_id,
+        session_id=conversation.session_id,
+        timeout_ms=30_000,
+    )
+    assert terminal["status"] == "cancelled"
+    assert terminal["error"]["code"] == "tool_run_cancelled"
+    assert conversation.session_id not in transport.cancelled_keys
+    harness.close()
+
+
 def test_harness_close_stops_detached_agents_idempotently(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
     transport = CancellationDomainTransport()
@@ -3219,24 +3557,35 @@ def test_harness_close_stops_detached_agents_idempotently(tmp_path: Path) -> Non
         transport.detached_id, session_id=conversation.session_id
     )
     assert stopped["status"] == "failed"
-    assert stopped["error"]["code"] == "detached_agent_shutdown"
+    assert stopped["error"]["code"] == "detached_shutdown"
 
 
-def test_detached_agent_limit_is_separate_and_bounded(tmp_path: Path) -> None:
+def test_detached_agents_share_the_bounded_tool_run_pool(tmp_path: Path) -> None:
     kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "hold_tool_run_slot",
+        "import time\n\n"
+        "async def main(input, ctx):\n"
+        "    while True:\n"
+        "        time.sleep(0.01)\n",
+    )
     transport = CancellationDomainTransport()
     harness = Harness(kernel)
     conversation = harness.start(ModelProvider(kernel, transport))
 
     handles = [
         harness._agent_coordinator.start_detached(conversation, "detached", sink=None)
-        for _ in range(4)
+        for _ in range(3)
     ]
+    tool_handle = harness.tool_runner.start_detached(
+        "hold_tool_run_slot", {}, session_id=conversation.session_id
+    )
     with pytest.raises(ToolboxError) as error:
         harness._agent_coordinator.start_detached(conversation, "detached", sink=None)
 
-    assert len({handle["job_id"] for handle in handles}) == 4
-    assert error.value.code == "detached_agent_limit"
+    assert len({handle["job_id"] for handle in handles} | {tool_handle["run_id"]}) == 4
+    assert error.value.code == "detached_job_limit"
     harness.close()
 
 
@@ -3294,7 +3643,7 @@ class InspectBoundaryBoundAgentTransport(UniformBoundAgentTransport):
             self.parent.job_id = observations[-1]["content"]["job_id"]
             return ModelTurn(text="boundary started")
         if prompt == "boundary":
-            return ModelTurn(text="x" * (1024 * 1024 - 2))
+            return ModelTurn(text="x" * (1024 * 1024 - 256))
         if prompt == "inspect boundary" and messages[-1]["role"] == "user":
             assert self.parent.job_id is not None
             return ModelTurn(
@@ -3308,7 +3657,7 @@ class InspectBoundaryBoundAgentTransport(UniformBoundAgentTransport):
             )
         snapshot = observations[-1]["content"]
         assert snapshot["status"] == "succeeded"
-        assert len(snapshot["result"]) == 1024 * 1024 - 2
+        assert len(snapshot["result"]) == 1024 * 1024 - 256
         return ModelTurn(text="boundary inspected")
 
 
@@ -3326,7 +3675,7 @@ def test_detached_agent_result_limit_and_unicode_are_terminal(tmp_path: Path) ->
         conversation.session_id,
         status="failed",
     )
-    assert failure["error"]["code"] == "detached_agent_result_too_large"
+    assert failure["error"]["code"] == "detached_result_too_large"
 
     surrogate = harness._agent_coordinator.start_detached(
         conversation, "surrogate", sink=None
@@ -3708,14 +4057,178 @@ def test_recursive_agent_launches_share_a_cumulative_rollout_budget(
                         ),
                     )
                 )
-            assert observations[0]["content"] == "answer:child-0"
-            assert observations[1]["content"] == "answer:child-1"
+            assert observations[0]["content"]["result"] == "answer:child-0"
+            assert observations[1]["content"]["result"] == "answer:child-1"
             assert observations[2]["content"]["error"]["code"] == ("agent_launch_limit")
             return ModelTurn(text="budget enforced")
 
     result = Harness(kernel).run(ModelProvider(kernel, BudgetTransport()), "root")
 
     assert result.answer == "budget enforced"
+
+
+def test_detached_agent_preserves_the_originating_launch_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(harness_module, "_MAX_AGENT_LAUNCHES_PER_ROLLOUT", 2)
+    kernel = kernel_at(tmp_path)
+
+    class DetachedBudgetTransport(UniformAgentTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.run_id: str | None = None
+
+        def for_session(self, session_id: str) -> DetachedBudgetBoundTransport:
+            self.bound_keys.append(session_id)
+            return DetachedBudgetBoundTransport(self, session_id)
+
+    class DetachedBudgetBoundTransport(UniformBoundAgentTransport):
+        parent: DetachedBudgetTransport
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            prompt = next(
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            )
+            observations = [
+                message for message in messages if message["role"] == "tool"
+            ]
+            if prompt == "root":
+                if not observations:
+                    return ModelTurn(
+                        calls=(ToolCall("run_agent", {"prompt": "child"}, "child"),)
+                    )
+                if len(observations) == 1:
+                    return ModelTurn(
+                        calls=(
+                            ToolCall(
+                                "run_agent",
+                                {"prompt": "detached", "detach": True},
+                                "detached",
+                            ),
+                        )
+                    )
+                self.parent.run_id = observations[-1]["content"]["run_id"]
+                return ModelTurn(text="detached started")
+            if prompt == "child":
+                return ModelTurn(text="child complete")
+            if prompt == "detached" and not observations:
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "run_agent",
+                            {"prompt": "grandchild"},
+                            "grandchild",
+                        ),
+                    )
+                )
+            assert observations[-1]["content"]["error"]["code"] == (
+                "agent_launch_limit"
+            )
+            return ModelTurn(text="budget preserved")
+
+    transport = DetachedBudgetTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("root").answer == "detached started"
+    assert transport.run_id is not None
+    terminal = harness.tool_runner.wait_tool_run(
+        transport.run_id,
+        session_id=conversation.session_id,
+        timeout_ms=30_000,
+    )
+    assert terminal["status"] == "succeeded"
+    assert terminal["result"]["result"] == "budget preserved"
+    harness.close()
+
+
+def test_legacy_session_detach_preserves_the_originating_launch_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(harness_module, "_MAX_AGENT_LAUNCHES_PER_ROLLOUT", 2)
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "legacy_session_detach",
+        "async def main(input, ctx):\n"
+        "    session = ctx.sessions.get(input['session_id'])\n"
+        "    return await session.prompt(\n"
+        "        'legacy detached', mode='spawn', detach=True\n"
+        "    )\n",
+    )
+
+    class LegacyBudgetTransport(UniformAgentTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.run_id: str | None = None
+
+        def for_session(self, session_id: str) -> LegacyBudgetBoundTransport:
+            self.bound_keys.append(session_id)
+            return LegacyBudgetBoundTransport(self, session_id)
+
+    class LegacyBudgetBoundTransport(UniformBoundAgentTransport):
+        parent: LegacyBudgetTransport
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            prompt = next(
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            )
+            observations = [
+                message for message in messages if message["role"] == "tool"
+            ]
+            if prompt == "root":
+                if not observations:
+                    return ModelTurn(
+                        calls=(ToolCall("run_agent", {"prompt": "child"}, "child"),)
+                    )
+                if len(observations) == 1:
+                    return ModelTurn(
+                        calls=(
+                            ToolCall(
+                                "call_tool",
+                                {
+                                    "name": "legacy_session_detach",
+                                    "args": {"session_id": self.session_id},
+                                },
+                                "legacy-detach",
+                            ),
+                        )
+                    )
+                self.parent.run_id = observations[-1]["content"]["run_id"]
+                return ModelTurn(text="legacy detached started")
+            if prompt == "child":
+                return ModelTurn(text="child complete")
+            if prompt == "legacy detached" and not observations:
+                return ModelTurn(
+                    calls=(
+                        ToolCall("run_agent", {"prompt": "grandchild"}, "grandchild"),
+                    )
+                )
+            assert observations[-1]["content"]["error"]["code"] == (
+                "agent_launch_limit"
+            )
+            return ModelTurn(text="legacy budget preserved")
+
+    transport = LegacyBudgetTransport()
+    harness = Harness(kernel)
+    conversation = harness.start(ModelProvider(kernel, transport))
+
+    assert conversation.send("root").answer == "legacy detached started"
+    assert transport.run_id is not None
+    terminal = harness.tool_runner.wait_tool_run(
+        transport.run_id,
+        session_id=conversation.session_id,
+        timeout_ms=30_000,
+    )
+    assert terminal["status"] == "succeeded"
+    assert terminal["result"]["result"] == "legacy budget preserved"
+    harness.close()
 
 
 def test_child_agent_tools_see_child_identity_and_create_grandchildren(
@@ -4398,7 +4911,7 @@ def test_legacy_database_migrates_into_a_durable_namespace(tmp_path: Path) -> No
     assert metadata["description"] is None
     assert metadata["annotation_revision"] == 0
     with sqlite3.connect(database) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 14
     assert Kernel(database, cwd=tmp_path).call("legacy_tool", {}) == "legacy"
 
 
@@ -4674,10 +5187,10 @@ def test_parallel_batch_preserves_transient_detached_updates(tmp_path: Path) -> 
     assert result.answer == "Batch completed."
     assert model.job_id is not None
     wait_for_detached(runner, model.job_id, conversation.session_id, status="succeeded")
-    detached_events = [event for event in events if event.kind.startswith("detached_")]
+    detached_events = [event for event in events if event.kind.startswith("tool_run_")]
     assert {event.kind for event in detached_events} >= {
-        "detached_started",
-        "detached_finished",
+        "tool_run_started",
+        "tool_run_finished",
     }
     assert all(event.seq is None for event in detached_events)
     harness.close()
@@ -4719,12 +5232,12 @@ def test_detached_call_continues_foreground_and_is_inspectable_later(
         status="running",
         output="started",
     )
-    assert running == {
-        "job_id": model.job_id,
-        "status": "running",
-        "output_tail": "started\n",
-        "truncated": False,
-    }
+    assert running["run_id"] == model.job_id
+    assert running["job_id"] == model.job_id
+    assert running["tool_name"] == "gated"
+    assert running["status"] == "running"
+    assert running["output_tail"] == "started\n"
+    assert running["truncated"] is False
     assert [message["role"] for message in conversation.messages] == [
         "user",
         "assistant",
@@ -4739,7 +5252,9 @@ def test_detached_call_continues_foreground_and_is_inspectable_later(
     ]
     assert len(observations) == 2
     assert observations[0]["payload"]["observation"] == {
+        "run_id": model.job_id,
         "job_id": model.job_id,
+        "tool_name": "gated",
         "status": "running",
     }
 
@@ -4748,6 +5263,424 @@ def test_detached_call_continues_foreground_and_is_inspectable_later(
     second = conversation.send("check the background work")
 
     assert second.answer == "Detached work finished."
+    harness.close()
+
+
+def test_tool_run_tools_control_authored_nested_detachment(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    started = tmp_path / "tool-run-started"
+    write(
+        kernel,
+        "blocking_work",
+        "import time\n"
+        "from pathlib import Path\n\n"
+        "async def main(input, ctx):\n"
+        f"    Path({str(started)!r}).write_text('yes')\n"
+        "    print('working', flush=True)\n"
+        "    while True:\n"
+        "        time.sleep(0.01)\n",
+    )
+    write(
+        kernel,
+        "launch_work",
+        "async def main(input, ctx):\n"
+        "    return await ctx.call_tool('blocking_work', {}, detach=True)\n",
+    )
+
+    class ToolRunModel:
+        def __init__(self) -> None:
+            self.run_id: str | None = None
+            self.observations: dict[str, dict[str, Any]] = {}
+
+        def for_session(self, session_id: str) -> ToolRunModel:
+            return self
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            prompt = next(
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            )
+            if messages[-1]["role"] == "user":
+                if prompt == "start":
+                    return ModelTurn(
+                        calls=(
+                            ToolCall(
+                                "call_tool",
+                                {"name": "launch_work", "args": {}},
+                                "start",
+                            ),
+                        )
+                    )
+                assert self.run_id is not None
+                operation = {
+                    "status": ("get_tool_run", {"run_id": self.run_id}),
+                    "poll": (
+                        "wait_tool_run",
+                        {"run_id": self.run_id, "timeout_ms": 1},
+                    ),
+                    "cancel": ("cancel_tool_run", {"run_id": self.run_id}),
+                    "wait": (
+                        "wait_tool_run",
+                        {"run_id": self.run_id, "timeout_ms": 30_000},
+                    ),
+                }[prompt]
+                return ModelTurn(calls=(ToolCall(*operation, prompt),))
+            observation = messages[-1]["content"]
+            if prompt == "start":
+                self.run_id = observation["run_id"]
+                assert observation == {
+                    "run_id": self.run_id,
+                    "job_id": self.run_id,
+                    "tool_name": "blocking_work",
+                    "status": "running",
+                }
+            else:
+                self.observations[prompt] = observation
+            return ModelTurn(text=f"{prompt} complete")
+
+    model = ToolRunModel()
+    harness = Harness(kernel)
+    conversation = harness.start(model)
+
+    assert conversation.send("start").answer == "start complete"
+    for _ in range(200):
+        if started.exists():
+            break
+        time.sleep(0.01)
+    assert started.exists()
+    assert conversation.send("status").answer == "status complete"
+    assert model.observations["status"] == {
+        "run_id": model.run_id,
+        "tool_name": "blocking_work",
+        "status": "running",
+    }
+    conversation.send("poll")
+    assert model.observations["poll"]["status"] == "running"
+    assert model.observations["poll"]["timed_out"] is True
+    conversation.send("cancel")
+    assert model.observations["cancel"] == {
+        "run_id": model.run_id,
+        "tool_name": "blocking_work",
+        "status": "cancelling",
+        "cancellation_requested": True,
+    }
+    conversation.send("wait")
+    assert model.observations["wait"]["status"] == "cancelled"
+    assert model.observations["wait"]["error"] == {
+        "code": "tool_run_cancelled",
+        "message": "tool run cancelled by request",
+        "details": {},
+    }
+    conversation.send("cancel")
+    assert model.observations["cancel"] == {
+        "run_id": model.run_id,
+        "tool_name": "blocking_work",
+        "status": "cancelled",
+        "cancellation_requested": False,
+    }
+    harness.close()
+
+
+def test_top_level_detach_runs_through_the_active_call_tool_version(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "call_tool",
+        "async def main(input, ctx):\n    return {'active_dispatcher': input}\n",
+        input_schema=CORE_SCHEMAS["call_tool"],
+        base_version=1,
+    )
+
+    class DetachPolicyModel:
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            if messages[-1]["role"] == "user":
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "call_tool",
+                            {"name": "missing", "args": {}, "detach": True},
+                            "detach",
+                        ),
+                    )
+                )
+            assert messages[-1]["content"] == {
+                "active_dispatcher": {
+                    "name": "missing",
+                    "args": {},
+                    "detach": True,
+                }
+            }
+            return ModelTurn(text="policy observed detach")
+
+    result = Harness(kernel).run(DetachPolicyModel(), "run")
+    assert result.answer == "policy observed detach"
+
+
+def test_legacy_job_inspection_uses_the_active_wait_tool_run_version(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "wait_tool_run",
+        "async def main(input, ctx):\n    return {'sentinel': input['run_id']}\n",
+        input_schema=CORE_SCHEMAS["wait_tool_run"],
+        base_version=1,
+    )
+
+    class LegacyInspectionModel:
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            prompt = next(
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            )
+            if messages[-1]["role"] == "user":
+                name = "call_tool" if prompt == "call" else "run_agent"
+                return ModelTurn(
+                    calls=(ToolCall(name, {"job_id": "legacy-id"}, prompt),)
+                )
+            assert messages[-1]["content"] == {"sentinel": "legacy-id"}
+            return ModelTurn(text=f"{prompt} inspected")
+
+    harness = Harness(kernel)
+    conversation = harness.start(LegacyInspectionModel())
+    assert conversation.send("call").answer == "call inspected"
+    assert conversation.send("agent").answer == "agent inspected"
+    harness.close()
+
+
+def test_tool_run_visibility_allows_creator_ancestors_but_hides_siblings(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    root = kernel.create_session(kind="conversation")
+    child = kernel.create_child_session(
+        kernel.snapshot_scope(root), kind="conversation"
+    )
+    sibling = kernel.create_child_session(
+        kernel.snapshot_scope(root), kind="conversation"
+    )
+    write(
+        kernel,
+        "identity",
+        "async def main(input, ctx):\n    return input['value']\n",
+        session_id=child,
+    )
+    runner = IsolatedToolRunner(kernel)
+    handle = runner.start_detached(
+        "identity",
+        {"value": 42},
+        session_id=child,
+    )
+
+    completed = runner.wait_tool_run(
+        handle["run_id"], session_id=root, timeout_ms=30_000
+    )
+    assert completed["result"] == 42
+    with pytest.raises(ToolboxError) as hidden:
+        runner.get_tool_run(handle["run_id"], session_id=sibling)
+    assert hidden.value.code == "unknown_tool_run"
+    runner.close()
+
+
+def test_tool_run_cancellation_wins_completion_and_shutdown_races(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    owner = kernel.create_session(kind="conversation")
+
+    for close_after_cancel in (False, True):
+        runner = IsolatedToolRunner(kernel)
+        run = isolation_module._ToolRun(
+            f"race-{close_after_cancel}",
+            kernel.create_child_session(kernel.snapshot_scope(owner), kind="generic"),
+            owner,
+            "race",
+            {},
+            None,
+            None,
+        )
+        runner._runs[run.run_id] = run
+
+        accepted = runner.cancel_tool_run(run.run_id, session_id=owner)
+        if close_after_cancel:
+            runner.close()
+        runner._finish_run(run, status="succeeded", result="too late")
+        terminal = runner.wait_tool_run(run.run_id, session_id=owner, timeout_ms=0)
+
+        assert accepted["cancellation_requested"] is True
+        assert terminal["status"] == "cancelled"
+        assert terminal["error"]["code"] == "tool_run_cancelled"
+
+
+def test_cancelling_a_waiter_does_not_cancel_the_target_tool_run(
+    tmp_path: Path,
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "wait_forever",
+        "import time\n\n"
+        "async def main(input, ctx):\n"
+        "    while True:\n"
+        "        time.sleep(0.01)\n",
+    )
+
+    class WaitingModel:
+        def __init__(self) -> None:
+            self.run_id: str | None = None
+
+        def for_session(self, session_id: str) -> WaitingModel:
+            return self
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            if messages[-1]["role"] == "user":
+                assert self.run_id is not None
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "wait_tool_run",
+                            {"run_id": self.run_id, "timeout_ms": 30_000},
+                            "wait",
+                        ),
+                    )
+                )
+            return ModelTurn(text="unexpected completion")
+
+    model = WaitingModel()
+    harness = Harness(kernel)
+    conversation = harness.start(model)
+    handle = harness.tool_runner.start_detached(
+        "wait_forever",
+        {},
+        session_id=conversation.session_id,
+    )
+    model.run_id = handle["run_id"]
+    failures: list[Exception] = []
+
+    def wait_in_foreground() -> None:
+        try:
+            conversation.send("wait")
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=wait_in_foreground)
+    thread.start()
+    for _ in range(200):
+        events = kernel.read_session(conversation.session_id, limit=100)["events"]
+        if any(
+            event["kind"] == "call_started" and event["tool_name"] == "wait_tool_run"
+            for event in events
+        ):
+            break
+        time.sleep(0.01)
+    assert conversation.cancel() is True
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert (
+        harness.tool_runner.get_tool_run(
+            model.run_id, session_id=conversation.session_id
+        )["status"]
+        == "running"
+    )
+    harness.tool_runner.cancel_tool_run(
+        model.run_id, session_id=conversation.session_id
+    )
+    harness.close()
+
+
+def test_detached_tool_preserves_the_originating_model_budget(tmp_path: Path) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "one_more_completion",
+        "async def main(input, ctx):\n"
+        "    return await ctx.model_provider.complete([\n"
+        "        {'role': 'user', 'content': 'one more'},\n"
+        "    ])\n",
+    )
+    write(
+        kernel,
+        "consume_then_detach",
+        "async def main(input, ctx):\n"
+        "    for index in range(8):\n"
+        "        await ctx.model_provider.complete([\n"
+        "            {'role': 'user', 'content': str(index)},\n"
+        "        ])\n"
+        "    return await ctx.call_tool('one_more_completion', {}, detach=True)\n",
+    )
+
+    class CompletionTransport:
+        def for_session(self, session_id: str) -> CompletionTransport:
+            return self
+
+        def complete(self, messages: Any) -> str:
+            return "ok"
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+    class BudgetModel:
+        def __init__(self) -> None:
+            self.run_id: str | None = None
+
+        def for_session(self, session_id: str) -> BudgetModel:
+            return self
+
+        def cancel_current(self) -> None:
+            pass
+
+        def reset_cancellation(self) -> None:
+            pass
+
+        def respond(self, messages: Any, tools: Any) -> ModelTurn:
+            if messages[-1]["role"] == "user":
+                return ModelTurn(
+                    calls=(
+                        ToolCall(
+                            "call_tool",
+                            {"name": "consume_then_detach", "args": {}},
+                            "consume",
+                        ),
+                    )
+                )
+            self.run_id = messages[-1]["content"]["run_id"]
+            return ModelTurn(text="launched")
+
+    model = BudgetModel()
+    harness = Harness(kernel)
+    conversation = harness.start(model, model_provider=CompletionTransport())
+
+    assert conversation.send("run").answer == "launched"
+    assert model.run_id is not None
+    terminal = harness.tool_runner.wait_tool_run(
+        model.run_id,
+        session_id=conversation.session_id,
+        timeout_ms=30_000,
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["error"]["code"] == "model_provider_limit"
     harness.close()
 
 
@@ -4899,8 +5832,8 @@ def test_detached_cleanup_stops_owned_descendants_and_joins_job_thread(
     child_pid = completed["result"]
     runner.close()
 
-    assert runner._jobs[handle["job_id"]].thread is not None
-    assert not runner._jobs[handle["job_id"]].thread.is_alive()
+    assert runner._runs[handle["job_id"]].thread is not None
+    assert not runner._runs[handle["job_id"]].thread.is_alive()
     deadline = time.monotonic() + 2
     while True:
         try:
@@ -5012,6 +5945,34 @@ def test_detached_job_limit_is_atomic_and_releases_completed_slots(
     runner.close()
 
 
+def test_detached_thread_start_failure_does_not_retain_a_phantom_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(kernel, "never_started", "async def main(input, ctx):\n    return None\n")
+    runner = IsolatedToolRunner(kernel)
+    session_id = kernel.create_session(kind="conversation")
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def fail_start(thread: threading.Thread) -> None:
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(isolation_module.Thread, "start", fail_start)
+    with pytest.raises(ToolboxError) as failure:
+        runner.start_detached(
+            "never_started",
+            {},
+            session_id=session_id,
+            on_update=lambda kind, payload: events.append((kind, payload)),
+        )
+
+    assert failure.value.code == "detached_start_failed"
+    assert runner._runs == {}
+    assert list(runner._completed_run_ids) == []
+    assert events == []
+    runner.close()
+
+
 def test_detached_job_retention_evicts_oldest_completed_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5040,6 +6001,60 @@ def test_detached_job_retention_evicts_oldest_completed_handle(
     )
     assert (
         runner.inspect_detached(handles[2]["job_id"], session_id=session_id)["result"]
+        == 2
+    )
+    runner.close()
+
+
+def test_detached_job_retention_uses_completion_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(isolation_module, "_MAX_RETAINED_DETACHED_JOBS", 2)
+    kernel = kernel_at(tmp_path)
+    release = tmp_path / "release-oldest-start"
+    write(
+        kernel,
+        "completion_order",
+        "import time\n"
+        "from pathlib import Path\n\n"
+        "async def main(input, ctx):\n"
+        "    if input['wait']:\n"
+        f"        while not Path({str(release)!r}).exists():\n"
+        "            time.sleep(0.01)\n"
+        "    return input['value']\n",
+    )
+    runner = IsolatedToolRunner(kernel)
+    session_id = kernel.create_session(kind="conversation")
+
+    oldest_started = runner.start_detached(
+        "completion_order", {"wait": True, "value": 0}, session_id=session_id
+    )
+    first_completed = runner.start_detached(
+        "completion_order", {"wait": False, "value": 1}, session_id=session_id
+    )
+    wait_for_detached(runner, first_completed["run_id"], session_id, status="succeeded")
+    second_completed = runner.start_detached(
+        "completion_order", {"wait": False, "value": 2}, session_id=session_id
+    )
+    wait_for_detached(
+        runner, second_completed["run_id"], session_id, status="succeeded"
+    )
+    release.write_text("go")
+    wait_for_detached(runner, oldest_started["run_id"], session_id, status="succeeded")
+
+    with pytest.raises(ToolboxError) as evicted:
+        runner.get_tool_run(first_completed["run_id"], session_id=session_id)
+    assert evicted.value.code == "unknown_tool_run"
+    assert (
+        runner.inspect_detached(oldest_started["run_id"], session_id=session_id)[
+            "result"
+        ]
+        == 0
+    )
+    assert (
+        runner.inspect_detached(second_completed["run_id"], session_id=session_id)[
+            "result"
+        ]
         == 2
     )
     runner.close()
