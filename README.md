@@ -75,7 +75,9 @@ uv run mechagnome
 
 That opens the terminal UI with `z-ai/glm-5.2` as the default model. Responses
 appear incrementally as OpenRouter streams them; fragmented tool calls are
-assembled before execution. The main pane is the saved multi-turn conversation.
+assembled before execution. Eligible transient failures before visible output
+receive bounded retries within the request's existing timeout. The main pane is
+the saved multi-turn conversation.
 The sidebar groups tool names into collapsible namespace trees and updates as the
 agent creates or replaces tools. State defaults to
 `~/.local/share/mechagnome/toolbox.db`, which holds toolbox routing, namespace

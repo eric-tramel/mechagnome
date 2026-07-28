@@ -973,6 +973,361 @@ def test_conversation_records_openrouter_transport_failure(tmp_path: Path) -> No
     assert secret not in str(events[-1]["payload"])
 
 
+def test_openrouter_retries_failed_finish_before_visible_output(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    responses = iter(
+        [
+            sse_response(
+                {"type": "response.reasoning.delta", "delta": "discarded"},
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "name": "help",
+                        "arguments": "{}",
+                        "call_id": "discarded-call",
+                    },
+                },
+                status="failed",
+                finish_reason="error",
+            ),
+            sse_response(
+                {"type": "response.content_part.delta", "delta": "Recovered."}
+            ),
+        ]
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return next(responses)
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    conversation = Harness(kernel).start(model)
+
+    result = conversation.send("recover this turn")
+
+    assert result.answer == "Recovered."
+    assert len(bodies) == 2
+    assert bodies[0] == bodies[1]
+    assert bodies[0]["store"] is False
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "model", "final"]
+
+
+def test_openrouter_does_not_retry_after_visible_text(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return sse_response(
+            {"type": "response.content_part.delta", "delta": "Partial"},
+            status="failed",
+            finish_reason="error",
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    events: list[ModelStreamEvent] = []
+
+    with pytest.raises(OpenRouterError, match="failed"):
+        events.extend(
+            model.stream(
+                [{"role": "user", "content": "hello"}],
+                kernel.tool_definitions(),
+            )
+        )
+
+    assert [event.text_delta for event in events] == ["Partial"]
+    assert requests == 1
+
+
+def test_openrouter_normalizes_nonretryable_httpx_stream_error(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    requests = 0
+
+    class ClosedStream(httpx.SyncByteStream):
+        def __iter__(self) -> Any:
+            raise httpx.StreamClosed()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=ClosedStream(),
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(OpenRouterError) as failure:
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+    assert failure.value.code == "openrouter_transport"
+    assert requests == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "error_type"),
+    [("type", "provider_overloaded"), ("code", "server_error")],
+)
+def test_openrouter_retries_typed_transient_stream_error(
+    tmp_path: Path, monkeypatch: Any, field_name: str, error_type: str
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    responses = iter(
+        [
+            sse_response(
+                {
+                    "type": "response.error",
+                    "error": {
+                        field_name: error_type,
+                        "message": "provider is busy",
+                    },
+                }
+            ),
+            sse_response({"type": "response.content_part.delta", "delta": "Ready."}),
+        ]
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return next(responses)
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    turn = model.respond(
+        [{"role": "user", "content": "hello"}], kernel.tool_definitions()
+    )
+
+    assert turn.text == "Ready."
+    assert requests == 2
+
+
+def test_openrouter_does_not_retry_length_without_visible_text(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return sse_response(status="completed", finish_reason="length")
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(OpenRouterError, match="length"):
+        model.respond([{"role": "user", "content": "hello"}], kernel.tool_definitions())
+
+    assert requests == 1
+
+
+def test_openrouter_completion_retries_retryable_http_failure(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    responses = iter(
+        [
+            httpx.Response(503, headers={"Retry-After": "0"}),
+            httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Recovered."}],
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return next(responses)
+
+    completion_model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    provider = ModelProvider(
+        kernel,
+        FinalModel(),
+        completion_transport=completion_model,
+    )
+    session = provider.start_session()
+
+    result = session.completion_provider().complete(
+        [{"role": "user", "content": "hello"}]
+    )
+
+    assert result == "Recovered."
+    assert len(bodies) == 2
+    assert bodies[0] == bodies[1]
+    children = [
+        child
+        for child in kernel.list_sessions(limit=100)["sessions"]
+        if child["parent_session_id"] == session.session_id
+    ]
+    assert len(children) == 1
+    events = kernel.read_session(children[0]["id"], limit=100)["events"]
+    assert [event["kind"] for event in events] == [
+        "model_input",
+        "model",
+        "final",
+    ]
+
+
+def test_openrouter_completion_retries_failed_terminal_response(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={"status": "failed", "finish_reason": "server_error"},
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Recovered."}],
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return next(responses)
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = model.complete([{"role": "user", "content": "hello"}])
+
+    assert result == "Recovered."
+    assert requests == 2
+
+
+def test_openrouter_retry_exhaustion_records_one_sanitized_failure(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return sse_response(status="failed", finish_reason="server_error")
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    conversation = Harness(kernel).start(model)
+
+    with pytest.raises(OpenRouterError, match="server_error"):
+        conversation.send("hello")
+
+    assert requests == 3
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "model_failed"]
+    assert events[-1]["payload"] == {
+        "code": "openrouter_finish_reason",
+        "message": "OpenRouter returned an unexpected finish reason",
+        "details": {},
+    }
+
+
+def test_openrouter_cancellation_interrupts_retry_backoff(tmp_path: Path) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    first_response = threading.Event()
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        first_response.set()
+        return httpx.Response(503, headers={"Retry-After": "30"})
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            model.respond(
+                [{"role": "user", "content": "hello"}],
+                kernel.tool_definitions(),
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert first_response.wait(timeout=1)
+    time.sleep(0.05)
+    model.cancel_current()
+    thread.join(timeout=1)
+
+    assert thread.is_alive() is False
+    assert requests == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], OpenRouterError)
+    assert failures[0].code == "openrouter_cancelled"
+
+
 @pytest.mark.parametrize(
     ("response", "code", "message"),
     [

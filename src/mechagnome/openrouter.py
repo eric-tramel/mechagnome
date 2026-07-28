@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 
 import httpx
@@ -27,6 +28,35 @@ DEFAULT_KEY_ENV = "OPENROUTER_API_KEY"
 MAX_STREAM_BYTES = 4_000_000
 MAX_COMPLETION_TOKENS = 2048
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_MAX_RETRIES = 2
+_RETRY_BASE_DELAY = 0.5
+_RETRY_AFTER_MAX_DELAY = 30.0
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 409, 429})
+_RETRYABLE_ERROR_TYPES = frozenset(
+    {
+        "rate_limit_exceeded",
+        "provider_overloaded",
+        "provider_unavailable",
+        "server",
+        "server_error",
+        "timeout",
+        "unmapped",
+    }
+)
+_RETRYABLE_FINISH_REASONS = frozenset(
+    {"error", "failed", "incomplete", "provider_error", "server_error"}
+)
+_PERMANENT_FINISH_REASONS = frozenset(
+    {
+        "content_filter",
+        "content_policy",
+        "length",
+        "max_output_tokens",
+        "max_tokens",
+        "refusal",
+        "safety",
+    }
+)
 _DEFAULT_SESSION = object()
 _PUBLIC_ERROR_MESSAGES = {
     "missing_api_key": "OpenRouter API key is missing",
@@ -132,7 +162,8 @@ class _ActiveSession:
 
     clients: dict[int, httpx.Client] = field(default_factory=dict)
     responses: dict[int, httpx.Response] = field(default_factory=dict)
-    cancel_requested: bool = False
+    cancelled: Event = field(default_factory=Event)
+    operations: int = 0
 
 
 class OpenRouterModel:
@@ -178,7 +209,7 @@ class OpenRouterModel:
     def _cancel_session(self, session_key: object) -> None:
         with self._active_lock:
             state = self._active_sessions.setdefault(session_key, _ActiveSession())
-            state.cancel_requested = True
+            state.cancelled.set()
             responses = list(state.responses.values())
             clients = list(state.clients.values())
         for response in responses:
@@ -193,8 +224,8 @@ class OpenRouterModel:
             state = self._active_sessions.get(session_key)
             if state is None:
                 return
-            state.cancel_requested = False
-            if not state.clients and not state.responses:
+            state.cancelled.clear()
+            if not state.operations and not state.clients and not state.responses:
                 self._active_sessions.pop(session_key, None)
 
     def available_models(self) -> list[OpenRouterModelOption]:
@@ -324,22 +355,39 @@ class OpenRouterModel:
             "store": False,
             "stream": False,
         }
+        deadline = time.monotonic() + self.timeout
+        with self._active(session_key), self._request_client(session_key) as client:
+            for retry_index in range(_MAX_RETRIES + 1):
+                try:
+                    return self._complete_once(client, body, session_key, deadline)
+                except OpenRouterError as error:
+                    self._raise_if_cancelled(session_key)
+                    if retry_index >= _MAX_RETRIES or not self._retryable(error):
+                        raise
+                    self._wait_to_retry(error, retry_index, deadline, session_key)
+        raise AssertionError("OpenRouter completion retry loop did not return")
+
+    def _complete_once(
+        self,
+        client: httpx.Client,
+        body: dict[str, Any],
+        session_key: object,
+        deadline: float,
+    ) -> str:
+        """Make one text-completion attempt inside a logical request."""
         try:
-            if self.client is None:
-                with (
-                    httpx.Client(timeout=self.timeout) as client,
-                    self._active(
-                        session_key,
-                        client=client,
-                        close_client_on_cancel=True,
-                    ),
-                ):
-                    return self._completion_response(client, body, session_key)
-            with self._active(session_key, client=self.client):
-                return self._completion_response(self.client, body, session_key)
+            return self._completion_response(client, body, session_key, deadline)
+        except httpx.TransportError as error:
+            raise OpenRouterError(
+                "openrouter_transport",
+                f"OpenRouter request failed: {error}",
+                retryable=True,
+            ) from error
         except (httpx.HTTPError, httpx.StreamError) as error:
             raise OpenRouterError(
-                "openrouter_transport", f"OpenRouter request failed: {error}"
+                "openrouter_transport",
+                f"OpenRouter request failed: {error}",
+                retryable=False,
             ) from error
 
     def stream(
@@ -372,27 +420,55 @@ class OpenRouterModel:
         }
         if self.reasoning_effort is not None:
             body["reasoning"] = {"effort": self.reasoning_effort}
+        deadline = time.monotonic() + self.timeout
+        with self._active(session_key), self._request_client(session_key) as client:
+            for retry_index in range(_MAX_RETRIES + 1):
+                emitted_text = False
+                try:
+                    for event in self._stream_once(client, body, session_key, deadline):
+                        if event.text_delta:
+                            emitted_text = True
+                        yield event
+                    return
+                except OpenRouterError as error:
+                    self._raise_if_cancelled(session_key)
+                    if (
+                        emitted_text
+                        or retry_index >= _MAX_RETRIES
+                        or not self._retryable(error)
+                    ):
+                        raise
+                    self._wait_to_retry(error, retry_index, deadline, session_key)
+
+    def _stream_once(
+        self,
+        client: httpx.Client,
+        body: dict[str, Any],
+        session_key: object,
+        deadline: float,
+    ) -> Iterator[ModelStreamEvent]:
+        """Make one streaming attempt inside a logical request."""
         try:
-            if self.client is None:
-                with (
-                    httpx.Client(timeout=self.timeout) as client,
-                    self._active(
-                        session_key,
-                        client=client,
-                        close_client_on_cancel=True,
-                    ),
-                ):
-                    yield from self._stream_response(client, body, session_key)
-            else:
-                with self._active(session_key, client=self.client):
-                    yield from self._stream_response(self.client, body, session_key)
+            yield from self._stream_response(client, body, session_key, deadline)
+        except httpx.TransportError as error:
+            raise OpenRouterError(
+                "openrouter_transport",
+                f"OpenRouter request failed: {error}",
+                retryable=True,
+            ) from error
         except (httpx.HTTPError, httpx.StreamError) as error:
             raise OpenRouterError(
-                "openrouter_transport", f"OpenRouter request failed: {error}"
+                "openrouter_transport",
+                f"OpenRouter request failed: {error}",
+                retryable=False,
             ) from error
 
     def _stream_response(
-        self, client: httpx.Client, body: dict[str, Any], session_key: object
+        self,
+        client: httpx.Client,
+        body: dict[str, Any],
+        session_key: object,
+        deadline: float,
     ) -> Iterator[ModelStreamEvent]:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -404,7 +480,6 @@ class OpenRouterModel:
         saw_done = False
         stream_bytes = 0
         line_buffer = bytearray()
-        deadline = time.monotonic() + self.timeout
         with (
             client.stream(
                 "POST",
@@ -414,6 +489,7 @@ class OpenRouterModel:
                     "Accept": "text/event-stream",
                 },
                 json=body,
+                timeout=self._remaining_timeout(deadline),
             ) as response,
             self._active(session_key, response=response),
         ):
@@ -457,7 +533,10 @@ class OpenRouterModel:
                         if not isinstance(payload, Mapping):
                             raise TypeError("stream event is not an object")
                         if payload.get("error") is not None:
-                            raise self._stream_error(payload["error"])
+                            raise self._stream_error(
+                                payload["error"],
+                                error_type=payload.get("error_type"),
+                            )
                         event_type = payload.get("type")
                         if not isinstance(event_type, str):
                             raise TypeError("stream event type is invalid")
@@ -522,6 +601,7 @@ class OpenRouterModel:
                         "response.completed",
                         "response.done",
                         "response.failed",
+                        "response.incomplete",
                     }:
                         response_payload = payload.get("response")
                         if not isinstance(response_payload, Mapping):
@@ -543,7 +623,10 @@ class OpenRouterModel:
                         terminal_status = status
                         error = response_payload.get("error")
                         if error is not None:
-                            raise self._stream_error(error)
+                            raise self._stream_error(
+                                error,
+                                error_type=response_payload.get("error_type"),
+                            )
                         finish_reason = response_payload.get("finish_reason")
                         if finish_reason is not None and not isinstance(
                             finish_reason, str
@@ -588,6 +671,7 @@ class OpenRouterModel:
                 finish_reason=(
                     incomplete_reason or terminal_finish_reason or terminal_status
                 ),
+                status=terminal_status,
             )
         ordered_items = tuple(item for _, item in sorted(output_items.items()))
         calls = tuple(
@@ -626,9 +710,12 @@ class OpenRouterModel:
         )
 
     def _completion_response(
-        self, client: httpx.Client, body: dict[str, Any], session_key: object
+        self,
+        client: httpx.Client,
+        body: dict[str, Any],
+        session_key: object,
+        deadline: float,
     ) -> str:
-        deadline = time.monotonic() + self.timeout
         response_bytes = bytearray()
         with (
             client.stream(
@@ -636,6 +723,7 @@ class OpenRouterModel:
                 f"{self.base_url}/responses",
                 headers={**self._headers(), "Accept": "application/json"},
                 json=body,
+                timeout=self._remaining_timeout(deadline),
             ) as response,
             self._active(session_key, response=response),
         ):
@@ -660,11 +748,30 @@ class OpenRouterModel:
             if not isinstance(payload, Mapping):
                 raise TypeError("response is not an object")
             if payload.get("error") is not None:
-                raise self._stream_error(payload["error"])
-            if payload.get("status") != "completed" or payload.get(
-                "finish_reason"
-            ) not in {None, "stop"}:
-                raise TypeError("completion did not complete normally")
+                raise self._stream_error(
+                    payload["error"], error_type=payload.get("error_type")
+                )
+            status = payload.get("status")
+            finish_reason = payload.get("finish_reason")
+            if status is not None and not isinstance(status, str):
+                raise TypeError("completion status is invalid")
+            if finish_reason is not None and not isinstance(finish_reason, str):
+                raise TypeError("completion finish reason is invalid")
+            details = payload.get("incomplete_details")
+            incomplete_reason = (
+                details.get("reason")
+                if isinstance(details, Mapping)
+                and isinstance(details.get("reason"), str)
+                else None
+            )
+            if status != "completed" or finish_reason not in {None, "stop"}:
+                reason = incomplete_reason or finish_reason or status
+                raise OpenRouterError(
+                    "openrouter_finish_reason",
+                    f"OpenRouter returned an invalid completion: {reason}",
+                    finish_reason=reason,
+                    status=status,
+                )
             output = payload.get("output")
             if not isinstance(output, list):
                 raise TypeError("response output is invalid")
@@ -695,6 +802,22 @@ class OpenRouterModel:
         }
 
     @contextmanager
+    def _request_client(self, session_key: object) -> Iterator[httpx.Client]:
+        """Keep one HTTP client alive for every attempt in a logical request."""
+        if self.client is not None:
+            yield self.client
+            return
+        with (
+            httpx.Client(timeout=self.timeout) as client,
+            self._active(
+                session_key,
+                client=client,
+                close_client_on_cancel=True,
+            ),
+        ):
+            yield client
+
+    @contextmanager
     def _active(
         self,
         session_key: object,
@@ -705,13 +828,14 @@ class OpenRouterModel:
     ) -> Iterator[None]:
         with self._active_lock:
             state = self._active_sessions.setdefault(session_key, _ActiveSession())
+            state.operations += 1
             if client is not None and close_client_on_cancel:
                 state.clients[id(client)] = client
             if response is not None:
                 state.responses[id(response)] = response
-            cancel_requested = state.cancel_requested
+            cancelled = state.cancelled
         try:
-            if cancel_requested:
+            if cancelled.is_set():
                 if response is not None:
                     with suppress(Exception):
                         response.close()
@@ -726,6 +850,7 @@ class OpenRouterModel:
             with self._active_lock:
                 state = self._active_sessions.get(session_key)
                 if state is not None:
+                    state.operations -= 1
                     if client is not None and state.clients.get(id(client)) is client:
                         state.clients.pop(id(client), None)
                     if (
@@ -734,19 +859,101 @@ class OpenRouterModel:
                     ):
                         state.responses.pop(id(response), None)
                     if (
-                        not state.cancel_requested
+                        not state.cancelled.is_set()
+                        and not state.operations
                         and not state.clients
                         and not state.responses
                     ):
                         self._active_sessions.pop(session_key, None)
 
     @staticmethod
-    def _stream_error(error: Any) -> OpenRouterError:
+    def _stream_error(error: Any, *, error_type: Any = None) -> OpenRouterError:
         message = error.get("message") if isinstance(error, Mapping) else None
+        normalized_type = error_type if isinstance(error_type, str) else None
+        if isinstance(error, Mapping):
+            for field_name in ("type", "code"):
+                value = error.get(field_name)
+                if isinstance(value, str):
+                    normalized_type = normalized_type or value
         return OpenRouterError(
             "openrouter_stream",
             str(message or "OpenRouter returned a stream error"),
+            **({"error_type": normalized_type} if normalized_type else {}),
         )
+
+    def _raise_if_cancelled(self, session_key: object) -> None:
+        with self._active_lock:
+            state = self._active_sessions.get(session_key)
+            cancelled = state is not None and state.cancelled.is_set()
+        if cancelled:
+            raise OpenRouterError(
+                "openrouter_cancelled", "OpenRouter request was cancelled"
+            )
+
+    @staticmethod
+    def _remaining_timeout(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OpenRouterError(
+                "openrouter_timeout", "OpenRouter request exceeded its timeout"
+            )
+        return remaining
+
+    @staticmethod
+    def _retryable(error: OpenRouterError) -> bool:
+        if error.code == "openrouter_transport":
+            return error.details.get("retryable") is True
+        if error.code in {"openrouter_timeout", "openrouter_truncated"}:
+            return True
+        if error.code == "openrouter_http":
+            status = error.details.get("status")
+            return isinstance(status, int) and (
+                status in _RETRYABLE_HTTP_STATUSES or status >= 500
+            )
+        if error.code == "openrouter_stream":
+            error_type = error.details.get("error_type")
+            return (
+                isinstance(error_type, str)
+                and error_type.lower() in _RETRYABLE_ERROR_TYPES
+            )
+        if error.code != "openrouter_finish_reason":
+            return False
+        reason = error.details.get("finish_reason")
+        normalized_reason = reason.lower() if isinstance(reason, str) else None
+        if normalized_reason in _PERMANENT_FINISH_REASONS:
+            return False
+        status = error.details.get("status")
+        return status in {"failed", "incomplete"} or (
+            normalized_reason in _RETRYABLE_FINISH_REASONS
+        )
+
+    @staticmethod
+    def _retry_delay(error: OpenRouterError, retry_index: int) -> float:
+        delay = _RETRY_BASE_DELAY * (2**retry_index)
+        retry_after = error.details.get("retry_after")
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+            delay = max(delay, min(float(retry_after), _RETRY_AFTER_MAX_DELAY))
+        return delay
+
+    def _wait_to_retry(
+        self,
+        error: OpenRouterError,
+        retry_index: int,
+        deadline: float,
+        session_key: object,
+    ) -> None:
+        self._raise_if_cancelled(session_key)
+        remaining = self._remaining_timeout(deadline)
+        delay = min(self._retry_delay(error, retry_index), remaining)
+        with self._active_lock:
+            state = self._active_sessions.get(session_key)
+            cancelled = state.cancelled if state is not None else None
+        if cancelled is not None and cancelled.wait(delay):
+            raise OpenRouterError(
+                "openrouter_cancelled", "OpenRouter request was cancelled"
+            )
+        self._raise_if_cancelled(session_key)
+        self._remaining_timeout(deadline)
 
     @staticmethod
     def _wire_tool(tool: dict[str, Any]) -> dict[str, Any]:
@@ -931,10 +1138,20 @@ class OpenRouterModel:
             )
         except ValueError:
             message = None
+        details: dict[str, Any] = {"status": response.status_code}
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                seconds = float(retry_after)
+            except ValueError:
+                pass
+            else:
+                if math.isfinite(seconds) and seconds >= 0:
+                    details["retry_after"] = min(seconds, _RETRY_AFTER_MAX_DELAY)
         return OpenRouterError(
             "openrouter_http",
             message or f"OpenRouter returned HTTP {response.status_code}",
-            status=response.status_code,
+            **details,
         )
 
 
