@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import math
 import os
 import select
 import signal
@@ -74,6 +75,22 @@ def _is_safe_environment_variable(name: str) -> bool:
     return False
 
 
+def _deadline_after_milliseconds(timeout_ms: int) -> float:
+    """Return a monotonic deadline, saturating unrepresentably large waits."""
+    try:
+        return time.monotonic() + timeout_ms / 1000
+    except OverflowError:
+        return math.inf
+
+
+def _deadline_after_seconds(timeout: float) -> float:
+    """Return a monotonic deadline, saturating unrepresentably large waits."""
+    try:
+        return time.monotonic() + timeout
+    except OverflowError:
+        return math.inf
+
+
 class _ControlSanitizer:
     """Strip terminal controls while preserving ordinary whitespace and text."""
 
@@ -134,7 +151,7 @@ class _ToolRun:
 class IsolatedToolRunner:
     """Run an entire editable tool call tree outside the provider process."""
 
-    def __init__(self, kernel: Kernel, *, timeout: float = 120.0) -> None:
+    def __init__(self, kernel: Kernel, *, timeout: float | None = None) -> None:
         self.kernel = kernel
         self.timeout = timeout
         self._runs: dict[str, _ToolRun] = {}
@@ -246,28 +263,33 @@ class IsolatedToolRunner:
             return self._status_locked(run)
 
     def wait_tool_run(
-        self, run_id: str, *, session_id: str, timeout_ms: int = 30_000
+        self, run_id: str, *, session_id: str, timeout_ms: int | None = None
     ) -> dict[str, Any]:
-        """Wait for a visible ToolRun to finish, bounded by ``timeout_ms``."""
-        if (
+        """Wait for a visible ToolRun, optionally bounded by ``timeout_ms``."""
+        if timeout_ms is not None and (
             isinstance(timeout_ms, bool)
             or not isinstance(timeout_ms, int)
-            or not 0 <= timeout_ms <= 30_000
+            or timeout_ms < 0
         ):
             raise ToolboxError(
                 "invalid_tool_run_request",
-                "tool run timeout_ms must be an integer from 0 through 30000",
+                "tool run timeout_ms must be a non-negative integer",
             )
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = (
+            None if timeout_ms is None else _deadline_after_milliseconds(timeout_ms)
+        )
         with self._runs_changed:
             run = self._visible_run_locked(run_id, session_id)
             while run.status in {"running", "cancelling"}:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    result = self._status_locked(run)
-                    result["timed_out"] = True
-                    return result
-                self._runs_changed.wait(remaining)
+                if deadline is None:
+                    self._runs_changed.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        result = self._status_locked(run)
+                        result["timed_out"] = True
+                        return result
+                    self._runs_changed.wait(min(1.0, remaining))
             return self._terminal_snapshot_locked(run)
 
     def cancel_tool_run(self, run_id: str, *, session_id: str) -> dict[str, Any]:
@@ -681,19 +703,26 @@ class IsolatedToolRunner:
                         daemon=True,
                     )
                     broker_thread.start()
-                deadline = time.monotonic() + self.timeout
+                deadline = (
+                    None
+                    if self.timeout is None
+                    else _deadline_after_seconds(self.timeout)
+                )
                 while process.poll() is None:
                     after = self._relay(session_id, after, on_event)
                     if cancelled is not None and cancelled():
                         raise ToolboxError("cancelled", "rollout stopped")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise ToolboxError(
-                            "tool_timeout",
-                            f"tool call exceeded {self.timeout:g} seconds",
-                        )
+                    wait_interval = 0.1
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ToolboxError(
+                                "tool_timeout",
+                                f"tool call exceeded {self.timeout:g} seconds",
+                            )
+                        wait_interval = min(wait_interval, remaining)
                     try:
-                        process.wait(timeout=min(0.1, remaining))
+                        process.wait(timeout=wait_interval)
                     except subprocess.TimeoutExpired:
                         pass
                 after = self._relay(session_id, after, on_event)
@@ -743,7 +772,7 @@ class IsolatedToolRunner:
                     output_thread.join()
                 broker_stuck = False
                 if broker_thread is not None:
-                    broker_thread.join(timeout=min(1.0, max(0.1, self.timeout)))
+                    broker_thread.join(timeout=1.0)
                     broker_stuck = broker_thread.is_alive()
                 if provider_was_cancelled and not broker_stuck:
                     self._reset_model_provider(model_provider)

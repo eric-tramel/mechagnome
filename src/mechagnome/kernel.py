@@ -34,6 +34,15 @@ if TYPE_CHECKING:
 
 JsonValue = Any
 
+
+def _deadline_after_milliseconds(timeout_ms: int) -> float:
+    """Return a monotonic deadline, saturating unrepresentably large waits."""
+    try:
+        return time.monotonic() + timeout_ms / 1000
+    except OverflowError:
+        return math.inf
+
+
 _SCHEMA_VERSION = 14
 _SESSION_KINDS = frozenset({"generic", "conversation", "completion"})
 _SESSION_METADATA_LIMITS = {"title": 256, "description": 4096}
@@ -585,21 +594,29 @@ class _KernelCapability:
             {"operation": "get", "run_id": run_id}
         )
 
-    async def wait_tool_run(self, run_id: str, timeout_ms: int = 30_000) -> JsonValue:
+    async def wait_tool_run(
+        self, run_id: str, timeout_ms: int | None = None
+    ) -> JsonValue:
         """Wait without blocking the authored tool event loop."""
         self._require("wait_tool_run")
-        if (
+        if timeout_ms is not None and (
             isinstance(timeout_ms, bool)
             or not isinstance(timeout_ms, int)
-            or not 0 <= timeout_ms <= 30_000
+            or timeout_ms < 0
         ):
             raise ToolboxError(
                 "invalid_tool_run_request",
-                "tool run timeout_ms must be an integer from 0 through 30000",
+                "tool run timeout_ms must be a non-negative integer",
             )
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = (
+            None if timeout_ms is None else _deadline_after_milliseconds(timeout_ms)
+        )
         while True:
-            remaining_ms = max(0, round((deadline - time.monotonic()) * 1000))
+            remaining_ms = (
+                100
+                if deadline is None or math.isinf(deadline)
+                else max(0, round((deadline - time.monotonic()) * 1000))
+            )
             result = await asyncio.to_thread(
                 self._context._state.model_provider.tool_run,
                 {
@@ -610,7 +627,7 @@ class _KernelCapability:
             )
             if not isinstance(result, dict) or not result.get("timed_out"):
                 return result
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return result
 
     def cancel_tool_run(self, run_id: str) -> JsonValue:

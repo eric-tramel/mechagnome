@@ -485,14 +485,14 @@ intentionally lets authored tools spend the configured provider account. Direct
 provider-isolation claim. Treat the experiment key as expendable and assume
 agent-authored code can spend or exfiltrate it.
 
-Nested tool calls remain together in the worker, and the host terminates the
-process group after 120 seconds. Committed events are relayed to the TUI from
-SQLite while the worker runs. Tools still retain ordinary filesystem, process,
-and network access; they can corrupt the database, inspect files available to
-the current OS user, consume resources, or attack other local processes through
-facilities the OS permits. Context capabilities prevent accidental
-architectural confusion, not hostile source. Nested depth and call-count bounds
-supplement the worker timeout.
+Nested tool calls remain together in the worker. Mechagnome does not impose a
+worker timeout; callers may opt into one when constructing a tool runner.
+Committed events are relayed to the TUI from SQLite while the worker runs. Tools
+still retain ordinary filesystem, process, and network access; they can corrupt
+the database, inspect files available to the current OS user, consume resources,
+or attack other local processes through facilities the OS permits. Context
+capabilities prevent accidental architectural confusion, not hostile source.
+Nested depth and call-count bounds still constrain recursive tool composition.
 
 Run experiments in a disposable environment, use a tightly capped OpenRouter
 key created only for that experiment, restrict its spend externally, and expose

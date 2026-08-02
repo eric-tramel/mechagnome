@@ -83,6 +83,32 @@ def test_normal_process_cleanup_still_signals_sigterm_first(
     assert signals[0] == signal.SIGTERM
 
 
+def test_tool_runner_does_not_impose_a_default_timeout(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = kernel_at(tmp_path)
+    write(
+        kernel,
+        "identity",
+        "async def main(input, ctx):\n    return input['value']\n",
+    )
+    runner = IsolatedToolRunner(kernel)
+
+    def unexpected_deadline() -> float:
+        raise AssertionError("default tool execution must not create a deadline")
+
+    monkeypatch.setattr(isolation_module.time, "monotonic", unexpected_deadline)
+
+    assert (
+        runner.call(
+            "call_tool",
+            {"name": "identity", "args": {"value": 42}},
+            session_id=kernel.create_session(),
+        )
+        == 42
+    )
+
+
 class AnnotationOnlyProvider:
     """Fail loudly if an annotation-only session handle tries to prompt."""
 
@@ -5328,7 +5354,7 @@ def test_tool_run_tools_control_authored_nested_detachment(tmp_path: Path) -> No
                     "cancel": ("cancel_tool_run", {"run_id": self.run_id}),
                     "wait": (
                         "wait_tool_run",
-                        {"run_id": self.run_id, "timeout_ms": 30_000},
+                        {"run_id": self.run_id, "timeout_ms": 10**1000},
                     ),
                 }[prompt]
                 return ModelTurn(calls=(ToolCall(*operation, prompt),))
@@ -5483,10 +5509,20 @@ def test_tool_run_visibility_allows_creator_ancestors_but_hides_siblings(
         session_id=child,
     )
 
-    completed = runner.wait_tool_run(
-        handle["run_id"], session_id=root, timeout_ms=30_000
-    )
+    completed = runner.wait_tool_run(handle["run_id"], session_id=root)
     assert completed["result"] == 42
+    assert (
+        runner.wait_tool_run(handle["run_id"], session_id=root, timeout_ms=60_000)[
+            "result"
+        ]
+        == 42
+    )
+    assert (
+        runner.wait_tool_run(handle["run_id"], session_id=root, timeout_ms=10**1000)[
+            "result"
+        ]
+        == 42
+    )
     with pytest.raises(ToolboxError) as hidden:
         runner.get_tool_run(handle["run_id"], session_id=sibling)
     assert hidden.value.code == "unknown_tool_run"

@@ -1232,7 +1232,7 @@ class Conversation:
             return self.tool_runner.wait_tool_run(
                 run_id,
                 session_id=self.session_id,
-                timeout_ms=args.get("timeout_ms", 30_000),
+                timeout_ms=args.get("timeout_ms"),
             )
         return self.tool_runner.cancel_tool_run(
             run_id,

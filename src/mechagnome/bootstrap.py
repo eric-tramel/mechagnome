@@ -139,7 +139,6 @@ WAIT_TOOL_RUN_SCHEMA = {
         "timeout_ms": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 30000,
         },
     },
     "required": ["run_id"],
@@ -433,9 +432,10 @@ WAIT_TOOL_RUN_SOURCE = dedent(
     """Wait for one detached tool invocation to finish or time out."""
 
     async def main(input, ctx):
-        return await ctx.kernel.wait_tool_run(
-            input["run_id"], timeout_ms=input.get("timeout_ms", 30000)
-        )
+        timeout_ms = input.get("timeout_ms")
+        if timeout_ms is None:
+            return await ctx.kernel.wait_tool_run(input["run_id"])
+        return await ctx.kernel.wait_tool_run(input["run_id"], timeout_ms=timeout_ms)
     '''
 )
 
