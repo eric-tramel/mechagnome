@@ -113,11 +113,11 @@ copying retained output into the conversation:
 ```
 
 Call `get_tool_run` with that input for lightweight status. Call
-`wait_tool_run` with optional `timeout_ms` (0–30000) to wait for completion; a
-nonterminal timeout adds `timed_out=true`, while a terminal response includes
-the bounded merged stdout/stderr `output_tail` and `truncated`. Success includes
-`result` (including explicit `null`); failure or cancellation includes a typed
-`error`. Polling is repeated `get_tool_run`.
+`wait_tool_run` to wait until completion, or supply a non-negative `timeout_ms`
+to bound that wait. A nonterminal timeout adds `timed_out=true`, while a terminal
+response includes the bounded merged stdout/stderr `output_tail` and
+`truncated`. Success includes `result` (including explicit `null`); failure or
+cancellation includes a typed `error`. Polling is repeated `get_tool_run`.
 
 Request cancellation with:
 

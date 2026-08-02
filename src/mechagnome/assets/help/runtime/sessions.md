@@ -275,8 +275,9 @@ Normal `call_succeeded` and `call_failed` payloads include `duration_ms`, measur
 with a monotonic clock from after `call_started` commits through source loading,
 `main`, nested calls, and result validation. The event's `tool_version_id`
 attributes that sample to the resolved version. Nested durations are inclusive,
-so parent and child durations must not be summed. Calls interrupted by timeout,
-cancellation, or worker failure may have no terminal event or duration sample.
+so parent and child durations must not be summed. Calls interrupted by an
+explicit caller timeout, cancellation, or worker failure may have no terminal
+event or duration sample.
 
 Session reads are not an authorization boundary: a tool can list saved sessions
 and read one when it knows the ID. Prompt and annotation mutations are
