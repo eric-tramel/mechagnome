@@ -7,8 +7,9 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from importlib.resources import files
 from threading import Event, Lock
@@ -44,6 +45,25 @@ _RETRYABLE_ERROR_TYPES = frozenset(
         "unmapped",
     }
 )
+_ACTIONABLE_ERROR_TYPES = frozenset(
+    {
+        "authentication",
+        "content_policy_violation",
+        "context_length_exceeded",
+        "invalid_prompt",
+        "invalid_request",
+        "max_tokens_exceeded",
+        "payment_required",
+        "permission_denied",
+        "refusal",
+        "string_too_long",
+        "token_limit_exceeded",
+    }
+)
+_KNOWN_ERROR_TYPES = _RETRYABLE_ERROR_TYPES | _ACTIONABLE_ERROR_TYPES
+_SESSION_RECOVERY_ERROR_TYPES = frozenset(
+    {"context_length_exceeded", "invalid_prompt", "string_too_long"}
+)
 _RETRYABLE_FINISH_REASONS = frozenset(
     {"error", "failed", "incomplete", "provider_error", "server_error"}
 )
@@ -73,6 +93,200 @@ _PUBLIC_ERROR_MESSAGES = {
     "openrouter_transport": "OpenRouter transport failed",
     "openrouter_truncated": "OpenRouter stream ended unexpectedly",
 }
+
+
+def _attempt_suffix(details: Mapping[str, Any]) -> str:
+    attempts = details.get("attempts")
+    if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 1:
+        return f" after {attempts} attempts"
+    return ""
+
+
+def _public_error_guidance(
+    code: str, details: Mapping[str, Any]
+) -> tuple[str, tuple[str, ...]]:
+    """Build provider-safe diagnostics and user actions from trusted fields."""
+    suffix = _attempt_suffix(details)
+    status = details.get("status")
+    status = (
+        status
+        if isinstance(status, int)
+        and not isinstance(status, bool)
+        and 100 <= status <= 599
+        else None
+    )
+    retryable = details.get("retryable") is True
+    error_type = details.get("error_type")
+    error_type = (
+        error_type.lower()
+        if isinstance(error_type, str) and error_type.lower() in _KNOWN_ERROR_TYPES
+        else None
+    )
+
+    if error_type == "context_length_exceeded":
+        return (
+            "This session's history exceeds the selected model's context window.",
+            (
+                "Compact the session and continue; repeated retries in the same "
+                "session will not help.",
+            ),
+        )
+    if error_type in {"max_tokens_exceeded", "token_limit_exceeded"}:
+        return (
+            "OpenRouter stopped because the request exceeded a token limit.",
+            ("Reduce the request size or output length, then retry.",),
+        )
+    if error_type == "string_too_long":
+        return (
+            "One item in the session is too large for the selected model.",
+            ("Compact the session or start a new one, then retry.",),
+        )
+    if error_type in {"invalid_prompt", "invalid_request"}:
+        return (
+            "OpenRouter rejected an item in the session history.",
+            (
+                "Compact the session or start a new one; repeated retries will not "
+                "help.",
+            ),
+        )
+    if error_type == "authentication":
+        return (
+            "OpenRouter rejected the configured credentials.",
+            (f"Check {DEFAULT_KEY_ENV} and the key's account access, then retry.",),
+        )
+    if error_type == "payment_required":
+        return (
+            "OpenRouter rejected the request because the account has insufficient "
+            "credits.",
+            ("Add credits or choose an available model, then retry.",),
+        )
+    if error_type == "permission_denied":
+        return (
+            "OpenRouter denied this request.",
+            ("Check the key permissions and guardrails, or switch models.",),
+        )
+    if error_type in {"content_policy_violation", "refusal"}:
+        return (
+            "OpenRouter or the selected model blocked the request for content policy.",
+            ("Rephrase the request or choose a model appropriate for the content.",),
+        )
+
+    if code == "missing_api_key":
+        return (
+            "OpenRouter cannot start because its API key is missing.",
+            (f"Set {DEFAULT_KEY_ENV}, then retry the message.",),
+        )
+    if code == "openrouter_http":
+        if status in {401, 403}:
+            return (
+                f"OpenRouter rejected the configured credentials (HTTP {status}).",
+                (f"Check {DEFAULT_KEY_ENV} and the key's account access, then retry.",),
+            )
+        if status == 402:
+            return (
+                "OpenRouter rejected the request because the account has insufficient "
+                "credits (HTTP 402).",
+                ("Add credits or choose an available model, then retry.",),
+            )
+        if status == 404:
+            return (
+                "OpenRouter could not find the selected model or endpoint (HTTP 404).",
+                ("Check the selected model name or switch models, then retry.",),
+            )
+        if status == 429:
+            return (
+                f"OpenRouter rate-limited the request (HTTP 429){suffix}.",
+                (
+                    "Retry the message later; if it continues, switch models or check "
+                    "OpenRouter's status page.",
+                ),
+            )
+        if status is not None and (status in {408, 409} or status >= 500):
+            return (
+                f"OpenRouter or its upstream provider returned a temporary HTTP "
+                f"{status} error{suffix}.",
+                (
+                    "Retry the message; if it continues, switch models or check "
+                    "OpenRouter's status page.",
+                ),
+            )
+        status_text = f" (HTTP {status})" if status is not None else ""
+        return (
+            f"OpenRouter rejected the request{status_text}.",
+            (
+                "Check that the selected model supports the requested tools and "
+                "reasoning settings, or switch models. If this repeats only in this "
+                "session, compact it or start a new one.",
+            ),
+        )
+    if code == "openrouter_transport":
+        return (
+            f"Mechagnome could not reach OpenRouter{suffix}.",
+            (
+                "Check the network connection and retry; if it continues, check "
+                "OpenRouter's status page.",
+            ),
+        )
+    if code == "openrouter_timeout":
+        return (
+            f"OpenRouter did not respond before the request timed out{suffix}.",
+            ("Retry the message; if it continues, switch models.",),
+        )
+    if code == "openrouter_truncated":
+        return (
+            f"OpenRouter ended the response before it completed{suffix}.",
+            ("Retry the message; if it continues, switch models.",),
+        )
+    if code == "openrouter_finish_reason":
+        reason = details.get("finish_reason")
+        normalized = reason.lower() if isinstance(reason, str) else None
+        if normalized in {"length", "max_output_tokens", "max_tokens"}:
+            return (
+                "The model stopped because it reached its output limit.",
+                ("Send 'continue', or split the request into smaller steps.",),
+            )
+        if normalized in {"content_filter", "content_policy", "refusal", "safety"}:
+            return (
+                "The model stopped because of a safety or content-policy decision.",
+                (
+                    "Rephrase the request or choose a model appropriate for the "
+                    "content.",
+                ),
+            )
+        return (
+            f"OpenRouter's provider stopped unexpectedly{suffix}.",
+            (
+                "Retry the message; if it continues, switch models or check "
+                "OpenRouter's status page.",
+            ),
+        )
+    if code == "openrouter_stream":
+        return (
+            f"OpenRouter's response stream failed{suffix}.",
+            (
+                "Retry the message; if it continues, switch models or check "
+                "OpenRouter's status page.",
+            ),
+        )
+    if code in {
+        "openrouter_models",
+        "openrouter_response",
+        "openrouter_response_too_large",
+        "openrouter_tool_call",
+    }:
+        return (
+            f"The selected model returned a response Mechagnome could not use{suffix}.",
+            ("Retry once; if it continues, switch models and report the session ID.",),
+        )
+    if code == "openrouter_cancelled":
+        return ("The OpenRouter request was cancelled.", ("Send the message again.",))
+
+    message = _PUBLIC_ERROR_MESSAGES.get(code, "OpenRouter request failed")
+    actions = ("Retry the message; if it continues, switch models.",)
+    if not retryable:
+        actions = ("Check the request and selected model, then retry.",)
+    return (f"{message}{suffix}.", actions)
+
 
 # Open-ended nested objects are not represented consistently by every model or
 # provider behind a Responses-compatible tool-calling endpoint. Keep the kernel's
@@ -111,6 +325,40 @@ class OpenRouterError(ModelTransportError):
             public_message=_PUBLIC_ERROR_MESSAGES.get(code),
             **details,
         )
+
+    def public_error(self) -> dict[str, Any]:
+        """Return sanitized diagnostics plus concrete recovery guidance."""
+        message, actions = _public_error_guidance(self.code, self.details)
+        if self.details.get("retry_suppressed") == "visible_output":
+            actions = (
+                "The response had already started, so Mechagnome did not retry it "
+                "and risk duplicate output; send 'continue' to resume.",
+            )
+        details: dict[str, Any] = {}
+        for name in ("attempts", "max_attempts", "status"):
+            value = self.details.get(name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                details[name] = value
+        retryable = self.details.get("retryable")
+        if isinstance(retryable, bool):
+            details["retryable"] = retryable
+        suppressed = self.details.get("retry_suppressed")
+        if suppressed == "visible_output":
+            details["retry_suppressed"] = suppressed
+        error_type = self.details.get("error_type")
+        if isinstance(error_type, str) and error_type.lower() in _KNOWN_ERROR_TYPES:
+            normalized_type = error_type.lower()
+            details["error_type"] = normalized_type
+            if (
+                normalized_type in _SESSION_RECOVERY_ERROR_TYPES
+                and suppressed != "visible_output"
+            ):
+                details["recovery"] = "compact_session"
+        return {
+            "code": self.code,
+            "message": " ".join((message, *actions)),
+            "details": details,
+        }
 
 
 @dataclass(frozen=True)
@@ -164,6 +412,9 @@ class OpenRouterModel:
         self.client = client
         self._active_lock = Lock()
         self._active_sessions: dict[object, _ActiveSession] = {}
+        self._retry_sink: ContextVar[Callable[[dict[str, Any]], None] | None] = (
+            ContextVar(f"openrouter_retry_sink_{id(self)}", default=None)
+        )
 
     @property
     def ready(self) -> bool:
@@ -181,6 +432,15 @@ class OpenRouterModel:
     def for_session(self, session_id: str) -> _SessionOpenRouterModel:
         """Return a view isolated to one conversation cancellation domain."""
         return _SessionOpenRouterModel(self, session_id)
+
+    @contextmanager
+    def capture_retries(self, sink: Callable[[dict[str, Any]], None]) -> Iterator[None]:
+        """Route retry notices to the durable session owning this request."""
+        token = self._retry_sink.set(sink)
+        try:
+            yield
+        finally:
+            self._retry_sink.reset(token)
 
     def _cancel_session(self, session_key: object) -> None:
         with self._active_lock:
@@ -338,9 +598,23 @@ class OpenRouterModel:
                     return self._complete_once(client, body, session_key, deadline)
                 except OpenRouterError as error:
                     self._raise_if_cancelled(session_key)
-                    if retry_index >= _MAX_RETRIES or not self._retryable(error):
+                    retryable = self._retryable(error)
+                    if retry_index >= _MAX_RETRIES or not retryable:
+                        self._finalize_error(
+                            error,
+                            attempts=retry_index + 1,
+                            retryable=retryable,
+                        )
                         raise
-                    self._wait_to_retry(error, retry_index, deadline, session_key)
+                    try:
+                        self._wait_to_retry(error, retry_index, deadline, session_key)
+                    except OpenRouterError as retry_error:
+                        self._finalize_error(
+                            retry_error,
+                            attempts=retry_index + 1,
+                            retryable=self._retryable(retry_error),
+                        )
+                        raise
         raise AssertionError("OpenRouter completion retry loop did not return")
 
     def _complete_once(
@@ -408,13 +682,26 @@ class OpenRouterModel:
                     return
                 except OpenRouterError as error:
                     self._raise_if_cancelled(session_key)
-                    if (
-                        emitted_text
-                        or retry_index >= _MAX_RETRIES
-                        or not self._retryable(error)
-                    ):
+                    retryable = self._retryable(error)
+                    if emitted_text or retry_index >= _MAX_RETRIES or not retryable:
+                        self._finalize_error(
+                            error,
+                            attempts=retry_index + 1,
+                            retryable=retryable,
+                            retry_suppressed=(
+                                "visible_output" if emitted_text else None
+                            ),
+                        )
                         raise
-                    self._wait_to_retry(error, retry_index, deadline, session_key)
+                    try:
+                        self._wait_to_retry(error, retry_index, deadline, session_key)
+                    except OpenRouterError as retry_error:
+                        self._finalize_error(
+                            retry_error,
+                            attempts=retry_index + 1,
+                            retryable=self._retryable(retry_error),
+                        )
+                        raise
 
     def _stream_once(
         self,
@@ -452,6 +739,7 @@ class OpenRouterModel:
         total_tokens: int | None = None
         terminal_status: str | None = None
         terminal_finish_reason: str | None = None
+        terminal_error_type: str | None = None
         incomplete_reason: str | None = None
         saw_done = False
         stream_bytes = 0
@@ -612,6 +900,9 @@ class OpenRouterModel:
                                 "OpenRouter returned an invalid finish reason",
                             )
                         terminal_finish_reason = finish_reason
+                        error_type = response_payload.get("error_type")
+                        if isinstance(error_type, str):
+                            terminal_error_type = error_type
                         details = response_payload.get("incomplete_details")
                         if isinstance(details, Mapping) and isinstance(
                             details.get("reason"), str
@@ -648,6 +939,11 @@ class OpenRouterModel:
                     incomplete_reason or terminal_finish_reason or terminal_status
                 ),
                 status=terminal_status,
+                **(
+                    {"error_type": terminal_error_type}
+                    if terminal_error_type is not None
+                    else {}
+                ),
             )
         ordered_items = tuple(item for _, item in sorted(output_items.items()))
         calls = tuple(
@@ -742,11 +1038,17 @@ class OpenRouterModel:
             )
             if status != "completed" or finish_reason not in {None, "stop"}:
                 reason = incomplete_reason or finish_reason or status
+                error_type = payload.get("error_type")
                 raise OpenRouterError(
                     "openrouter_finish_reason",
                     f"OpenRouter returned an invalid completion: {reason}",
                     finish_reason=reason,
                     status=status,
+                    **(
+                        {"error_type": error_type}
+                        if isinstance(error_type, str)
+                        else {}
+                    ),
                 )
             output = payload.get("output")
             if not isinstance(output, list):
@@ -877,6 +1179,9 @@ class OpenRouterModel:
 
     @staticmethod
     def _retryable(error: OpenRouterError) -> bool:
+        error_type = error.details.get("error_type")
+        if isinstance(error_type, str) and error_type.lower() in _KNOWN_ERROR_TYPES:
+            return error_type.lower() in _RETRYABLE_ERROR_TYPES
         if error.code == "openrouter_transport":
             return error.details.get("retryable") is True
         if error.code in {"openrouter_timeout", "openrouter_truncated"}:
@@ -911,6 +1216,46 @@ class OpenRouterModel:
             delay = max(delay, min(float(retry_after), _RETRY_AFTER_MAX_DELAY))
         return delay
 
+    @staticmethod
+    def _finalize_error(
+        error: OpenRouterError,
+        *,
+        attempts: int,
+        retryable: bool,
+        retry_suppressed: str | None = None,
+    ) -> None:
+        """Annotate a terminal failure with safe retry diagnostics."""
+        error.details["attempts"] = attempts
+        error.details["max_attempts"] = _MAX_RETRIES + 1
+        error.details["retryable"] = retryable
+        if retry_suppressed is not None:
+            error.details["retry_suppressed"] = retry_suppressed
+
+    def _emit_retry(
+        self, error: OpenRouterError, retry_index: int, delay: float
+    ) -> None:
+        sink = self._retry_sink.get()
+        if sink is None:
+            return
+        attempt = retry_index + 2
+        max_attempts = _MAX_RETRIES + 1
+        reason, _ = _public_error_guidance(error.code, error.details)
+        delay = round(delay, 3)
+        timing = "immediately" if delay <= 0 else f"in {delay:g} seconds"
+        sink(
+            {
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay_seconds": delay,
+                "code": error.code,
+                "reason": reason,
+                "action": (
+                    f"Retrying automatically {timing} "
+                    f"(attempt {attempt} of {max_attempts})."
+                ),
+            }
+        )
+
     def _wait_to_retry(
         self,
         error: OpenRouterError,
@@ -920,7 +1265,12 @@ class OpenRouterModel:
     ) -> None:
         self._raise_if_cancelled(session_key)
         remaining = self._remaining_timeout(deadline)
-        delay = min(self._retry_delay(error, retry_index), remaining)
+        delay = self._retry_delay(error, retry_index)
+        if delay >= remaining:
+            raise OpenRouterError(
+                "openrouter_timeout", "OpenRouter retry window exceeded its timeout"
+            )
+        self._emit_retry(error, retry_index, delay)
         with self._active_lock:
             state = self._active_sessions.get(session_key)
             cancelled = state.cancelled if state is not None else None
@@ -1102,6 +1452,7 @@ class OpenRouterModel:
 
     @staticmethod
     def _http_error(response: httpx.Response) -> OpenRouterError:
+        error_type: str | None = None
         try:
             payload = response.json()
             provider_error = (
@@ -1112,9 +1463,38 @@ class OpenRouterModel:
                 if isinstance(provider_error, dict)
                 else None
             )
+            candidates: tuple[Any, ...] = (
+                payload.get("error_type") if isinstance(payload, Mapping) else None,
+                (
+                    provider_error.get("error_type")
+                    if isinstance(provider_error, Mapping)
+                    else None
+                ),
+                (
+                    provider_error.get("code")
+                    if isinstance(provider_error, Mapping)
+                    else None
+                ),
+                (
+                    provider_error.get("metadata", {}).get("error_type")
+                    if isinstance(provider_error, Mapping)
+                    and isinstance(provider_error.get("metadata"), Mapping)
+                    else None
+                ),
+            )
+            error_type = next(
+                (
+                    value.lower()
+                    for value in candidates
+                    if isinstance(value, str) and value.lower() in _KNOWN_ERROR_TYPES
+                ),
+                None,
+            )
         except ValueError:
             message = None
         details: dict[str, Any] = {"status": response.status_code}
+        if error_type is not None:
+            details["error_type"] = error_type
         retry_after = response.headers.get("Retry-After")
         if retry_after is not None:
             try:
@@ -1150,6 +1530,11 @@ class _SessionOpenRouterModel:
 
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
         return self._model._complete(messages, self._session_key)
+
+    @contextmanager
+    def capture_retries(self, sink: Callable[[dict[str, Any]], None]) -> Iterator[None]:
+        with self._model.capture_retries(sink):
+            yield
 
     def cancel_current(self) -> None:
         self._model._cancel_session(self._session_key)

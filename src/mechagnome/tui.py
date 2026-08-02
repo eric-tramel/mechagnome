@@ -588,6 +588,7 @@ class SessionTab:
     total_tokens: int | None = None
     context_model: str | None = None
     auto_compact_suppressed: bool = False
+    recover_after_context_error: bool = False
     streamed_text: str = ""
     pending_stream_text: list[str] = field(default_factory=list)
     stream_timer: Timer | None = None
@@ -2068,6 +2069,11 @@ class ToolboxApp(App[None]):
         if event.kind == "model_started":
             self._show_model_activity(state)
             self._set_status("thinking…", state)
+        elif event.kind == "model_retry":
+            self._clear_stream(state)
+            state.chat.write(self._model_retry_panel(event.payload))
+            self._show_model_activity(state)
+            self._set_status("retrying…", state)
         elif event.kind == "model_delta":
             text = str(event.payload.get("text") or "")
             state.streamed_text += text
@@ -2159,8 +2165,24 @@ class ToolboxApp(App[None]):
             self._set_status(f"{name} failed", state)
         elif event.kind in {"model_failed", "harness_failed"}:
             self._stop_active_tool_events(state)
-            self._clear_stream(state)
-            self._write_error(str(event.payload.get("message") or event.payload), state)
+            durable_partial = str(event.payload.get("partial_text") or "")
+            partial = durable_partial or (
+                state.streamed_text + "".join(state.pending_stream_text)
+            )
+            if partial:
+                self._finish_stream(state, partial, stopped=True)
+            else:
+                self._clear_stream(state)
+            details = event.payload.get("details")
+            state.recover_after_context_error = (
+                isinstance(details, dict)
+                and details.get("recovery") == "compact_session"
+                and not state.auto_compact_suppressed
+            )
+            message = str(event.payload.get("message") or event.payload)
+            if state.recover_after_context_error:
+                message += " Mechagnome is compacting into a child session now."
+            self._write_error(message, state)
         elif event.kind == "cancelled":
             self._stop_active_tool_events(state)
             durable_partial = str(event.payload.get("partial_text") or "")
@@ -2686,6 +2708,22 @@ class ToolboxApp(App[None]):
         state.chat.write(Panel(Text(message), title="error", border_style="red"))
         self._set_status("error", state)
 
+    @staticmethod
+    def _model_retry_panel(payload: dict[str, Any]) -> Panel:
+        attempt = payload.get("attempt")
+        max_attempts = payload.get("max_attempts")
+        title = "model retry"
+        if (
+            isinstance(attempt, int)
+            and not isinstance(attempt, bool)
+            and isinstance(max_attempts, int)
+            and not isinstance(max_attempts, bool)
+        ):
+            title += f" · attempt {attempt}/{max_attempts}"
+        reason = str(payload.get("reason") or "The model request failed temporarily.")
+        action = str(payload.get("action") or "Retrying automatically.")
+        return Panel(Text(f"{reason}\n{action}"), title=title, border_style="yellow")
+
     def _refresh_sidebar(self) -> None:
         # Historical inventory retains deleted lineages for audit; the effective
         # catalog intentionally contains only tools that remain callable.
@@ -3052,7 +3090,18 @@ class ToolboxApp(App[None]):
                         border_style="green",
                     )
                 )
+        elif kind == "model_retry":
+            state.session_view.write(self._model_retry_panel(payload))
         elif kind == "model_failed":
+            partial = str(payload.get("partial_text") or "")[:4000]
+            if partial:
+                state.session_view.write(
+                    self._model_panel(
+                        partial,
+                        title=f"{self._active_model_name} · stopped",
+                        border_style="yellow",
+                    )
+                )
             error = str(payload.get("message") or payload)
             state.session_view.write(
                 Panel(Text(error), title="error", border_style="red")
@@ -3185,6 +3234,8 @@ class ToolboxApp(App[None]):
         state.running = False
         state.rollout = None
         state.stop_requested = False
+        recover_after_context_error = state.recover_after_context_error
+        state.recover_after_context_error = False
         if state.status not in {"error", "stopped"}:
             state.status = "ready"
         prompt = self.query_one("#prompt", Input)
@@ -3195,6 +3246,10 @@ class ToolboxApp(App[None]):
         self._refresh_active_status()
         if state is self.active_session:
             prompt.focus()
+        if recover_after_context_error:
+            state.status = "ready"
+            self._compact_session(state, automatic=True)
+            return
         if state.status == "ready" and self._should_auto_compact(state):
             self._compact_session(state, automatic=True)
 
@@ -3299,6 +3354,7 @@ class ToolboxApp(App[None]):
         state.total_tokens = None
         state.context_model = None
         state.auto_compact_suppressed = False
+        state.recover_after_context_error = False
 
     def _forwarded_child(
         self, state: SessionTab, event: AgentEvent, name: str, args: Any

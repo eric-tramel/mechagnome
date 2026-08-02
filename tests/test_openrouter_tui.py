@@ -170,6 +170,7 @@ def sse_response(
     *payloads: dict[str, Any],
     status: str = "completed",
     finish_reason: str | None = None,
+    error_type: str | None = None,
     incomplete_reason: str | None = None,
     usage: Any = None,
     post_terminal: tuple[dict[str, Any], ...] = (),
@@ -180,6 +181,8 @@ def sse_response(
     response: dict[str, Any] = {"id": "resp-test", "status": status}
     if finish_reason is not None:
         response["finish_reason"] = finish_reason
+    if error_type is not None:
+        response["error_type"] = error_type
     if incomplete_reason is not None:
         response["incomplete_details"] = {"reason": incomplete_reason}
     if usage is not None:
@@ -318,8 +321,8 @@ def test_openrouter_adapter_uses_glm_defaults_and_translates_tool_calls(
     assert captured["body"]["store"] is False
     assert captured["body"]["stream"] is True
     system_prompt = captured["body"]["instructions"]
-    assert "async def main(input, ctx)" in system_prompt
-    assert "Await ctx.call_tool" in " ".join(system_prompt.split())
+    assert "call the `help` tool" in system_prompt
+    assert "call_tool" in system_prompt
     tools = {tool["name"]: tool for tool in captured["body"]["tools"]}
     assert tuple(tools) == CORE_NAMES
     write_schema = tools["write_tool"]["parameters"]["properties"]["input_schema"]
@@ -964,11 +967,22 @@ def test_conversation_records_openrouter_transport_failure(tmp_path: Path) -> No
         conversation.send("hello")
 
     events = kernel.read_session(conversation.session_id, limit=100)["events"]
-    assert [event["kind"] for event in events] == ["user", "model_failed"]
-    assert events[-1]["payload"] == {
-        "code": "openrouter_transport",
-        "message": "OpenRouter transport failed",
-        "details": {},
+    assert [event["kind"] for event in events] == [
+        "user",
+        "model_retry",
+        "model_retry",
+        "model_failed",
+    ]
+    assert [event["payload"]["attempt"] for event in events[1:3]] == [2, 3]
+    assert all(
+        "Retrying automatically" in event["payload"]["action"] for event in events[1:3]
+    )
+    assert events[-1]["payload"]["code"] == "openrouter_transport"
+    assert "after 3 attempts" in events[-1]["payload"]["message"]
+    assert events[-1]["payload"]["details"] == {
+        "attempts": 3,
+        "max_attempts": 3,
+        "retryable": True,
     }
     assert secret not in str(events[-1]["payload"])
 
@@ -1019,7 +1033,14 @@ def test_openrouter_retries_failed_finish_before_visible_output(
     assert bodies[0] == bodies[1]
     assert bodies[0]["store"] is False
     events = kernel.read_session(conversation.session_id, limit=100)["events"]
-    assert [event["kind"] for event in events] == ["user", "model", "final"]
+    assert [event["kind"] for event in events] == [
+        "user",
+        "model_retry",
+        "model",
+        "final",
+    ]
+    assert events[1]["payload"]["attempt"] == 2
+    assert events[1]["payload"]["max_attempts"] == 3
 
 
 def test_openrouter_does_not_retry_after_visible_text(
@@ -1044,7 +1065,7 @@ def test_openrouter_does_not_retry_after_visible_text(
     )
     events: list[ModelStreamEvent] = []
 
-    with pytest.raises(OpenRouterError, match="failed"):
+    with pytest.raises(OpenRouterError, match="failed") as failure:
         events.extend(
             model.stream(
                 [{"role": "user", "content": "hello"}],
@@ -1054,6 +1075,44 @@ def test_openrouter_does_not_retry_after_visible_text(
 
     assert [event.text_delta for event in events] == ["Partial"]
     assert requests == 1
+    public = failure.value.public_error()
+    assert public["details"]["retry_suppressed"] == "visible_output"
+    assert "send 'continue'" in public["message"]
+
+
+def test_context_error_after_visible_text_preserves_partial_without_recovery(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return sse_response(
+            {"type": "response.content_part.delta", "delta": "Partial answer"},
+            status="failed",
+            finish_reason="invalid_prompt",
+            error_type="context_length_exceeded",
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    conversation = Harness(kernel).start(model)
+
+    with pytest.raises(OpenRouterError):
+        conversation.send("continue")
+
+    assert requests == 1
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == ["user", "model_failed"]
+    failure = events[-1]["payload"]
+    assert failure["partial_text"] == "Partial answer"
+    assert failure["details"]["retry_suppressed"] == "visible_output"
+    assert "recovery" not in failure["details"]
+    assert "send 'continue'" in failure["message"]
 
 
 def test_openrouter_normalizes_nonretryable_httpx_stream_error(
@@ -1209,9 +1268,11 @@ def test_openrouter_completion_retries_retryable_http_failure(
     events = kernel.read_session(children[0]["id"], limit=100)["events"]
     assert [event["kind"] for event in events] == [
         "model_input",
+        "model_retry",
         "model",
         "final",
     ]
+    assert events[1]["payload"]["reason"].endswith("HTTP 503 error.")
 
 
 def test_openrouter_completion_retries_failed_terminal_response(
@@ -1280,12 +1341,96 @@ def test_openrouter_retry_exhaustion_records_one_sanitized_failure(
 
     assert requests == 3
     events = kernel.read_session(conversation.session_id, limit=100)["events"]
+    assert [event["kind"] for event in events] == [
+        "user",
+        "model_retry",
+        "model_retry",
+        "model_failed",
+    ]
+    assert events[-1]["payload"]["code"] == "openrouter_finish_reason"
+    assert "after 3 attempts" in events[-1]["payload"]["message"]
+    assert events[-1]["payload"]["details"]["attempts"] == 3
+    assert events[-1]["payload"]["details"]["retryable"] is True
+
+
+def test_openrouter_context_error_is_actionable_and_not_retried(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "invalid_prompt",
+                    "message": "sentinel-provider-context-detail",
+                },
+                "error_type": "context_length_exceeded",
+            },
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    conversation = Harness(kernel).start(model)
+
+    with pytest.raises(OpenRouterError):
+        conversation.send("continue")
+
+    assert requests == 1
+    events = kernel.read_session(conversation.session_id, limit=100)["events"]
     assert [event["kind"] for event in events] == ["user", "model_failed"]
-    assert events[-1]["payload"] == {
-        "code": "openrouter_finish_reason",
-        "message": "OpenRouter returned an unexpected finish reason",
-        "details": {},
+    failure = events[-1]["payload"]
+    assert "context window" in failure["message"]
+    assert "repeated retries" in failure["message"]
+    assert failure["details"] == {
+        "attempts": 1,
+        "error_type": "context_length_exceeded",
+        "max_attempts": 3,
+        "recovery": "compact_session",
+        "retryable": False,
+        "status": 400,
     }
+    assert "sentinel-provider-context-detail" not in str(failure)
+
+
+def test_openrouter_uses_native_invalid_prompt_code_as_safe_recovery_hint(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db")
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    400,
+                    json={
+                        "error": {
+                            "code": "invalid_prompt",
+                            "message": "sentinel-provider-detail",
+                        }
+                    },
+                )
+            )
+        ),
+    )
+    conversation = Harness(kernel).start(model)
+
+    with pytest.raises(OpenRouterError):
+        conversation.send("continue")
+
+    failure = kernel.read_session(conversation.session_id, limit=100)["events"][-1][
+        "payload"
+    ]
+    assert failure["details"]["error_type"] == "invalid_prompt"
+    assert failure["details"]["recovery"] == "compact_session"
+    assert "repeated retries will not help" in failure["message"]
+    assert "sentinel-provider-detail" not in str(failure)
 
 
 def test_openrouter_cancellation_interrupts_retry_backoff(tmp_path: Path) -> None:
@@ -1329,7 +1474,7 @@ def test_openrouter_cancellation_interrupts_retry_backoff(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
-    ("response", "code", "message"),
+    ("response", "code", "message_fragment"),
     [
         (
             httpx.Response(
@@ -1337,7 +1482,7 @@ def test_openrouter_cancellation_interrupts_retry_backoff(tmp_path: Path) -> Non
                 json={"error": {"message": "sentinel-provider-secret"}},
             ),
             "openrouter_http",
-            "OpenRouter returned an HTTP error",
+            "HTTP 400",
         ),
         (
             httpx.Response(
@@ -1351,7 +1496,7 @@ def test_openrouter_cancellation_interrupts_retry_backoff(tmp_path: Path) -> Non
                 ),
             ),
             "openrouter_stream",
-            "OpenRouter stream failed",
+            "response stream failed",
         ),
     ],
 )
@@ -1359,7 +1504,7 @@ def test_conversation_sanitizes_provider_controlled_openrouter_errors(
     tmp_path: Path,
     response: httpx.Response,
     code: str,
-    message: str,
+    message_fragment: str,
 ) -> None:
     kernel = Kernel(tmp_path / "toolbox.db")
     secret = "sentinel-provider-secret"
@@ -1373,11 +1518,13 @@ def test_conversation_sanitizes_provider_controlled_openrouter_errors(
         conversation.send("hello")
 
     events = kernel.read_session(conversation.session_id, limit=100)["events"]
-    assert events[-1]["payload"] == {
-        "code": code,
-        "message": message,
-        "details": {},
-    }
+    failure = events[-1]["payload"]
+    assert failure["code"] == code
+    assert message_fragment in failure["message"]
+    assert failure["details"]["attempts"] == 1
+    assert failure["details"]["max_attempts"] == 3
+    assert failure["details"]["retryable"] is False
+    assert "switch models" in failure["message"]
     assert secret not in str(events[-1]["payload"])
 
 
@@ -1410,11 +1557,15 @@ def test_completion_session_records_safe_openrouter_failure(tmp_path: Path) -> N
     ]
     assert len(children) == 1
     events = kernel.read_session(children[0]["id"], limit=100)["events"]
-    assert events[-1]["payload"] == {
-        "code": "openrouter_transport",
-        "message": "OpenRouter transport failed",
-        "details": {},
-    }
+    assert [event["kind"] for event in events] == [
+        "model_input",
+        "model_retry",
+        "model_retry",
+        "model_failed",
+    ]
+    assert events[-1]["payload"]["code"] == "openrouter_transport"
+    assert "after 3 attempts" in events[-1]["payload"]["message"]
+    assert events[-1]["payload"]["details"]["attempts"] == 3
     assert secret not in str(events[-1]["payload"])
 
 
@@ -2998,6 +3149,177 @@ def test_compact_continues_in_a_child_session_in_the_same_tab(
             assert divider.content.title == "compacted"
             with pytest.raises(RunCancelled):
                 parent.send("closed")
+
+    asyncio.run(exercise())
+
+
+def test_tui_compacts_and_continues_after_native_invalid_prompt_error(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    response_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal response_requests
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": DEFAULT_MODEL,
+                            "name": "Default model",
+                            "context_length": 100,
+                            "supported_parameters": ["tools"],
+                        }
+                    ]
+                },
+            )
+        response_requests += 1
+        if response_requests == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "invalid_prompt",
+                        "message": "input exceeds context",
+                    },
+                },
+            )
+        return sse_response(
+            {"type": "response.content_part.delta", "delta": "Recovered."}
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    app = ToolboxApp(kernel, model, model_name=model.model)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            state = app.active_session
+            parent = state.conversation
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "continue the long session"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert response_requests == 2
+            assert state.conversation is not parent
+            assert (
+                kernel.session_metadata(state.conversation.session_id)[
+                    "parent_session_id"
+                ]
+                == parent.session_id
+            )
+            rendered = chat_text(app)
+            assert "session history" in rendered
+            assert "compacting into a child session now" in rendered
+            assert "compacted" in rendered
+            assert tui_module.COMPACT_CONTINUATION_PROMPT in rendered
+            assert "Recovered." in rendered
+
+    asyncio.run(exercise())
+
+
+def test_tui_preserves_partial_context_failure_without_auto_recovery(
+    tmp_path: Path,
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    response_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal response_requests
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": []})
+        response_requests += 1
+        return sse_response(
+            {"type": "response.content_part.delta", "delta": "Partial answer"},
+            status="failed",
+            finish_reason="invalid_prompt",
+            error_type="context_length_exceeded",
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    app = ToolboxApp(kernel, model, model_name=model.model)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            state = app.active_session
+            parent = state.conversation
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "continue"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert response_requests == 1
+            assert state.conversation is parent
+            rendered = chat_text(app)
+            assert "Partial answer" in rendered
+            assert "stopped" in rendered
+            assert "send 'continue'" in rendered
+            assert "compacted" not in rendered
+
+    asyncio.run(exercise())
+
+
+def test_tui_keeps_automatic_retry_visible_in_the_session_log(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    kernel = Kernel(tmp_path / "toolbox.db", cwd=tmp_path)
+    monkeypatch.setattr(openrouter_module, "_RETRY_BASE_DELAY", 0)
+    response_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal response_requests
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": []})
+        response_requests += 1
+        if response_requests == 1:
+            return httpx.Response(503)
+        return sse_response(
+            {"type": "response.content_part.delta", "delta": "Recovered."}
+        )
+
+    model = OpenRouterModel(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    app = ToolboxApp(kernel, model, model_name=model.model)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            state = app.active_session
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "retry visibly"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert response_requests == 2
+            rendered = chat_text(app)
+            assert "model retry" in rendered
+            assert "attempt 2/3" in rendered
+            assert "temporary HTTP 503 error" in rendered
+            assert "Retrying automatically" in rendered
+            assert "Recovered." in rendered
+            events = kernel.read_session(state.conversation.session_id, limit=100)[
+                "events"
+            ]
+            assert [event["kind"] for event in events] == [
+                "user",
+                "model_retry",
+                "model",
+                "final",
+            ]
 
     asyncio.run(exercise())
 

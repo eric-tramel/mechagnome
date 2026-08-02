@@ -7,6 +7,7 @@ import json
 import socket
 import struct
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Protocol
@@ -153,6 +154,19 @@ def _bind_session_transport(transport: Any, session_id: str) -> Any:
     """Bind an opt-in transport to one conversation cancellation domain."""
     bind = getattr(transport, "for_session", None)
     return bind(session_id) if callable(bind) else transport
+
+
+@contextmanager
+def _capture_model_retries(
+    transport: Any, sink: Callable[[dict[str, Any]], None]
+) -> Iterator[None]:
+    """Capture optional provider retry notices without widening the base ABI."""
+    capture = getattr(transport, "capture_retries", None)
+    if callable(capture):
+        with capture(sink):
+            yield
+        return
+    yield
 
 
 class ToolModelProvider:
@@ -333,7 +347,13 @@ class ModelProvider:
             self.kernel.append_event(child_id, "model_failed", error.to_dict()["error"])
             raise error
         try:
-            result = complete(normalized)
+            with _capture_model_retries(
+                completion_transport,
+                lambda payload: self.kernel.append_event(
+                    child_id, "model_retry", payload
+                ),
+            ):
+                result = complete(normalized)
             if not isinstance(result, str):
                 raise _error("model_provider_failed")
             if len(result.encode("utf-8")) > MAX_MODEL_RESPONSE_BYTES:
@@ -453,25 +473,36 @@ class ModelSession:
         if not input_recorded:
             self._record("model_input", {"messages": messages}, on_record)
         completed: ModelTurn | None = None
+        partial_text: list[str] = []
         try:
-            stream = getattr(self.transport, "stream", None)
-            events = (
-                stream(messages, tools)
-                if callable(stream)
-                else iter(
-                    (ModelStreamEvent(turn=self.transport.respond(messages, tools)),)
-                )
-            )
-            for event in events:
-                if event.turn is not None:
-                    if completed is not None:
-                        raise ToolboxError(
-                            "invalid_model_stream",
-                            "model stream completed more than once",
+            with _capture_model_retries(
+                self.transport,
+                lambda payload: self._record("model_retry", payload, on_record),
+            ):
+                stream = getattr(self.transport, "stream", None)
+                events = (
+                    stream(messages, tools)
+                    if callable(stream)
+                    else iter(
+                        (
+                            ModelStreamEvent(
+                                turn=self.transport.respond(messages, tools)
+                            ),
                         )
-                    completed = event.turn
-                else:
-                    yield event
+                    )
+                )
+                for event in events:
+                    if event.text_delta:
+                        partial_text.append(event.text_delta)
+                    if event.turn is not None:
+                        if completed is not None:
+                            raise ToolboxError(
+                                "invalid_model_stream",
+                                "model stream completed more than once",
+                            )
+                        completed = event.turn
+                    else:
+                        yield event
             if completed is None:
                 raise ToolboxError(
                     "invalid_model_stream",
@@ -489,6 +520,8 @@ class ModelSession:
                     if isinstance(error, ModelTransportError)
                     else _error("model_provider_failed").to_dict()["error"]
                 )
+                if partial_text:
+                    failure = {**failure, "partial_text": "".join(partial_text)}
                 self._record("model_failed", failure, on_record)
             raise
 
